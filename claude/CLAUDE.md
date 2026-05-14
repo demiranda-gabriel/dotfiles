@@ -31,3 +31,28 @@ source — this section is just a pointer.
 The same dotfiles repo (`~/dotfiles`, `git@github.com:demiranda-gabriel/dotfiles.git`)
 is the single source of truth across every cluster I work on. Run
 `~/dotfiles/bootstrap.sh` once per cluster after cloning.
+
+## Per-project `DATA_MANAGEMENT.md`
+
+Every project root contains a `DATA_MANAGEMENT.md` that classifies every
+top-level file and directory into exactly one of three categories:
+
+- **git-tracked** — committed and synced with GitHub on the working branch.
+- **gdrive-tracked** — bulk data under `gdrive:projects/<project>/<subpath>/`,
+  moved with the `gdrive-push` / `gdrive-pull` / `gdrive-archive` scripts.
+  Not committed.
+- **local-only** — ephemeral, regenerable, or environment-specific. Not
+  committed, not backed up.
+
+Rules:
+
+1. Anything listed in `.gitignore` is either gdrive-tracked or local-only.
+2. Anything not in `.gitignore` is git-tracked.
+3. When a new top-level entry appears, classify it in the same commit
+   that introduces it.
+4. Before deleting a local copy of a gdrive-tracked path, confirm a
+   recent push exists (`gdrive-push -n` first).
+
+When entering a project that lacks `DATA_MANAGEMENT.md`, create one by
+listing `ls -A` at the project root, reading `.gitignore`, and grouping
+entries under the three headings above.
