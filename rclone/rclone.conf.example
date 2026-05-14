@@ -1,0 +1,15 @@
+# Template only. Real config lives at ~/.config/rclone/rclone.conf and is
+# NEVER committed (contains an OAuth token). Generate with:
+#
+#   rclone config
+#
+# Pick: n (new remote) → name = "gdrive" → "drive" → leave client_id/secret
+# blank for the default rclone OAuth client → scope = "drive" → leave the
+# rest at defaults → authorize in a browser (rclone authorize drive on a
+# machine with one, paste the JSON token on the headless cluster).
+
+[gdrive]
+type = drive
+scope = drive
+token = {"access_token":"REDACTED","token_type":"Bearer","refresh_token":"REDACTED","expiry":"REDACTED"}
+team_drive =

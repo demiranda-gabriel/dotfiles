@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# gdrive-archive <local_dir> [<remote_subpath>] [-p PROJECT] [--name NAME] [--rm] [-n]
+#
+# Create a tarball of <local_dir> and upload it to:
+#   gdrive:projects/<PROJECT>/<remote_subpath>/<NAME>
+#
+# Default NAME = <basename(local_dir)>-<YYYY-MM-DD>.tar.gz
+# Honours <local_dir>/ignore_list.txt (tar -X) if present.
+# Uses pigz when available, else gzip.
+# Local archive is KEPT by default; pass --rm to delete after a successful upload.
+#
+# PROJECT resolution (first hit wins):
+#   1. -p flag
+#   2. $PROJECT_NAME env var
+#   3. basename of `git rev-parse --show-toplevel` evaluated inside <local_dir>
+#
+# Flags:
+#   -p PROJECT   override project name
+#   --name NAME  override archive filename
+#   --rm         remove local archive after a successful upload (default: keep)
+#   -n           dry-run: print all commands, don't execute
+#   -h           help
+
+set -euo pipefail
+
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-0}"; }
+
+DRY=0
+PROJECT=""
+NAME=""
+RM_LOCAL=0
+POSITIONAL=()
+
+while (( $# )); do
+    case "$1" in
+        -p) PROJECT="$2"; shift 2 ;;
+        --name) NAME="$2"; shift 2 ;;
+        --rm) RM_LOCAL=1; shift ;;
+        -n) DRY=1; shift ;;
+        -h|--help) usage 0 ;;
+        --) shift; POSITIONAL+=("$@"); break ;;
+        -*) echo "unknown flag: $1" >&2; usage 1 ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+(( ${#POSITIONAL[@]} >= 1 )) || { echo "missing <local_dir>" >&2; usage 1; }
+
+LOCAL_DIR="${POSITIONAL[0]}"
+SUBPATH="${POSITIONAL[1]:-}"
+
+[[ -d "$LOCAL_DIR" ]] || { echo "not a directory: $LOCAL_DIR" >&2; exit 1; }
+
+if [[ -z "$PROJECT" ]]; then
+    PROJECT="${PROJECT_NAME:-}"
+fi
+if [[ -z "$PROJECT" ]]; then
+    if root=$(git -C "$LOCAL_DIR" rev-parse --show-toplevel 2>/dev/null); then
+        PROJECT=$(basename "$root")
+    fi
+fi
+[[ -n "$PROJECT" ]] || { echo "could not resolve PROJECT (use -p or set PROJECT_NAME or run inside a git repo)" >&2; exit 1; }
+
+if [[ -z "$NAME" ]]; then
+    NAME="$(basename "$(readlink -f "$LOCAL_DIR")")-$(date +%Y-%m-%d).tar.gz"
+fi
+
+SUBPATH="${SUBPATH#/}"
+SUBPATH="${SUBPATH%/}"
+REMOTE_DIR="gdrive:projects/${PROJECT}"
+[[ -n "$SUBPATH" ]] && REMOTE_DIR="${REMOTE_DIR}/${SUBPATH}"
+
+ARCHIVE="$(mktemp -d)/$NAME"
+
+# Build tar arguments inside LOCAL_DIR so paths in the archive are relative.
+TAR_FLAGS=(--warning=no-file-changed --exclude="$NAME")
+if [[ -f "$LOCAL_DIR/ignore_list.txt" ]]; then
+    TAR_FLAGS+=(-X "$LOCAL_DIR/ignore_list.txt")
+    echo "ℹ ignore_list.txt found — applying excludes"
+fi
+
+if command -v pigz >/dev/null 2>&1; then
+    COMPRESS=(pigz)
+    echo "ℹ compressor: pigz"
+else
+    COMPRESS=(gzip)
+    echo "ℹ compressor: gzip"
+fi
+
+echo "→ tar ${TAR_FLAGS[*]} -cv -C $LOCAL_DIR . | ${COMPRESS[*]} > $ARCHIVE"
+echo "→ rclone copy -P $ARCHIVE $REMOTE_DIR"
+(( RM_LOCAL )) && echo "→ rm $ARCHIVE (after upload)"
+
+if (( DRY )); then
+    exit 0
+fi
+
+tar "${TAR_FLAGS[@]}" -cv -C "$LOCAL_DIR" . | "${COMPRESS[@]}" > "$ARCHIVE"
+echo "✓ archive built: $(du -h "$ARCHIVE" | cut -f1) at $ARCHIVE"
+
+rclone copy -P "$ARCHIVE" "$REMOTE_DIR"
+echo "✓ uploaded to $REMOTE_DIR/$NAME"
+
+if (( RM_LOCAL )); then
+    rm "$ARCHIVE"
+    rmdir "$(dirname "$ARCHIVE")" 2>/dev/null || true
+    echo "✓ local archive removed"
+else
+    echo "ℹ local archive kept at $ARCHIVE"
+fi

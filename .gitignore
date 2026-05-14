@@ -1,0 +1,10 @@
+# Never commit real rclone config (contains OAuth token).
+rclone/rclone.conf
+**/rclone.conf
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Bootstrap-generated state if anyone ever stages it accidentally
+.bootstrap.log
