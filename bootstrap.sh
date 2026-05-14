@@ -59,6 +59,22 @@ for src in "$DOTFILES"/claude/skills/*; do
     echo "✓ linked skill $(basename "$src")"
 done
 
+# 3b. Symlink user-scoped CLAUDE.md (always-loaded instructions)
+CLAUDE_MD_SRC="$DOTFILES/claude/CLAUDE.md"
+CLAUDE_MD_TARGET="$HOME/.claude/CLAUDE.md"
+if [[ -f "$CLAUDE_MD_SRC" ]]; then
+    if [[ -L "$CLAUDE_MD_TARGET" || -e "$CLAUDE_MD_TARGET" ]]; then
+        if [[ "$(readlink -f "$CLAUDE_MD_TARGET" 2>/dev/null)" == "$CLAUDE_MD_SRC" ]]; then
+            echo "✓ ~/.claude/CLAUDE.md already linked"
+        else
+            echo "⚠ $CLAUDE_MD_TARGET exists and points elsewhere — skipping"
+        fi
+    else
+        ln -s "$CLAUDE_MD_SRC" "$CLAUDE_MD_TARGET"
+        echo "✓ linked ~/.claude/CLAUDE.md → $CLAUDE_MD_SRC"
+    fi
+fi
+
 # 4. Toolchain probe
 echo
 echo "=== Toolchain ==="
