@@ -14,6 +14,12 @@ CLAUDE_SKILLS="$HOME/.claude/skills"
 BASHRC="$HOME/.bashrc"
 SOURCE_LINE="for f in $DOTFILES/shell/*.sh; do source \"\$f\"; done  # dotfiles"
 
+# State flags consumed by the "Next steps" section.
+BASHRC_CHANGED=0
+RCLONE_MISSING=0
+PIGZ_MISSING=0
+GDRIVE_MISSING=0
+
 echo "=== Bootstrapping dotfiles from $DOTFILES ==="
 
 # 1. Symlink scripts into ~/.local/bin
@@ -38,6 +44,7 @@ done
 if ! grep -qF "# dotfiles" "$BASHRC" 2>/dev/null; then
     printf '\n# Source dotfiles shell snippets (added by bootstrap.sh)\n%s\n' "$SOURCE_LINE" >> "$BASHRC"
     echo "✓ appended source line to $BASHRC"
+    BASHRC_CHANGED=1
 else
     echo "✓ $BASHRC already sources dotfiles"
 fi
@@ -82,7 +89,11 @@ for tool in rclone pigz tar; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo "✓ $tool: $(command -v "$tool")"
     else
-        echo "✗ $tool: MISSING (gdrive-archive will fall back to gzip if pigz absent; rclone is required)"
+        echo "✗ $tool: MISSING"
+        case "$tool" in
+            rclone) RCLONE_MISSING=1 ;;
+            pigz)   PIGZ_MISSING=1 ;;
+        esac
     fi
 done
 
@@ -94,12 +105,57 @@ if command -v rclone >/dev/null 2>&1; then
         echo "✓ remote 'gdrive:' configured"
     else
         echo "✗ remote 'gdrive:' NOT configured"
-        echo "  Run: rclone config   # name the remote 'gdrive', type 'drive'"
-        echo "  Template: $DOTFILES/rclone/rclone.conf.example"
+        GDRIVE_MISSING=1
     fi
 else
-    echo "✗ rclone missing — install it before continuing"
+    GDRIVE_MISSING=1  # can't even probe without rclone
 fi
 
+# 6. Next steps — render a checklist conditional on detected state.
 echo
-echo "Done. Open a new shell or 'source $BASHRC' to pick up PATH and aliases."
+echo "=== Next steps ==="
+
+step=1
+say() { printf "  %d. %s\n" "$step" "$1"; step=$((step+1)); }
+
+if (( BASHRC_CHANGED )); then
+    say "Reload shell so PATH and aliases take effect:"
+    echo "       source $BASHRC      # or just open a new terminal"
+else
+    say "Shell already wired up — nothing to reload."
+fi
+
+if (( RCLONE_MISSING )); then
+    say "Install rclone (required for any gdrive operation):"
+    echo "       # cluster-specific: module load rclone, dnf install rclone,"
+    echo "       # or curl https://rclone.org/install.sh | sudo bash"
+fi
+
+if (( PIGZ_MISSING )); then
+    say "Install pigz for faster gdrive-archive (gzip is used as fallback):"
+    echo "       # e.g. dnf install pigz, apt install pigz, or skip for now"
+fi
+
+if (( GDRIVE_MISSING )); then
+    say "Configure the 'gdrive' rclone remote:"
+    echo "       rclone config        # n → name=gdrive → type=drive →"
+    echo "       # use default OAuth client; on a headless cluster run"
+    echo "       # 'rclone authorize drive' on a machine with a browser"
+    echo "       # and paste the JSON token back here."
+    echo "       Reference template: $DOTFILES/rclone/rclone.conf.example"
+fi
+
+if (( ! RCLONE_MISSING && ! GDRIVE_MISSING )); then
+    say "Smoke-test the round trip:"
+    echo "       echo hello > /tmp/_gdrive_smoke.txt"
+    echo "       gdrive-push /tmp/_gdrive_smoke.txt _smoketest -p \$(whoami)-smoke -n   # dry-run first"
+    echo "       gdrive-push /tmp/_gdrive_smoke.txt _smoketest -p \$(whoami)-smoke"
+    echo "       gdrive-pull _smoketest/_gdrive_smoke.txt /tmp/_back -p \$(whoami)-smoke"
+    echo "       diff /tmp/_gdrive_smoke.txt /tmp/_back/_gdrive_smoke.txt"
+fi
+
+say "Open a Claude Code session anywhere — the 'backup-to-gdrive' skill"
+echo "       and ~/.claude/CLAUDE.md are now picked up globally."
+
+echo
+echo "Done."
