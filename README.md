@@ -17,10 +17,39 @@ The bootstrap script is idempotent. It:
 2. Appends a `source ~/dotfiles/shell/*.sh` line to `~/.bashrc` (only if
    absent).
 3. Symlinks `claude/skills/*` into `~/.claude/skills/`.
-4. Probes for `rclone`, `pigz`, and a configured `gdrive:` remote;
-   reports anything missing.
+4. Per-file symlinks `config/<app>/*` into `~/.config/<app>/` (currently
+   `lf`, `tmux`). For `tmux` also creates `~/.tmux.conf` as a fallback
+   for tmux <3.1 (which doesn't honor the XDG path).
+5. Probes for `rclone`, `pigz`, `tmux`, `lf`, `tectonic`, `pandoc`,
+   `termpdf`, `pdftoppm`, and a configured `gdrive:` remote; reports missing.
+
+Pass `--viewers` to also fetch the tool stack
+(`lf`, `tmux`, `tectonic`, `pandoc`, `termpdf.py` + Python deps) into
+`~/.local/bin/` and `~/software/`:
+
+```bash
+~/dotfiles/bootstrap.sh --viewers
+```
 
 After bootstrap, open a new shell (or `source ~/.bashrc`).
+
+## Terminal viewer stack
+
+For reading documents over SSH+kitty without leaving the terminal.
+
+| Tool      | Role                                                          |
+|-----------|---------------------------------------------------------------|
+| `tmux`    | Terminal multiplexer. Config in `config/tmux/tmux.conf`. Installed from `nelsonenzo/tmux-appimage` (extracted, no FUSE needed) |
+| `lf`      | Terminal file manager (replaces ranger). Config in `config/lf/` |
+| `md-view` | `pandoc → tectonic → PDF → termpdf` for markdown notes. Font size via `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, engine via `MDVIEW_ENGINE` |
+| `img-view`| `kitten icat` wrapper, scales image to fit terminal box       |
+| `termpdf` | Multi-page PDF/epub/djvu viewer using kitty graphics protocol |
+| `tectonic`| Modern XeTeX engine. Bundles its own TeX, auto-fetches packages — bypasses incomplete cluster TeX installs |
+
+Inside `lf`: `<enter>` dispatches by extension (md → md-view, pdf →
+termpdf, image → img-view). `B` / `H` for big/huge font markdown, `P`
+for first-page PDF peek, `yK` for kitty transfer download to local Mac.
+`R` reloads the lf config.
 
 ## Backup workflow
 
@@ -50,14 +79,24 @@ muscle memory keeps working.
 ```
 dotfiles/
 ├── bin/                                 ← scripts symlinked into ~/.local/bin
-│   ├── gdrive-push
-│   ├── gdrive-pull
-│   └── gdrive-archive
+│   ├── gdrive-{push,pull,archive}
+│   ├── md-view                          ← markdown → pandoc/tectonic → termpdf
+│   └── img-view                         ← image filling terminal via kitten icat
+├── config/                              ← per-file symlinks into ~/.config/<app>
+│   ├── lf/{lfrc,preview,cleaner}
+│   └── tmux/tmux.conf                   ← also symlinked to ~/.tmux.conf (legacy fallback)
+├── install/                             ← idempotent fetchers (run with --viewers)
+│   ├── install-lf.sh
+│   ├── install-tmux.sh
+│   ├── install-tectonic.sh
+│   ├── install-pandoc.sh
+│   └── install-termpdf.sh
 ├── shell/                               ← sourced from ~/.bashrc by bootstrap
 │   ├── 00-path.sh                       ← prepends ~/.local/bin to $PATH
-│   └── 50-backup.sh                     ← backup / restore / cloudsave aliases
+│   ├── 50-backup.sh                     ← backup / restore / cloudsave aliases
+│   └── 60-lf.sh                         ← EDITOR=nvim + lfcd cd-on-exit wrapper
 ├── claude/skills/                       ← symlinked into ~/.claude/skills
-│   └── backup-to-gdrive/SKILL.md        ← policy and triggers for Claude
+│   └── backup-to-gdrive/SKILL.md
 ├── rclone/rclone.conf.example           ← template; real config is per-cluster
 └── bootstrap.sh
 ```

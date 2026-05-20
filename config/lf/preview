@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# lf previewer — text via bat/cat, images via kitten icat, pdf first-page render
+# Args: $1=file, $2=width, $3=height, $4=x, $5=y
+
+set -u
+f="$1"; w="$2"; h="$3"; x="$4"; y="$5"
+
+KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
+
+mime="$(file --mime-type -Lb -- "$f" 2>/dev/null || echo unknown)"
+
+case "$mime" in
+    image/*)
+        "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
+            --place="${w}x${h}@${x}x${y}" -- "$f" </dev/null
+        exit 1   # exit code 1 = lf will not cache preview (re-renders on move)
+        ;;
+    application/pdf)
+        tmp="$(mktemp -t lfprev-XXXXXX.jpg)"
+        trap 'rm -f "$tmp"' EXIT
+        pdftoppm -jpeg -r 100 -singlefile -- "$f" "${tmp%.jpg}" 2>/dev/null \
+          && "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
+                --place="${w}x${h}@${x}x${y}" -- "$tmp" </dev/null
+        exit 1
+        ;;
+    text/*|application/json|application/xml|application/javascript)
+        if command -v bat >/dev/null 2>&1; then
+            bat --color=always --style=plain --paging=never --terminal-width="$w" -- "$f"
+        else
+            cat -- "$f"
+        fi
+        ;;
+    *)
+        echo "----- $mime"
+        echo
+        file -Lb -- "$f"
+        ;;
+esac

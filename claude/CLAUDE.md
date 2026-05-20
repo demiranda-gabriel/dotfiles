@@ -56,3 +56,48 @@ Rules:
 When entering a project that lacks `DATA_MANAGEMENT.md`, create one by
 listing `ls -A` at the project root, reading `.gitignore`, and grouping
 entries under the three headings above.
+
+## Terminal viewer stack (SSH + kitty workflow)
+
+For reading documents and browsing files without leaving the terminal.
+All wired up by `~/dotfiles/bootstrap.sh --viewers`.
+
+| Tool       | Role                                                          | Source |
+|------------|---------------------------------------------------------------|--------|
+| `tmux`     | Terminal multiplexer. Config at `~/.config/tmux/tmux.conf` (+ legacy `~/.tmux.conf` symlink for tmux <3.1) | `nelsonenzo/tmux-appimage`, extracted (no FUSE needed) |
+| `lf`       | File manager (replaces ranger). Config in `~/.config/lf/`     | binary, fetched |
+| `md-view`  | Markdown → PDF (pandoc + tectonic) → termpdf. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_ENGINE` (default `tectonic`) | `dotfiles/bin/` |
+| `img-view` | `kitten icat` wrapper, fits image in terminal box, clears before display | `dotfiles/bin/` |
+| `termpdf`  | Multi-page PDF / epub / djvu viewer using kitty graphics      | upstream py, fetched |
+| `tectonic` | Modern XeTeX engine, bundles TeX, auto-fetches packages — bypasses incomplete cluster TeX | binary, fetched |
+| `pandoc`   | Newer (3.9.0.2) — system pandoc on RHEL/Rocky 8 is too old for tectonic | binary, fetched |
+
+**Inside `lf`:** `<enter>` dispatches by extension (md → md-view, pdf →
+termpdf, image → img-view). `B`/`H` for big/huge font markdown, `P` for
+first-page pdf peek, `yK` for kitty transfer download to local Mac, `R`
+to reload config. Quit drops parent shell into last-visited dir.
+
+**Cluster TeX caveat:** the system TeX install on FASRC (Rocky 8) is
+incomplete — `xelatex`/`lualatex` missing `ucharcat.sty`, xcolor broken.
+`md-view` defaults to `tectonic` to bypass this entirely. Don't try to
+"fix" by switching to system pdflatex unless explicitly working ASCII-only.
+
+## New-cluster recipe
+
+```bash
+git clone git@github.com:demiranda-gabriel/dotfiles.git ~/dotfiles
+~/dotfiles/bootstrap.sh --viewers
+source ~/.bashrc
+```
+
+That installs gdrive scripts, lf+viewer stack, shell snippets, Claude
+skills, and symlinks this CLAUDE.md into `~/.claude/`. After that the
+canonical references are:
+
+- `~/dotfiles/README.md` — full repo doc
+- `~/dotfiles/claude/skills/backup-to-gdrive/SKILL.md` — backup policy
+- This file — global Claude instructions
+
+Auto-memory at `~/.claude/projects/<dir-hash>/memory/` is **per-host and
+not in the repo**. New cluster starts with empty memory; Claude rebuilds
+it from observation.

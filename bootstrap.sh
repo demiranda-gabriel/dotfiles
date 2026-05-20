@@ -11,8 +11,26 @@ set -euo pipefail
 DOTFILES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_BIN="$HOME/.local/bin"
 CLAUDE_SKILLS="$HOME/.claude/skills"
+CONFIG_DIR="$HOME/.config"
 BASHRC="$HOME/.bashrc"
 SOURCE_LINE="for f in $DOTFILES/shell/*.sh; do source \"\$f\"; done  # dotfiles"
+
+# Parse args
+INSTALL_VIEWERS=0
+for arg in "$@"; do
+    case "$arg" in
+        --viewers|--install-viewers) INSTALL_VIEWERS=1 ;;
+        -h|--help)
+            cat <<EOF
+Usage: bootstrap.sh [--viewers]
+  --viewers   Also fetch the tool stack (lf, tmux, tectonic, pandoc, termpdf)
+              into ~/.local/bin (10s of MB downloaded — only run on a host
+              where you want them)
+EOF
+            exit 0
+            ;;
+    esac
+done
 
 # State flags consumed by the "Next steps" section.
 BASHRC_CHANGED=0
@@ -82,10 +100,61 @@ if [[ -f "$CLAUDE_MD_SRC" ]]; then
     fi
 fi
 
+# 3c. Symlink ~/.config/<app>/* contents from dotfiles/config/<app>/
+# Per-file symlinks (not whole-dir) so other config files in the same app dir
+# aren't shadowed.
+for app_dir in "$DOTFILES"/config/*/; do
+    [[ -d "$app_dir" ]] || continue
+    app="$(basename "$app_dir")"
+    dest_dir="$CONFIG_DIR/$app"
+    mkdir -p "$dest_dir"
+    for src in "$app_dir"*; do
+        [[ -f "$src" ]] || continue
+        target="$dest_dir/$(basename "$src")"
+        if [[ -L "$target" || -e "$target" ]]; then
+            if [[ "$(readlink -f "$target" 2>/dev/null)" == "$src" ]]; then
+                echo "✓ ~/.config/$app/$(basename "$src") already linked"
+                continue
+            fi
+            echo "⚠ $target exists and points elsewhere — skipping"
+            continue
+        fi
+        ln -s "$src" "$target"
+        echo "✓ linked ~/.config/$app/$(basename "$src")"
+    done
+done
+
+# 3c.1. Legacy ~/.tmux.conf symlink — tmux <3.1 does not honor XDG path.
+TMUX_CONF_SRC="$DOTFILES/config/tmux/tmux.conf"
+TMUX_CONF_LEGACY="$HOME/.tmux.conf"
+if [[ -f "$TMUX_CONF_SRC" ]]; then
+    if [[ -L "$TMUX_CONF_LEGACY" || -e "$TMUX_CONF_LEGACY" ]]; then
+        if [[ "$(readlink -f "$TMUX_CONF_LEGACY" 2>/dev/null)" == "$TMUX_CONF_SRC" ]]; then
+            echo "✓ ~/.tmux.conf already linked"
+        else
+            echo "⚠ $TMUX_CONF_LEGACY exists and points elsewhere — skipping"
+        fi
+    else
+        ln -s "$TMUX_CONF_SRC" "$TMUX_CONF_LEGACY"
+        echo "✓ linked ~/.tmux.conf → $TMUX_CONF_SRC"
+    fi
+fi
+
+# 3d. Optional install stack (lf, tmux, tectonic, pandoc, termpdf)
+if (( INSTALL_VIEWERS )); then
+    echo
+    echo "=== Installing tool stack ==="
+    for installer in "$DOTFILES"/install/install-*.sh; do
+        [[ -x "$installer" ]] || continue
+        echo "--- $(basename "$installer") ---"
+        "$installer" || echo "✗ $(basename "$installer") failed (continuing)"
+    done
+fi
+
 # 4. Toolchain probe
 echo
 echo "=== Toolchain ==="
-for tool in rclone pigz tar; do
+for tool in rclone pigz tar tmux lf tectonic pandoc termpdf pdftoppm; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo "✓ $tool: $(command -v "$tool")"
     else

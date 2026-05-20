@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# md-view: render markdown to PDF via pandoc, view in terminal (kitty graphics).
+# Font size tunable via $MDVIEW_FONTSIZE (default 14pt). Uses extarticle class
+# to allow >12pt sizes.
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: md-view FILE.md [pandoc-args...]" >&2
+  echo "env:   MDVIEW_FONTSIZE=14pt  (10|11|12|14|17|20)" >&2
+  exit 1
+fi
+
+in="$1"; shift
+out="$(mktemp -t mdview-XXXXXX.pdf)"
+trap 'rm -f "$out"' EXIT
+
+fontsize="${MDVIEW_FONTSIZE:-14pt}"
+
+engine="${MDVIEW_ENGINE:-tectonic}"
+
+pandoc "$in" \
+  --pdf-engine="$engine" \
+  -V documentclass=extarticle \
+  -V fontsize="$fontsize" \
+  -V geometry:margin=0.6in \
+  "$@" \
+  -o "$out"
+
+termpdf "$out"

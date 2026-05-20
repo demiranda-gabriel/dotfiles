@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# lf cleaner — clears kitty graphics images when moving cursor.
+KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
+"$KITTEN" icat --clear --silent --stdin=no --transfer-mode=memory </dev/null 2>/dev/null

@@ -1,0 +1,112 @@
+# =====================================================================
+# lf config — mirrors ranger setup (md/pdf/png viewers, kitty download)
+# NOTE: do NOT nest ${VAR:-${OTHER}} inside ${{ ... }} — the inner `}}`
+# terminates the lf block early. Use single-level expansion only.
+# =====================================================================
+
+# --- core options ---
+set hidden false
+set ignorecase true
+set icons false
+set drawbox false
+set ratios 1:2:3
+set scrolloff 8
+set period 1
+set previewer ~/.config/lf/preview
+set cleaner  ~/.config/lf/cleaner
+
+# --- open dispatch (default action on Enter / `l`) ---
+cmd open ${{
+    case "$f" in
+        *.md|*.markdown)
+            md-view "$f"
+            ;;
+        *.pdf|*.epub|*.djvu|*.cbz|*.fb2|*.xps)
+            termpdf "$f"
+            ;;
+        *.png|*.jpg|*.jpeg|*.gif|*.webp|*.tif|*.tiff|*.bmp)
+            img-view "$f"
+            ;;
+        *)
+            mime=$(file --mime-type -Lb "$f")
+            ed=${VISUAL:-$EDITOR}
+            [ -z "$ed" ] && ed=vi
+            case "$mime" in
+                text/*|application/json|application/xml|application/x-shellscript)
+                    "$ed" "$f"
+                    ;;
+                *)
+                    xdg-open "$f" 2>/dev/null || "$ed" "$f"
+                    ;;
+            esac
+            ;;
+    esac
+}}
+
+# --- markdown font-size variants ---
+cmd md_big  ${{ MDVIEW_FONTSIZE=17pt md-view "$f" }}
+cmd md_huge ${{ MDVIEW_FONTSIZE=20pt md-view "$f" }}
+map B md_big
+map H md_huge
+
+# --- pdf single-page peek (kitten icat fallback) ---
+cmd pdf_peek ${{
+    pdftoppm -jpeg -r 150 -singlefile -- "$f" - \
+      | ~/.local/share/kitty-ssh-kitten/kitty/bin/kitten icat --hold --stdin=yes
+}}
+map P pdf_peek
+
+# --- kitty transfer: download highlighted/selected files to local Mac ---
+cmd kitty_download ${{
+    KITTEN=$KITTEN
+    [ -z "$KITTEN" ] && KITTEN=$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten
+    DEST="/Users/demiranda/Downloads/"
+    for path in $fx; do
+        "$KITTEN" transfer --direction=download "$path" "$DEST"
+    done
+}}
+map yK kitty_download
+
+# --- open with custom command ---
+cmd open-with ${{
+    clear
+    printf "open with: "
+    read cmd
+    $cmd "$f"
+}}
+map o open-with
+
+# --- handy bindings ---
+map <enter> open
+map x cut
+map y copy
+map p paste
+map d delete
+map . set hidden!
+map zh set hidden!
+map gh cd ~
+map gd cd ~/Downloads
+map gN cd /n/netscratch/kozinsky_lab/Lab/demiranda
+map gH cd /n/holylabs/kozinsky_lab/Users/demiranda
+map gP cd /n/netscratch/kozinsky_lab/Lab/demiranda/projects
+
+# --- reload config without quitting ---
+cmd reload-config :{{
+    source ~/.config/lf/lfrc
+}}
+map R reload-config
+
+# --- delete with confirm ---
+cmd trash %trash-put "$fx"
+cmd delete ${{
+    set -f
+    printf "delete '%s'? [y/n] " "$fx" >&2
+    read ans
+    [ "$ans" = "y" ] && rm -rf -- $fx
+}}
+
+# --- mkdir / touch ---
+cmd mkdir %{{ printf "dir name: " >&2; read d; mkdir -p -- "$d"; }}
+cmd touch  %{{ printf "file name: " >&2; read f; touch -- "$f"; }}
+map a push :mkdir<space>
+map A push :touch<space>

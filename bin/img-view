@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# img-view: clear screen + display image filling terminal box (fits W and H).
+set -euo pipefail
+
+cols=$(tput cols)
+rows=$(tput lines)
+h=$((rows - 1))
+
+KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
+
+# Clear any prior kitty graphics + text scrollback view.
+"$KITTEN" icat --clear --silent --transfer-mode=memory </dev/null 2>/dev/null || true
+clear
+
+exec "$KITTEN" icat \
+  --hold \
+  --place="${cols}x${h}@0x0" \
+  --scale-up \
+  --align=center \
+  -- "$@"
