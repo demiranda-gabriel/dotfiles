@@ -49,6 +49,81 @@ cmd md_huge ${{ MDVIEW_FONTSIZE=20pt md-view "$f" }}
 map B md_big
 map H md_huge
 
+# --- marp slides: build PDF, view in termpdf ---
+# Detects a marp deck (frontmatter `marp: true`). If sibling package.json
+# defines `slides:pdf`, uses that (preserves theme/flags); else falls back
+# to a direct `marp` invocation, auto-passing any sibling `themes/*.css`
+# as --theme so per-project themes apply without extra config. Output
+# PDF reused in-place; --html accepts the deck's inline HTML blocks.
+cmd marp_view ${{
+    set -e
+    case "$f" in *.md|*.markdown) : ;; *)
+        printf "marp_view: not a markdown file\n" >&2; exit 1 ;;
+    esac
+    if ! head -n 30 "$f" | grep -q '^marp: true'; then
+        printf "marp_view: '%s' has no 'marp: true' frontmatter\n" "$f" >&2
+        exit 1
+    fi
+    dir=$(dirname "$f")
+    base=$(basename "$f" .md)
+    out="$dir/$base.pdf"
+    cd "$dir"
+    if [ -f package.json ] && grep -q '"slides:pdf"' package.json; then
+        npm run --silent slides:pdf
+    else
+        set --
+        for css in themes/*.css; do
+            [ -e "$css" ] || continue
+            set -- "$@" --theme "$css"
+        done
+        marp "$f" -o "$out" "$@" --pdf --html --allow-local-files --no-stdin
+    fi
+    termpdf "$out"
+}}
+map M marp_view
+
+# --- marp slides: background watcher (rebuilds PDF on save) ---
+# Toggle: first press starts `marp -w` detached, second press stops it.
+# PID + log live in /tmp keyed by deck-path hash so deck dirs stay clean.
+# Auto-passes any sibling `themes/*.css` as --theme so per-project themes
+# apply without extra config. Pair with `M` (marp_view) which opens
+# slides.pdf in termpdf; press Ctrl-R inside termpdf to reload after each
+# rebuild.
+cmd marp_watch &{{
+    case "$f" in *.md|*.markdown) : ;; *)
+        lf -remote "send $id echoerr 'marp_watch: not a markdown file'"
+        exit 1 ;;
+    esac
+    if ! head -n 30 "$f" | grep -q '^marp: true'; then
+        lf -remote "send $id echoerr 'marp_watch: no marp: true frontmatter'"
+        exit 1
+    fi
+    dir=$(dirname "$f")
+    base=$(basename "$f" .md)
+    out="$dir/$base.pdf"
+    key=$(printf '%s' "$f" | md5sum | cut -c1-12)
+    pidfile="/tmp/marp-watch-$key.pid"
+    logfile="/tmp/marp-watch-$key.log"
+    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        kill "$(cat "$pidfile")" 2>/dev/null
+        rm -f "$pidfile"
+        lf -remote "send $id echo 'marp watcher stopped'"
+        exit 0
+    fi
+    cd "$dir"
+    set --
+    for css in themes/*.css; do
+        [ -e "$css" ] || continue
+        set -- "$@" --theme "$css"
+    done
+    nohup marp -w "$f" -o "$out" "$@" --pdf --html --allow-local-files --no-stdin \
+        >"$logfile" 2>&1 < /dev/null &
+    pid=$!
+    echo "$pid" > "$pidfile"
+    lf -remote "send $id echo 'marp watcher started — pid $pid, log $logfile'"
+}}
+map W marp_watch
+
 # --- pdf single-page peek (kitten icat fallback) ---
 cmd pdf_peek ${{
     pdftoppm -jpeg -r 150 -singlefile -- "$f" - \
