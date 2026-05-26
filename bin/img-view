@@ -12,9 +12,12 @@ KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 "$KITTEN" icat --clear --silent --transfer-mode=memory </dev/null 2>/dev/null || true
 clear
 
-exec "$KITTEN" icat \
-  --hold \
+"$KITTEN" icat \
   --place="${cols}x${h}@0x0" \
   --scale-up \
   --align=center \
   -- "$@"
+
+# Wait for any key; works under tmux unlike kitten's --hold.
+read -n 1 -s -r </dev/tty
+"$KITTEN" icat --clear --silent --transfer-mode=memory </dev/null 2>/dev/null || true
