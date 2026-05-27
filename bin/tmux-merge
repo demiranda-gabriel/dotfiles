@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# tmux-merge — gather the first N windows into one tiled window, and restore
+#              them exactly afterwards.
+#
+#   tmux-merge merge N    Pull every pane of the first N windows into the first
+#                         window and lay them out tiled (smart grid). Snapshots
+#                         each window's order/name/layout/active-pane first.
+#   tmux-merge restore    Rebuild the original windows from the snapshot:
+#                         same order, names, split layouts and active panes.
+#
+# Why it can restore exactly: a pane id (%N) is stable across moves, so panes
+# (with their processes + scrollback) are *moved*, never recreated. A window's
+# #{window_layout} string encodes geometry keyed by pane id, so feeding it back
+# to select-layout reproduces the exact split arrangement. window_id (@N) is the
+# only thing lost when a window empties — irrelevant here, since renumber-windows
+# keeps indices contiguous and we restore by order.
+set -euo pipefail
+
+sess=$(tmux display -p '#{session_id}')
+state="${TMPDIR:-/tmp}/tmux-merge-${sess#\$}.state"
+
+usage() { echo "usage: tmux-merge {merge N|restore}" >&2; exit 1; }
+
+cmd=${1:-}
+case "$cmd" in
+  merge)
+    N=${2:-}
+    [[ "$N" =~ ^[0-9]+$ ]] || usage
+
+    mapfile -t allw < <(tmux list-windows -F '#{window_id}')
+    wins=("${allw[@]:0:N}")
+    if (( ${#wins[@]} < 2 )); then
+      tmux display "tmux-merge: need at least 2 windows"; exit 0
+    fi
+    target=${wins[0]}
+
+    # Snapshot the first N windows BEFORE moving anything.
+    # Header line records the merged target window id.
+    printf 'M\t%s\n' "$target" > "$state"
+    for w in "${wins[@]}"; do
+      name=$(tmux display   -p -t "$w" '#{window_name}')
+      active=$(tmux display -p -t "$w" '#{pane_id}')
+      layout=$(tmux display -p -t "$w" '#{window_layout}')
+      panes=$(tmux list-panes -t "$w" -F '#{pane_id}' | paste -sd, -)
+      printf 'W\t%s\t%s\t%s\t%s\n' "$name" "$active" "$panes" "$layout" >> "$state"
+    done
+
+    # Merge: move every pane of the remaining windows into the target.
+    # Each source window auto-closes once its last pane leaves.
+    for w in "${wins[@]:1}"; do
+      for p in $(tmux list-panes -t "$w" -F '#{pane_id}'); do
+        tmux join-pane -d -s "$p" -t "$target"
+      done
+    done
+    tmux select-layout -t "$target" tiled
+
+    # Label each pane with its origin window name and show a per-pane border.
+    # Set window-local so only the merged window gets borders; it dies on
+    # restore, so no cleanup is needed afterwards.
+    tmux set-option -w -t "$target" pane-border-status top
+    tmux set-option -w -t "$target" pane-border-format ' #{pane_title} '
+    while IFS=$'\t' read -r tag name active panes layout; do
+      [[ "$tag" == W ]] || continue
+      IFS=',' read -ra parr <<< "$panes"
+      for p in "${parr[@]}"; do
+        tmux select-pane -t "$p" -T "$name"
+      done
+    done < "$state"
+
+    tmux select-window -t "$target"
+    ;;
+
+  restore)
+    [[ -f "$state" ]] || { tmux display "tmux-merge: no snapshot to restore"; exit 0; }
+    M=$(awk -F'\t' '$1=="M"{print $2; exit}' "$state")
+
+    # Rebuild each saved window, in order, inserted just before the merged
+    # window M. Forward order + insert-before lands them as W1,W2,...,WN; once
+    # M's last pane is removed it auto-closes and indices compact.
+    while IFS=$'\t' read -r tag name active panes layout; do
+      [[ "$tag" == W ]] || continue
+      IFS=',' read -ra parr <<< "$panes"
+      first=${parr[0]}
+      tmux break-pane -d -b -t "$M" -n "$name" -s "$first"
+      neww=$(tmux display -p -t "$first" '#{window_id}')
+      for p in "${parr[@]:1}"; do
+        tmux join-pane -d -s "$p" -t "$neww"
+      done
+      tmux select-layout -t "$neww" "$layout"
+      tmux select-pane   -t "$active"
+    done < "$state"
+
+    rm -f "$state"
+    ;;
+
+  *) usage ;;
+esac
