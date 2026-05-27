@@ -154,7 +154,10 @@ map o open-with
 # --- handy bindings ---
 map <enter> open
 map x cut
-map y copy
+# y is a pure prefix (yy=copy, yK=kitty download); a bare `map y copy`
+# would fire on first keypress and shadow yK, making it unreachable.
+map y
+map yy copy
 map p paste
 map d delete
 map . set hidden!
