@@ -21,7 +21,7 @@ The bootstrap script is idempotent. It:
    `lf`, `tmux`). For `tmux` also creates `~/.tmux.conf` as a fallback
    for tmux <3.1 (which doesn't honor the XDG path).
 5. Probes for `rclone`, `pigz`, `tmux`, `lf`, `tectonic`, `pandoc`,
-   `termpdf`, `pdftoppm`, and a configured `gdrive:` remote; reports missing.
+   `termpdf`, `pdftoppm`, and a configured `mir-backup:` remote; reports missing.
 
 Pass `--viewers` to also fetch the tool stack
 (`lf`, `tmux`, `tectonic`, `pandoc`, `termpdf.py` + Python deps) into
@@ -53,13 +53,15 @@ for first-page PDF peek, `yK` for kitty transfer download to local Mac.
 
 ## Backup workflow
 
-All bulk data lives under `gdrive:projects/<project>/<subpath>/<file>`.
-Code stays in GitHub; only datasets, raw artefacts, and processed
-outputs that need a long-term home off-cluster go to Drive.
+All bulk data lives under
+`mir-backup:Current_members/Gabriel/projects/<project>/<subpath>/<file>`
+on the **MIR-backup shared (Team) drive** (research group, not a personal
+account). Code stays in GitHub; only datasets, raw artefacts, and
+processed outputs that need a long-term home off-cluster go to Drive.
 
 | Command                                       | Behavior                                                                                |
 |-----------------------------------------------|-----------------------------------------------------------------------------------------|
-| `gdrive-push <local> [<sub>]`                 | `rclone copy <local> gdrive:projects/<proj>/<sub>/`                                     |
+| `gdrive-push <local> [<sub>]`                 | `rclone copy <local> mir-backup:Current_members/Gabriel/projects/<proj>/<sub>/`         |
 | `gdrive-pull <sub> [<dest>]`                  | inverse, into `<dest>` (default `.`)                                                    |
 | `gdrive-archive <dir> [<sub>] [--rm] [-n]`    | tar + pigz, upload, **keep local by default** (`--rm` deletes after a successful copy)  |
 
@@ -106,9 +108,15 @@ dotfiles/
 1. Install `rclone` and (optionally) `pigz` via the cluster's package
    manager or modules.
 2. `git clone … ~/dotfiles && ~/dotfiles/bootstrap.sh`.
-3. `rclone config` and create a remote named `gdrive` of type `drive`.
-   On a headless cluster, run `rclone authorize drive` on a machine
-   with a browser and paste the JSON token.
+3. `rclone config` and create a remote named `mir-backup` of type
+   `drive`, scoped to the **MIR-backup shared drive**: set
+   `team_drive = 0ABLkzStq5DREUk9PVA` (or pick it from the team-drive
+   list `rclone config` offers). On a headless cluster, run
+   `rclone authorize drive` on a machine with a browser and paste the
+   JSON token. To clone an existing personal `gdrive` remote into a
+   shared-drive one, copy its `[gdrive]` block in
+   `~/.config/rclone/rclone.conf` to `[mir-backup]` and add the
+   `team_drive` line.
 4. Smoke-test:
    ```bash
    echo hello > /tmp/hello.txt

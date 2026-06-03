@@ -2,7 +2,7 @@
 # gdrive-push <local_path> [<remote_subpath>] [-p PROJECT] [-n]
 #
 # Copy a local file or directory to:
-#   gdrive:projects/<PROJECT>/<remote_subpath>/<basename(local_path)>
+#   mir-backup:Current_members/Gabriel/projects/<PROJECT>/<remote_subpath>/<basename(local_path)>
 #
 # PROJECT resolution (first hit wins):
 #   1. -p flag
@@ -52,7 +52,10 @@ fi
 
 SUBPATH="${SUBPATH#/}"
 SUBPATH="${SUBPATH%/}"
-REMOTE_DIR="gdrive:projects/${PROJECT}"
+# Remote base: MIR-backup shared (Team) drive, under Current_members/Gabriel.
+# Override via $GDRIVE_REMOTE_BASE if the destination ever moves.
+REMOTE_BASE="${GDRIVE_REMOTE_BASE:-mir-backup:Current_members/Gabriel/projects}"
+REMOTE_DIR="${REMOTE_BASE}/${PROJECT}"
 [[ -n "$SUBPATH" ]] && REMOTE_DIR="${REMOTE_DIR}/${SUBPATH}"
 
 CMD=(rclone copy -P "$LOCAL" "$REMOTE_DIR")

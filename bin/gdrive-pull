@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gdrive-pull <remote_subpath> [<local_dest>] [-p PROJECT] [-n]
 #
-# Copy from gdrive:projects/<PROJECT>/<remote_subpath> into <local_dest>
+# Copy from mir-backup:Current_members/Gabriel/projects/<PROJECT>/<remote_subpath> into <local_dest>
 # (default: current directory). If <remote_subpath> ends in a filename,
 # only that file is fetched; otherwise the whole subtree.
 #
@@ -51,7 +51,10 @@ fi
 
 SUBPATH="${SUBPATH#/}"
 SUBPATH="${SUBPATH%/}"
-REMOTE="gdrive:projects/${PROJECT}/${SUBPATH}"
+# Remote base: MIR-backup shared (Team) drive, under Current_members/Gabriel.
+# Override via $GDRIVE_REMOTE_BASE if the destination ever moves.
+REMOTE_BASE="${GDRIVE_REMOTE_BASE:-mir-backup:Current_members/Gabriel/projects}"
+REMOTE="${REMOTE_BASE}/${PROJECT}/${SUBPATH}"
 
 mkdir -p "$DEST"
 CMD=(rclone copy -P "$REMOTE" "$DEST")

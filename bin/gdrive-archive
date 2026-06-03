@@ -2,7 +2,7 @@
 # gdrive-archive <local_dir> [<remote_subpath>] [-p PROJECT] [--name NAME] [--rm] [-n]
 #
 # Create a tarball of <local_dir> and upload it to:
-#   gdrive:projects/<PROJECT>/<remote_subpath>/<NAME>
+#   mir-backup:Current_members/Gabriel/projects/<PROJECT>/<remote_subpath>/<NAME>
 #
 # Default NAME = <basename(local_dir)>-<YYYY-MM-DD>.tar.gz
 # Honours <local_dir>/ignore_list.txt (tar -X) if present.
@@ -67,7 +67,10 @@ fi
 
 SUBPATH="${SUBPATH#/}"
 SUBPATH="${SUBPATH%/}"
-REMOTE_DIR="gdrive:projects/${PROJECT}"
+# Remote base: MIR-backup shared (Team) drive, under Current_members/Gabriel.
+# Override via $GDRIVE_REMOTE_BASE if the destination ever moves.
+REMOTE_BASE="${GDRIVE_REMOTE_BASE:-mir-backup:Current_members/Gabriel/projects}"
+REMOTE_DIR="${REMOTE_BASE}/${PROJECT}"
 [[ -n "$SUBPATH" ]] && REMOTE_DIR="${REMOTE_DIR}/${SUBPATH}"
 
 ARCHIVE="$(mktemp -d)/$NAME"

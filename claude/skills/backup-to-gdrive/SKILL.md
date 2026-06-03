@@ -9,13 +9,20 @@ Wraps three scripts installed by `~/dotfiles/bootstrap.sh`:
 
 | Script           | Purpose                                                      |
 |------------------|--------------------------------------------------------------|
-| `gdrive-push`    | rclone copy a file/dir to `gdrive:projects/<proj>/<sub>/`    |
-| `gdrive-pull`    | inverse: download from `gdrive:projects/<proj>/<sub>/`       |
+| `gdrive-push`    | rclone copy a file/dir to `mir-backup:Current_members/Gabriel/projects/<proj>/<sub>/` |
+| `gdrive-pull`    | inverse: download from the same path                        |
 | `gdrive-archive` | tar+pigz a directory, upload, optionally remove local archive |
 
 All three resolve `<proj>` from (in order): `-p` flag, `$PROJECT_NAME`, or
 `basename(git rev-parse --show-toplevel)`. The remote layout is fixed:
-**`gdrive:projects/<project>/<sub>/<filename>`**.
+**`mir-backup:Current_members/Gabriel/projects/<project>/<sub>/<filename>`**.
+
+`mir-backup:` is the **MIR-backup shared (Team) drive** (research group),
+*not* a personal account — distinct from the legacy `gdrive:` remote
+(personal My Drive) that backups used before 2026-06-03. The remote base
+is set via `$GDRIVE_REMOTE_BASE` in each script (default
+`mir-backup:Current_members/Gabriel/projects`), so a future move is a
+one-line change.
 
 ## When to invoke
 
@@ -83,7 +90,8 @@ gdrive-archive shared_models models -p shared-assets
 Before invoking a script for the user, sanity-check:
 
 - `command -v gdrive-archive` returns a path (else: bootstrap not run)
-- `rclone listremotes` includes `gdrive:` (else: run `rclone config`)
+- `rclone listremotes` includes `mir-backup:` (else: see README setup —
+  create it with `team_drive = 0ABLkzStq5DREUk9PVA`)
 - For `--rm` invocations, the user has explicitly authorized deletion
 - For multi-GB uploads, the user is aware (mention the size first)
 
