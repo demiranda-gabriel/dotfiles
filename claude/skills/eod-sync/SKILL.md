@@ -13,9 +13,34 @@ already classified, and pausing only to ask you about anything new the
 plan doesn't yet cover.
 
 Default behaviour: **apply the safe, classified actions automatically;
-ask about new/unclassified entries, record the answer in the plan, then
-continue autonomously.** Make no irreversible change (deletion, history
-rewrite) without explicit confirmation.
+surface every decision point interactively (see Interaction model),
+record the outcome where it belongs, then continue autonomously.** Make
+no irreversible change (deletion, history rewrite) without explicit
+confirmation.
+
+## Interaction model (default)
+
+Surface every decision point to the user **interactively, one at a time**,
+with AskUserQuestion — never silently guess, never collapse distinct
+choices into one lump, and never dump them all as plain prose for the user
+to sort out. For each decision:
+
+- Inspect the thing first (size, file types, git state, is-it-a-repo) so
+  the options are concrete and correct.
+- Present it as its own question with 2–4 options, the **recommended one
+  first**, each with a one-line consequence.
+- Act on that item only after the user answers; then move to the next.
+
+This applies to **any** judgment call — not just classifying a new entry:
+where a new file/dir belongs, whether to commit work-in-progress, whether
+to add a `.gitignore` rule, any multi-GB or hard-to-reverse push, etc.
+Decisions within one project may share a single AskUserQuestion call (as
+separate questions), but each distinct decision stays its own question.
+
+Only **truly unambiguous, safe mechanics** are applied without a prompt:
+committing changes to already-classified git-tracked paths, pushing
+already-classified gdrive-tracked data, pushing an existing local commit.
+The interactive step is for the *decisions*, not the plumbing.
 
 ## Projects root
 
@@ -93,7 +118,7 @@ added, and anything still needing attention. Close with an overall
 
 ## Guardrails
 - Skip experiments with active SLURM jobs — never touch their in-flight outputs.
-- New top-level entry → ask, record in `DATA_MANAGEMENT.md`, *then* act. Never silently guess a classification.
+- Every decision point (new entry, WIP commit, new ignore rule, multi-GB / hard-to-reverse push) → surface it interactively, one at a time, per the **Interaction model**. For a new top-level entry, record the answer in `DATA_MANAGEMENT.md` before acting. Never silently guess.
 - Models go to Drive only as `.nequip.zip`, never raw `.ckpt`.
 - Never edit third-party / vendored / site-packages source.
 - Confirm a recent push before deleting any local gdrive-tracked copy; deletion needs explicit user say-so.
