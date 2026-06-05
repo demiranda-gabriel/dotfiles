@@ -1,0 +1,4 @@
+# SLURM stdout logs written here by vscode.job / gpu.job — regenerable.
+out
+out_gpu
+*.out

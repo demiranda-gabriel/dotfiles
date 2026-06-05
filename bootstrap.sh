@@ -140,6 +140,26 @@ if [[ -f "$TMUX_CONF_SRC" ]]; then
     fi
 fi
 
+# 3e. FASRC-only: symlink the ~/scripts/vscode allocation toolkit from dotfiles.
+# Skipped off FASRC (these scripts use Cannon partitions / `code tunnel`).
+if [[ -d /n/netscratch ]]; then
+    VSCODE_SRC="$DOTFILES/scripts/vscode"
+    VSCODE_TARGET="$HOME/scripts/vscode"
+    if [[ -d "$VSCODE_SRC" ]]; then
+        mkdir -p "$HOME/scripts"
+        if [[ -L "$VSCODE_TARGET" || -e "$VSCODE_TARGET" ]]; then
+            if [[ "$(readlink -f "$VSCODE_TARGET" 2>/dev/null)" == "$VSCODE_SRC" ]]; then
+                echo "✓ ~/scripts/vscode already linked"
+            else
+                echo "⚠ $VSCODE_TARGET exists and points elsewhere — skipping"
+            fi
+        else
+            ln -s "$VSCODE_SRC" "$VSCODE_TARGET"
+            echo "✓ linked ~/scripts/vscode → $VSCODE_SRC"
+        fi
+    fi
+fi
+
 # 3d. Optional install stack (lf, tmux, tectonic, pandoc, termpdf)
 if (( INSTALL_VIEWERS )); then
     echo
