@@ -1,19 +1,77 @@
 #!/usr/bin/env bash
-# tmux-window-fzf — a Ctrl-b w replacement with a side-by-side layout:
-#   window list on the LEFT (with a Claude-session state glyph), live pane
-#   preview on the RIGHT. Launched from a tmux display-popup (see `bind-key w`).
+# tmux-window-fzf — a Ctrl-b w replacement with a three-column layout:
+#   window list on the LEFT (with a Claude-session state glyph), and on the
+#   RIGHT a single fzf preview region split into two sub-columns:
+#     live pane preview  │  SLURM job list (a snapshot of the `lq` alias).
+#   Launched from a tmux display-popup (see `bind -n M-j` in ~/.tmux.conf).
 #
 # State glyph mirrors the tab bar, driven by the per-window @claude_state option
 # set by the claude-tmux-state hook:
 #   ● orange = running   ○ orange = waiting (bg/ext, not your turn)   ● green = your turn
+#
+# The job column is a one-shot snapshot taken when the popup opens (squeue is not
+# re-run on every keystroke). It mirrors:  lq = squeue -u <me> -S t -o "%.30j %.12T"
 set -eo pipefail
+
+# Absolute path to this script, so fzf's --preview can re-invoke it.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------------------
+# Preview sub-command: `tmux-window-fzf --preview <target> <jobs_cache_file>`
+# Renders pane-capture (left) and the cached job list (right) side by side,
+# sized to fzf's preview width. Falls back to pane-only when too narrow.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--preview" ]; then
+  target="$2"; jobs_cache="${3:-}"
+  lines="${FZF_PREVIEW_LINES:-40}"
+  cols="${FZF_PREVIEW_COLUMNS:-80}"
+  jobw=43                          # lq line width: %.30j + ' ' + %.12T
+  panew=$(( cols - jobw - 3 ))     # 3 = ' │ ' separator
+
+  if [ -z "$jobs_cache" ] || [ ! -s "$jobs_cache" ] || [ "$panew" -lt 24 ]; then
+    # No jobs to show, or preview too narrow for two columns: pane only (keep color).
+    tmux capture-pane -pet "$target" 2>/dev/null | tail -n "$lines"
+    exit 0
+  fi
+
+  # capture-pane WITHOUT -e here: stripping ANSI keeps the column math aligned.
+  awk -v w="$panew" -v jw="$jobw" '
+    NR==FNR { p[FNR]=$0; np=FNR; next }
+            { j[FNR]=$0; nj=FNR }
+    END {
+      n = (np > nj) ? np : nj
+      bar = "\033[90m│\033[0m"
+      for (i = 1; i <= n; i++) {
+        pl = (i <= np) ? p[i] : ""
+        jl = (i <= nj) ? j[i] : ""
+        if (length(pl) > w)  pl = substr(pl, 1, w)
+        if (length(jl) > jw) jl = substr(jl, 1, jw)
+        # Colorise state (job column is rightmost, so ANSI here breaks no alignment).
+        gsub(/RUNNING/, "\033[38;5;46mRUNNING\033[0m", jl)   # green
+        gsub(/PENDING/, "\033[38;5;220mPENDING\033[0m", jl)  # yellow
+        printf "%-*s %s %s\n", w, pl, bar, jl
+      }
+    }
+  ' <(tmux capture-pane -pt "$target" 2>/dev/null | tail -n "$lines") "$jobs_cache"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Main: build the window list and let fzf drive switch-client.
+# ---------------------------------------------------------------------------
 
 # Be robust to the popup's PATH: fzf lives in ~/.local/bin, fall back to PATH.
 FZF="$HOME/.local/bin/fzf"; [ -x "$FZF" ] || FZF="fzf"
 
+# One-shot SLURM queue snapshot for the side column (mirrors the `lq` alias).
+JOBS_CACHE="$(mktemp "${TMPDIR:-/tmp}/twf-jobs.XXXXXX")"
+trap 'rm -f "$JOBS_CACHE"' EXIT
+squeue -u "${USER:-$(id -un)}" -S t -o "%.30j %.12T" >"$JOBS_CACHE" 2>/dev/null \
+  || printf '(squeue unavailable)\n' >"$JOBS_CACHE"
+
 sel=$(
   tmux list-windows -a \
-    -F $'#{session_name}:#{window_index}\t#{@claude_state}\t#{?window_active,1,0}\t#{session_name}: #{window_name}  (#{window_panes}p)' \
+    -F $'#{session_name}:#{window_index}\t#{@claude_state}\t#{?window_active,1,0}\t#{window_name}' \
   | awk -F'\t' 'BEGIN{e=sprintf("%c",27); r=e"[0m"}
       {
         s=$2
@@ -26,8 +84,8 @@ sel=$(
         printf "%s\t%s %s%s\n", $1, g, act, $4
       }' \
   | "$FZF" --ansi --delimiter=$'\t' --with-nth=2 \
-        --preview='tmux capture-pane -pet {1} | tail -n "${FZF_PREVIEW_LINES:-40}"' \
-        --preview-window='right:65%' \
+        --preview="'$SELF' --preview {1} '$JOBS_CACHE'" \
+        --preview-window='right:70%' \
         --reverse --prompt='search ❯ ' \
         --header='jk:move  g/G:ends  s:search  ⏎:switch  esc:cancel' \
         --no-input \
