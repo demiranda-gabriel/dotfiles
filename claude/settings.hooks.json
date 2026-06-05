@@ -1,0 +1,56 @@
+{
+  "//": "Reference snippet — the Claude Code hooks that drive the precise per-window tmux Claude-state glyph (config/tmux/tmux.conf). NOT auto-installed: ~/.claude/settings.json is per-host (model, plugins, statusLine paths differ per cluster), so merge this `hooks` block in by hand. See README → 'tmux Claude-state glyph'. Without these hooks the glyph still works approximately via the claude-tmux-watch polling fallback; with them it distinguishes running / bg / ext / you precisely. The hook command resolves to ~/.local/bin/claude-tmux-state, which bootstrap.sh symlinks from bin/.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/claude-tmux-state UserPromptSubmit"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/claude-tmux-state PreToolUse"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/claude-tmux-state Notification"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/claude-tmux-state Stop"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/claude-tmux-state SessionEnd"
+          }
+        ]
+      }
+    ]
+  }
+}

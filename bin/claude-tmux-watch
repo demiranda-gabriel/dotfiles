@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# claude-tmux-watch — background fallback that keeps a state glyph on every
+# Claude tmux window, including sessions started BEFORE the claude-tmux-state
+# hooks were installed (which therefore never fire a hook).
+#
+# Hook-managed windows mark themselves with @claude_hooked=1 and are skipped
+# here, so their precise state is never clobbered. Un-hooked Claude windows are
+# classified as:
+#   "esc to interrupt" visible        -> running   (actively working)
+#   else live background watcher shell -> ext       (waiting on a job, etc.)
+#   else                              -> you        (idle / awaiting input)
+#
+# Started once from tmux.conf behind a dedupe guard; exits when the tmux server
+# goes away. Tunable: CLAUDE_TMUX_WATCH_INTERVAL (seconds, default 3).
+set -eo pipefail
+
+INTERVAL="${CLAUDE_TMUX_WATCH_INTERVAL:-3}"
+EXTWAIT="$HOME/.local/bin/claude-tmux-extwait"
+
+classify() {  # $1 = window target, $2 = pane_pid -> echoes running|ext|you
+  local txt
+  txt=$(tmux capture-pane -pt "$1" 2>/dev/null | tail -n 30) || { echo you; return; }
+  if printf '%s' "$txt" | grep -qiE 'esc to interrupt'; then echo running; return; fi
+  if [ -n "$2" ] && "$EXTWAIT" "$2"; then echo ext; return; fi
+  echo you
+}
+
+while tmux list-sessions >/dev/null 2>&1; do
+  while IFS=$'\t' read -r target hooked cmd pane_pid manual; do
+    [ -n "$target" ] || continue
+    [ "$hooked" = "1" ] && continue          # owned by hooks; hands off
+    [ "$manual" = "1" ] && continue          # manual override (claude-tmux-set); hands off
+    if [ "$cmd" = "claude" ]; then
+      tmux set-option -w -t "$target" @claude_state "$(classify "$target" "$pane_pid")" >/dev/null 2>&1
+    else
+      # No longer a Claude window: clear any glyph we previously set.
+      tmux set-option -uw -t "$target" @claude_state >/dev/null 2>&1
+    fi
+    # NB: the @claude_hooked field is forced to 1/0 (never empty) so adjacent
+    # tabs can't collapse under IFS and shift the fields.
+  done < <(tmux list-windows -a -F $'#{session_name}:#{window_index}\t#{?#{@claude_hooked},1,0}\t#{pane_current_command}\t#{pane_pid}\t#{?#{@claude_manual},1,0}' 2>/dev/null)
+  sleep "$INTERVAL"
+done

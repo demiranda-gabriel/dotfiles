@@ -51,6 +51,59 @@ termpdf, image → img-view). `B` / `H` for big/huge font markdown, `P`
 for first-page PDF peek, `yK` for kitty transfer download to local Mac.
 `R` reloads the lf config.
 
+## tmux config
+
+`config/tmux/tmux.conf` is symlinked to `~/.config/tmux/tmux.conf` (and
+`~/.tmux.conf` for tmux <3.1). Beyond the keybinding tweaks and the
+TPM/minimal-tmux-status plugins (auto-installed on first run), it wires
+up a set of helper scripts that **must be present in `~/.local/bin/`** —
+`bootstrap.sh` symlinks them there from `bin/`:
+
+| Binding / hook        | Helper (in `bin/`)   | What it does                                                            |
+|-----------------------|----------------------|-------------------------------------------------------------------------|
+| `prefix + g` / `G`    | `tmux-merge`         | Gather first N windows into one tiled window / restore them exactly     |
+| `M-j`                 | `tmux-window-fzf`    | fzf window chooser popup (list left, live pane preview right)           |
+| `prefix + S`          | `claude-tmux-set`    | Menu to manually override this window's Claude-state glyph              |
+| `run-shell -b` (auto) | `claude-tmux-watch`  | Background fallback that scrapes panes to keep the glyph current        |
+| (called by the above) | `claude-tmux-extwait`| Detects a live Claude-spawned background shell (e.g. a SLURM poll)      |
+| Claude Code hooks     | `claude-tmux-state`  | Precise glyph driver, invoked by `~/.claude/settings.json` hooks        |
+
+### tmux Claude-state glyph
+
+Each window tab (and the `M-j` chooser) shows a coloured glyph for the
+Claude session in that window — orange ● running, orange ○ waiting,
+green ● your turn — read from a per-window `@claude_state` tmux option.
+There are two ways that option gets set:
+
+- **Polling fallback** — `claude-tmux-watch` is started automatically by
+  `tmux.conf` and scrapes each Claude pane every few seconds. This needs
+  **no extra wiring**: once the scripts are on `PATH`, the glyph works.
+- **Precise hooks** *(optional)* — `claude-tmux-state` is invoked by
+  Claude Code hooks and distinguishes `running` / `bg` / `ext` / `you`
+  exactly (the fallback can't tell `bg` from `ext`). Because
+  `~/.claude/settings.json` is per-host (model, plugins, statusLine
+  paths differ per cluster), it is **not** auto-installed. To enable the
+  precise path, merge the `hooks` block from
+  `claude/settings.hooks.json` into your `~/.claude/settings.json` —
+  e.g. with `jq`:
+
+  ```bash
+  jq -s '.[0] * {hooks: .[1].hooks}' \
+     ~/.claude/settings.json ~/dotfiles/claude/settings.hooks.json \
+     > /tmp/settings.merged && mv /tmp/settings.merged ~/.claude/settings.json
+  ```
+
+### External dependencies (install via your cluster's package manager)
+
+These are *not* fetched by the repo — install them yourself:
+
+- **`fzf`** — required for the `M-j` window chooser (`tmux-window-fzf`).
+- **`jq`** — used by `claude-tmux-state` to read the hook payload; it
+  degrades gracefully if absent (the `ext`-marker arming is skipped), so
+  it is optional but recommended for the precise hooks.
+- **`tmux` ≥ 3.2** — for `display-popup` (`M-j`) and `display-menu`
+  (`prefix + S`). The bundled `install-tmux.sh` ships 3.5a.
+
 ## Backup workflow
 
 All bulk data lives under
@@ -83,7 +136,10 @@ dotfiles/
 ├── bin/                                 ← scripts symlinked into ~/.local/bin
 │   ├── gdrive-{push,pull,archive}
 │   ├── md-view                          ← markdown → pandoc/tectonic → termpdf
-│   └── img-view                         ← image filling terminal via kitten icat
+│   ├── img-view                         ← image filling terminal via kitten icat
+│   ├── tmux-merge                       ← gather/restore windows as panes (prefix g/G)
+│   ├── tmux-window-fzf                  ← fzf window chooser popup (M-j; needs fzf)
+│   └── claude-tmux-{state,watch,set,extwait}  ← Claude-state tab glyph (see "tmux config")
 ├── config/                              ← per-file symlinks into ~/.config/<app>
 │   ├── lf/{lfrc,preview,cleaner}
 │   └── tmux/tmux.conf                   ← also symlinked to ~/.tmux.conf (legacy fallback)
@@ -97,8 +153,11 @@ dotfiles/
 │   ├── 00-path.sh                       ← prepends ~/.local/bin to $PATH
 │   ├── 50-backup.sh                     ← backup / restore / cloudsave aliases
 │   └── 60-lf.sh                         ← EDITOR=nvim + lfcd cd-on-exit wrapper
-├── claude/skills/                       ← symlinked into ~/.claude/skills
-│   └── backup-to-gdrive/SKILL.md
+├── claude/                              ← Claude Code config
+│   ├── skills/                          ← symlinked into ~/.claude/skills
+│   │   └── backup-to-gdrive/SKILL.md
+│   ├── CLAUDE.md                        ← symlinked into ~/.claude/CLAUDE.md
+│   └── settings.hooks.json              ← hooks for the tmux glyph (merge by hand)
 ├── rclone/rclone.conf.example           ← template; real config is per-cluster
 └── bootstrap.sh
 ```

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# claude-tmux-set STATE  — manually override the @claude_state glyph for the
+# CURRENT tmux window. STATE ∈ { running | bg | ext | you | auto }.
+#
+#   running/bg/ext/you : force that state and mark @claude_manual=1 so the
+#                        fallback watcher (claude-tmux-watch) won't clobber it.
+#   auto               : release the override (clear @claude_manual).
+#
+# The override is intentionally NOT permanent: for a hook-managed window the
+# next hook event (PreToolUse / Stop / Notification / UserPromptSubmit) rewrites
+# @claude_state, so the manual value holds only "until any further process
+# retriggers the status". Use `auto` to drop the @claude_manual flag explicitly.
+set -eo pipefail
+
+state="${1:-}"
+# Target the active pane: $TMUX_PANE when run inside a pane, else whatever pane
+# is current (e.g. when invoked from a tmux key binding via run-shell).
+pane="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"
+[ -n "$pane" ] || { echo "claude-tmux-set: not inside tmux" >&2; exit 1; }
+
+case "$state" in
+  running|bg|ext|you)
+    tmux set-option -w -t "$pane" @claude_state "$state"
+    tmux set-option -w -t "$pane" @claude_manual 1
+    tmux display-message "claude state → $state (manual; released on next activity)"
+    ;;
+  auto|clear|"")
+    tmux set-option -uw -t "$pane" @claude_manual
+    tmux display-message "claude state → auto (manual override released)"
+    ;;
+  *)
+    echo "usage: claude-tmux-set {running|bg|ext|you|auto}" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# claude-tmux-state EVENT
+#
+# Invoked by Claude Code hooks (see ~/.claude/settings.json). Reads the hook's
+# JSON payload on stdin and stamps a per-window tmux user option @claude_state
+# on the window that hosts THIS Claude session, identified via $TMUX_PANE.
+#
+#   @claude_state ∈ { running, bg, ext, you }
+#     running : actively generating / running a tool
+#     bg      : turn ended but a LIVE background process is still running
+#               (a backgrounded Bash watcher, e.g. a SLURM poll) — no input needed
+#     ext     : turn ended with an armed wake-up but no live process to observe
+#               (a scheduled wake-up, /loop, or cron) — no input needed yet
+#     you     : genuinely stuck waiting on you -> the ONLY state that means
+#               "your input needed". Set when the turn ended with nothing pending,
+#               or on a permission prompt. An idle notification while a background
+#               process runs does NOT flip to you (it stays bg/ext).
+#
+# Both the tmux tab bar (window-status-format) and the fzf window chooser
+# (tmux-window-fzf) render a coloured glyph from this single source of truth.
+#
+# Contract with Claude Code hooks: stay SILENT on stdout (stdout from Stop /
+# UserPromptSubmit hooks is otherwise fed back into the model) and always exit 0.
+
+event="${1:-}"
+pane="${TMUX_PANE:-}"
+
+# Only meaningful inside tmux; harmless no-op everywhere else.
+[ -n "$pane" ] || exit 0
+command -v tmux >/dev/null 2>&1 || exit 0
+
+# Detector for a live background watcher (e.g. a backgrounded SLURM-poll shell).
+EXTWAIT="$HOME/.local/bin/claude-tmux-extwait"
+
+set_state() {
+  tmux set-option -w -t "$pane" @claude_state "$1" >/dev/null 2>&1
+  # Mark this window as hook-managed so claude-tmux-watch leaves it alone
+  # (the watcher can't detect 'ext' by scraping and would otherwise clobber it).
+  tmux set-option -w -t "$pane" @claude_hooked 1 >/dev/null 2>&1
+}
+
+# Per-pane marker: present == this turn armed an "external wait". Pane ids look
+# like %30; sanitise for a filename. /tmp is node-local on the cluster, which is
+# exactly right — the hook and its session always share a node.
+marker="${TMPDIR:-/tmp}/claude-tmux-extwait.${pane//[^A-Za-z0-9]/_}"
+
+arm()    { : > "$marker" 2>/dev/null; }
+disarm() { rm -f "$marker" 2>/dev/null; }
+
+# Resolve the post-turn state from what work is still pending:
+#   bg  : a live background watcher (e.g. a backgrounded SLURM poll) is running now
+#   ext : no live process, but a wake-up / loop / cron was armed this turn-chain
+#   you : nothing pending -> genuinely your turn
+# $$ lets the detector ignore this hook's own wrapper shell.
+decide_idle() {
+  local pane_pid
+  pane_pid=$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null)
+  if [ -n "$pane_pid" ] && "$EXTWAIT" "$pane_pid" "$$"; then
+    set_state bg
+  elif [ -f "$marker" ]; then
+    set_state ext
+  else
+    set_state you
+  fi
+}
+
+case "$event" in
+  UserPromptSubmit)
+    disarm
+    set_state running
+    ;;
+
+  PreToolUse)
+    # Arm the marker for waits that leave NO process to observe (scheduled
+    # wake-ups / loops). Backgrounded shells are detected live at Stop via
+    # claude-tmux-extwait, so they don't need the marker. We deliberately do not
+    # disarm on other tools: a foreground call after arming must not erase it.
+    payload=$(cat 2>/dev/null)
+    if command -v jq >/dev/null 2>&1; then
+      tool=$(printf '%s' "$payload" | jq -r '.tool_name // empty' 2>/dev/null)
+    else
+      tool=""
+    fi
+    case "$tool" in
+      ScheduleWakeup|CronCreate|Monitor) arm ;;
+    esac
+    set_state running
+    ;;
+
+  Notification)
+    # A notification is NOT automatically "your turn". A permission prompt truly
+    # blocks on you. But the idle "waiting for your input" nudge fires even while a
+    # backgrounded process is running -> defer to decide_idle so the green glyph
+    # means ONLY "really stuck waiting for input", never "busy in the background".
+    payload=$(cat 2>/dev/null)
+    if printf '%s' "$payload" | grep -qi 'permission'; then
+      set_state you
+    else
+      decide_idle
+    fi
+    ;;
+
+  Stop)
+    decide_idle
+    ;;
+
+  SessionEnd)
+    disarm
+    tmux set-option -uw -t "$pane" @claude_state  >/dev/null 2>&1
+    tmux set-option -uw -t "$pane" @claude_hooked >/dev/null 2>&1
+    ;;
+esac
+
+exit 0

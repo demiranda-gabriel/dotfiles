@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# claude-tmux-extwait PANE_PID [EXCLUDE_PID]
+#
+# Exit 0 if the Claude session rooted at PANE_PID has a LIVE Claude-spawned
+# background shell — i.e. a `Bash(run_in_background:true)` watcher, the pattern
+# used to wait on SLURM jobs. Exit 1 otherwise.
+#
+# How: every shell Claude Code launches is wrapped so it sources a
+# shell-snapshot file and redirects to /tmp/claude-*-cwd. A *foreground* tool's
+# shell is gone by the time we care (Stop / idle), so any descendant of the
+# session's process tree still carrying that signature is a background shell.
+#
+# EXCLUDE_PID (the calling hook's own $$) and its ancestor chain are ignored, so
+# a Stop hook never mistakes its OWN wrapper shell for a background watcher.
+
+root="$1"; self="${2:-0}"
+[ -n "$root" ] || exit 1
+
+ps -eo pid=,ppid=,args= 2>/dev/null | awk -v root="$root" -v self="$self" '
+  { pid=$1; ppid=$2; $1=""; $2=""; PP[pid]=ppid; AA[pid]=$0 }
+  END {
+    # transitive descendants of root
+    desc[root]=1; changed=1
+    while (changed) {
+      changed=0
+      for (p in PP) if (!(p in desc) && (PP[p] in desc)) { desc[p]=1; changed=1 }
+    }
+    # exclude the caller (self) and its ancestor chain up to root
+    e=self
+    while (e!="" && e!="0" && e!="1") { excl[e]=1; if (e==root) break; e=PP[e] }
+    for (p in desc) {
+      if (p==root || (p in excl)) continue
+      a=AA[p]
+      if (a ~ /snapshot-bash/ || a ~ /\/tmp\/claude-[A-Za-z0-9]+-cwd/) { found=1 }
+    }
+    exit(found ? 0 : 1)
+  }
+'
