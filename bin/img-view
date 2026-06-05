@@ -6,6 +6,15 @@ cols=$(tput cols)
 rows=$(tput lines)
 h=$((rows - 1))
 
+# Under tmux, passthrough mode uses Unicode placeholders. Writing a placeholder
+# to the final column triggers terminal autowrap, dragging trailing cells onto
+# the next row and corrupting the rightmost column of the image. Shave one
+# column to keep the placeholder grid strictly inside the pane.
+w=$cols
+if [[ -n "${TMUX:-}" ]]; then
+  w=$((cols - 1))
+fi
+
 KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 
 # Clear any prior kitty graphics + text scrollback view.
@@ -13,7 +22,7 @@ KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 clear
 
 "$KITTEN" icat \
-  --place="${cols}x${h}@0x0" \
+  --place="${w}x${h}@0x0" \
   --scale-up \
   --align=center \
   -- "$@"
