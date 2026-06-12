@@ -86,6 +86,75 @@ incomplete — `xelatex`/`lualatex` missing `ucharcat.sty`, xcolor broken.
 `md-view` defaults to `tectonic` to bypass this entirely. Don't try to
 "fix" by switching to system pdflatex unless explicitly working ASCII-only.
 
+## Job submission on Polaris (ALCF) — HyperQueue workflow
+
+**Polaris-only section** (PBS Pro; other clusters ignore). All compute jobs
+go through **HyperQueue** (`hq`, `~/.local/bin/`), NOT raw `qsub`. A
+standing fleet of 2 nodes / 8 A100s is kept attached at all times; tasks
+submitted to the HQ server start within seconds on whatever workers are up.
+
+### Submitting work
+
+```bash
+hq submit --resource gpus/nvidia=1 -- python train.py  # 1 GPU; HQ sets CUDA_VISIBLE_DEVICES
+hq submit --cpus 16 -- ./analysis.sh                   # CPU-only
+hq job list / hq job info <id> / hq job cat <id> stdout
+hq-fleet status                                        # fleet at a glance
+```
+
+Tasks are cheap (~ms overhead) — submit many small ones; HQ packs them
+(e.g. 4 single-GPU tasks per node). Tasks interrupted by preemption retry
+automatically (default `--crash-limit 5`).
+
+### Architecture (set up 2026-06-12; do not re-invent)
+
+| Piece | What / where |
+|-------|--------------|
+| HQ server | `polaris-login-01`, tmux session `hq`, journal `~/.hq/journal`, log `~/.hq/server.log` |
+| `hq-server-up` | THE ONLY way to (re)start the server — applies LD_PRELOAD shim + taskset (see cgroup note) |
+| `hq-fleet` | orchestrator, tmux session `hq-fleet`; subcommands `status/up/down/tick`, `DRY_RUN=1` to preview; log `~/.hq/fleet.log` |
+| Primary allocation | 2-node/168h `capacity` job `hq-capacity` (`~/.hq/capacity-workers.pbs`) |
+| Bridge allocation | 2-node/72h `preemptable` job `hq-bridge` (`~/.hq/preempt-bridge.pbs`), ensured when no capacity job runs or <24h remains; auto-cancelled when capacity is healthy AND no HQ task is running |
+| Autoalloc queues | `debug` (1n/1h) and `preempt` (1n/72h) — HQ auto-qsubs only when tasks wait uncovered; safety net, normally silent |
+
+The fleet self-heals: each tick re-runs `hq-server-up` (idempotent), resubmits
+capacity when the project slot frees, resubmits the bridge if preempted.
+
+**Resizing the fleet**: `qalter -l select=...` is BLOCKED by ALCF's
+account_check hook — resizing requires resubmission. Edit `select=` in both
+`~/.hq/*.pbs` scripts, then `hq-fleet down`, `qdel` the queued `hq-capacity`
+/ `hq-bridge` jobs, `hq-fleet tick` (resubmits at the new size), `hq-fleet up`.
+
+### Login-node cgroup trap (affects EVERYTHING, not just hq)
+
+Login nodes confine each user to `/sys/fs/cgroup/users/$USER/`:
+**8 cores, 8 GB RAM, 256 pids — and pids count THREADS.** At the cap, every
+new `fork()`/`pthread_create()` in any process fails (crashes Claude/Node
+sessions). `taskset` does NOT constrain libraries that read raw core count
+via `get_nprocs()` (the HiGHS solver inside hq spawned 128 threads this way).
+Fix: `LD_PRELOAD=~/.hq/shim/nproc8.so` (fakes 8 CPUs; source alongside).
+Apply shim + `taskset -c 0-7` to ANY long-lived daemon on login nodes.
+Diagnose with `cat /sys/fs/cgroup/users/$USER/pids.{current,events}`.
+
+### Queue facts (verified empirically)
+
+- `capacity`: ≤4 nodes, ≤168h, **2 jobs/project (queued+running, Held jobs
+  count)** — check teammates' jobs (`qstat -f <id> | grep Account_Name`)
+  before submitting.
+- `preemptable`: 1–10 nodes, ≤72h, can be preempted by on-demand jobs.
+- `debug`: ≤2 nodes, ≤1h. `prod` walltime is tiered by node count (10n→3h).
+- Always pass `-A HetRxnEnergy -l filesystems=home:eagle -l place=scatter`.
+
+### Troubleshooting
+
+- Server dead / `hq` says "no running instance" → `hq-server-up` (journal
+  restores jobs + autoalloc queues; fleet does this automatically within 10 min).
+- No workers → `hq-fleet status`; check `qstat -u $USER` and `~/.hq/fleet.log`.
+- Never start the server bare, never move it off `polaris-login-01`
+  (clients dial the host recorded in `~/.hq-server/`).
+- Pause everything (e.g. budget): `hq-fleet down`, then `qdel` the
+  `hq-capacity` / `hq-bridge` jobs.
+
 ## New-cluster recipe
 
 ```bash
