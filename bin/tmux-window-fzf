@@ -16,6 +16,11 @@ set -eo pipefail
 # Absolute path to this script, so fzf's --preview can re-invoke it.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
+# Column width ratio:  window-list : pane-preview : jobs.  Tweak to taste.
+# Drives both the fzf list/preview split AND the pane/jobs split inside the
+# preview, so the three columns end up in these proportions across the popup.
+LIST_R=2; PANE_R=6; JOBS_R=3
+
 # ---------------------------------------------------------------------------
 # Preview sub-command: `tmux-window-fzf --preview <target> <jobs_cache_file>`
 # Renders pane-capture (left) and the cached job list (right) side by side,
@@ -25,7 +30,9 @@ if [ "${1:-}" = "--preview" ]; then
   target="$2"; jobs_cache="${3:-}"
   lines="${FZF_PREVIEW_LINES:-40}"
   cols="${FZF_PREVIEW_COLUMNS:-80}"
-  jobw=43                          # lq line width: %.30j + ' ' + %.12T
+  # Split the preview width into pane:jobs per the ratio (3 cols go to ' │ ').
+  jobw=$(( (cols - 3) * JOBS_R / (PANE_R + JOBS_R) ))
+  [ "$jobw" -lt 14 ] && jobw=14    # keep at least the state + a little name
   panew=$(( cols - jobw - 3 ))     # 3 = ' │ ' separator
 
   if [ -z "$jobs_cache" ] || [ ! -s "$jobs_cache" ] || [ "$panew" -lt 24 ]; then
@@ -34,8 +41,23 @@ if [ "${1:-}" = "--preview" ]; then
     exit 0
   fi
 
-  # capture-pane WITHOUT -e here: stripping ANSI keeps the column math aligned.
+  # capture-pane WITH -e to keep the pane's colors; vpad() pads/truncates the
+  # left column by *visible* width (skipping ANSI escapes) so the separator and
+  # job column still line up, then resets colour before the bar so it can't bleed.
   awk -v w="$panew" -v jw="$jobw" '
+    function vpad(s,   out, v) {
+      out = ""; v = 0
+      while (length(s) > 0 && v < w) {
+        if (match(s, /^\033\[[0-9;?]*[A-Za-z]/)) {      # copy escape, do not count it
+          out = out substr(s, 1, RLENGTH); s = substr(s, RLENGTH + 1)
+        } else {                                        # copy one visible char
+          out = out substr(s, 1, 1); s = substr(s, 2); v++
+        }
+      }
+      out = out "\033[0m"                               # stop colour bleeding into the bar
+      if (v < w) out = out sprintf("%*s", w - v, "")    # pad to full column width
+      return out
+    }
     NR==FNR { p[FNR]=$0; np=FNR; next }
             { j[FNR]=$0; nj=FNR }
     END {
@@ -44,54 +66,225 @@ if [ "${1:-}" = "--preview" ]; then
       for (i = 1; i <= n; i++) {
         pl = (i <= np) ? p[i] : ""
         jl = (i <= nj) ? j[i] : ""
-        if (length(pl) > w)  pl = substr(pl, 1, w)
-        if (length(jl) > jw) jl = substr(jl, 1, jw)
+        if (length(jl) > jw) jl = substr(jl, length(jl) - jw + 1)  # keep tail: name end + STATE
         # Colorise state (job column is rightmost, so ANSI here breaks no alignment).
         gsub(/RUNNING/, "\033[38;5;46mRUNNING\033[0m", jl)   # green
         gsub(/PENDING/, "\033[38;5;220mPENDING\033[0m", jl)  # yellow
-        printf "%-*s %s %s\n", w, pl, bar, jl
+        printf "%s %s %s\n", vpad(pl), bar, jl
       }
     }
-  ' <(tmux capture-pane -pt "$target" 2>/dev/null | tail -n "$lines") "$jobs_cache"
+  ' <(tmux capture-pane -pet "$target" 2>/dev/null | tail -n "$lines") "$jobs_cache"
   exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Main: build the window list and let fzf drive switch-client.
+# List sub-command: `tmux-window-fzf --list`
+# Emits the grouped, ordered window list that fzf consumes (and reloads on every
+# reorder). Sessions are ranked by the per-session @order option (lower = higher
+# in the list; unset → sorts last, then alphabetical), so the order is whatever
+# the user has arranged via Alt-k/Alt-j. Output is TAB-delimited, three fields:
+#   <target>\t<display>\t<session>
+# where target is empty on section-header rows. fzf shows field 2 (--with-nth=2)
+# and reads {1}=target (switch / preview) and {3}=session (reorder / cursor).
 # ---------------------------------------------------------------------------
-
-# Be robust to the popup's PATH: fzf lives in ~/.local/bin, fall back to PATH.
-FZF="$HOME/.local/bin/fzf"; [ -x "$FZF" ] || FZF="fzf"
-
-# One-shot SLURM queue snapshot for the side column (mirrors the `lq` alias).
-JOBS_CACHE="$(mktemp "${TMPDIR:-/tmp}/twf-jobs.XXXXXX")"
-trap 'rm -f "$JOBS_CACHE"' EXIT
-squeue -u "${USER:-$(id -un)}" -S t -o "%.30j %.12T" >"$JOBS_CACHE" 2>/dev/null \
-  || printf '(squeue unavailable)\n' >"$JOBS_CACHE"
-
-sel=$(
-  tmux list-windows -a \
-    -F $'#{session_name}:#{window_index}\t#{@claude_state}\t#{?window_active,1,0}\t#{window_name}' \
-  | awk -F'\t' 'BEGIN{e=sprintf("%c",27); r=e"[0m"}
+if [ "${1:-}" = "--list" ]; then
+  awk -F'\t' '
+      NR==FNR { ord[$1] = ($2=="" ? 1000000000 : $2); next }   # session → @order rank
+      { o = (($1 in ord) ? ord[$1] : 1000000000) + 0
+        printf "%015d\t%s\t%05d\t%s:%s\t%s\t%s\t%s\n", o, $1, $2, $1, $2, $3, $4, $5 }
+    ' \
+    <(tmux list-sessions -F $'#{session_name}\t#{@order}') \
+    <(tmux list-windows -a -F $'#{session_name}\t#{window_index}\t#{@claude_state}\t#{?window_active,1,0}\t#{window_name}') \
+  | sort -t$'\t' -k1,1 -k2,2 -k3,3 \
+  | awk -F'\t' 'BEGIN{e=sprintf("%c",27); r=e"[0m"; dim=e"[38;5;240m"}
+      # post-sort fields: 1=orderkey 2=session 3=widxkey 4=target 5=state 6=active 7=name
+      # Dim, non-selectable section header (empty target) whenever the session changes.
+      ($2"")!=(prev"") { printf "\t  %s──── %s ────%s\t%s\n", dim, $2, r, $2; prev=$2 }
       {
-        s=$2
+        s=$5
         if      (s=="running") g=e"[38;5;208m●"r
         else if (s=="bg")      g=e"[38;5;208m○"r
         else if (s=="ext")     g=e"[38;5;208m○"r
         else if (s=="you")     g=e"[38;5;46m●"r
         else                   g=e"[38;5;240m·"r
-        act=($3=="1") ? e"[1m›"r" " : "  "
-        printf "%s\t%s %s%s\n", $1, g, act, $4
-      }' \
+        act=($6=="1") ? e"[1m›"r" " : "  "
+        printf "%s\t  %s%s %s\t%s\n", $4, act, g, $7, $2
+      }'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Reorder sub-command: `tmux-window-fzf --reorder up|down <session>`
+# Moves <session> one slot up/down by swapping its @order rank with its
+# neighbour, then rewrites dense 1..N ranks so the ordering stays compact.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--reorder" ]; then
+  dir="${2:-}"; sess="${3:-}"
+  if [ -z "$dir" ] || [ -z "$sess" ]; then exit 0; fi
+
+  # Record the moved project so --posline can re-find it after the reload without
+  # depending on fzf's post-reload cursor (which placeholders would re-evaluate
+  # against). Set even on a no-op edge so the cursor simply stays put.
+  tmux set-option -g @twf_moved "$sess"
+
+  # Sessions in current display order — identical ranking to --list.
+  mapfile -t order < <(
+    tmux list-sessions -F $'#{session_name}\t#{@order}' \
+    | awk -F'\t' '{ printf "%015d\t%s\n", ($2=="" ? 1000000000 : $2), $1 }' \
+    | sort -t$'\t' -k1,1 -k2,2 \
+    | cut -f2
+  )
+
+  idx=-1
+  for i in "${!order[@]}"; do
+    if [ "${order[$i]}" = "$sess" ]; then idx=$i; break; fi
+  done
+  if [ "$idx" -lt 0 ]; then exit 0; fi
+
+  if [ "$dir" = "up" ]; then j=$((idx - 1)); else j=$((idx + 1)); fi
+  if [ "$j" -lt 0 ] || [ "$j" -ge "${#order[@]}" ]; then exit 0; fi   # already at an edge
+
+  tmp="${order[$idx]}"; order[$idx]="${order[$j]}"; order[$j]="$tmp"
+  rank=1
+  for s in "${order[@]}"; do
+    # No "=" exact-match prefix here: set-option rejects it (unlike has-session).
+    # Names come from list-sessions, and tmux matches exact-first, so this is safe.
+    tmux set-option -t "$s" @order "$rank"
+    rank=$((rank + 1))
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Cursor sub-command: `tmux-window-fzf --posline <session>`
+# Prints an fzf `pos(N)` action pointing at <session>'s header row in the freshly
+# built list, so the cursor follows a project as it is moved. Silent if absent.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--posline" ]; then
+  sess="$(tmux show-options -gv @twf_moved 2>/dev/null || true)"
+  if [ -n "$sess" ]; then
+    n=$("$SELF" --list | awk -F'\t' -v s="$sess" '$1=="" && $3==s { print NR; exit }' || true)
+    if [ -n "$n" ]; then printf 'pos(%s)' "$n"; fi
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Kill sub-command: `tmux-window-fzf --kill <target> <session>`
+# Kills window <target> (session:index). A header row passes an empty target, so
+# Alt-X there can't kill anything — it just parks the cursor on that project.
+# Refuses to kill the very last window (which would end the tmux server).
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--kill" ]; then
+  target="${2:-}"; sess="${3:-}"
+  if [ -n "$target" ]; then
+    if [ "$(tmux list-windows -a -F x | wc -l)" -gt 1 ]; then
+      tmux set-option -g @twf_moved "${target%%:*}"   # keep cursor on this project
+      tmux kill-window -t "$target" 2>/dev/null || true
+    fi
+  elif [ -n "$sess" ]; then
+    tmux set-option -g @twf_moved "$sess"              # header row: just stay put
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# New-window sub-command: `tmux-window-fzf --new <session>`
+# Opens a new window in <session>, in that session's current directory, and
+# makes it that session's active window. Parks the cursor on that project.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--new" ]; then
+  sess="${2:-}"
+  if [ -n "$sess" ]; then
+    tmux set-option -g @twf_moved "$sess"
+    path="$(tmux display-message -p -t "$sess" '#{pane_current_path}' 2>/dev/null || true)"
+    if [ -n "$path" ]; then tmux new-window -t "$sess:" -c "$path"
+    else                    tmux new-window -t "$sess:"; fi
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# New-session sub-command: `tmux-window-fzf --new-session`
+# Prompts on the popup's tty (via fzf `execute`, which hands over the terminal)
+# for a project name, then creates a detached session with that name and parks
+# the cursor on it. Existing name → just jump there. Empty / cancelled → no-op.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--new-session" ]; then
+  printf '\n  New project (session) name: ' > /dev/tty
+  IFS= read -r name < /dev/tty || true
+  # Sanitise: ':' and '.' break session/window/pane target syntax; trim edges.
+  name="$(printf '%s' "$name" | tr -d '\n' | sed -E 's/[:.]/-/g; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+  if [ -n "$name" ]; then
+    tmux has-session -t "=$name" 2>/dev/null || tmux new-session -d -s "$name"
+    tmux set-option -g @twf_moved "$name"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Main: build the window list and let fzf drive switch-client.
+# With `--jobs`, take a one-shot SLURM queue snapshot and show it as a third
+# preview column; without it, skip squeue entirely (the slow part — so the popup
+# opens instantly) and show only the live pane preview.
+# ---------------------------------------------------------------------------
+WANT_JOBS=0
+[ "${1:-}" = "--jobs" ] && WANT_JOBS=1
+
+# Be robust to the popup's PATH: fzf lives in ~/.local/bin, fall back to PATH.
+FZF="$HOME/.local/bin/fzf"; [ -x "$FZF" ] || FZF="fzf"
+
+if [ "$WANT_JOBS" = 1 ]; then
+  # Preview region holds pane+jobs, so it takes the larger share of the popup.
+  PREVIEW_PCT=$(( (PANE_R + JOBS_R) * 100 / (LIST_R + PANE_R + JOBS_R) ))
+  # One-shot SLURM queue snapshot for the side column (mirrors the `lq` alias).
+  JOBS_CACHE="$(mktemp "${TMPDIR:-/tmp}/twf-jobs.XXXXXX")"
+  trap 'rm -f "$JOBS_CACHE"' EXIT
+  squeue -u "${USER:-$(id -un)}" -S t -o "%.30j %.12T" >"$JOBS_CACHE" 2>/dev/null \
+    || printf '(squeue unavailable)\n' >"$JOBS_CACHE"
+else
+  # No jobs column: an empty cache path makes --preview render pane-only, and we
+  # never invoke squeue, so the popup opens with no perceptible delay.
+  PREVIEW_PCT=$(( PANE_R * 100 / (LIST_R + PANE_R) ))
+  JOBS_CACHE=""
+fi
+
+# Open with the cursor on the window the popup was launched from. The key binding
+# stashes that target in @twf_here (via run-shell, which expands the format the
+# popup itself can't); we map it to its list line and seed fzf's cursor with
+# start:pos. Best-effort — if it isn't found, fzf just starts at the top.
+START_OPT=""
+HERE="$(tmux show-options -gv @twf_here 2>/dev/null || true)"
+if [ -n "$HERE" ]; then
+  n="$("$SELF" --list | awk -F'\t' -v t="$HERE" '$1==t { print NR; exit }' || true)"
+  [ -n "$n" ] && START_OPT="--bind=start:pos($n)"
+fi
+
+# In-menu actions (all reload the list and keep the cursor on the affected
+# project): Alt-k/Alt-j reorder it, Alt-N creates a new project (prompts for a
+# name), Alt-C opens a new window in it, Alt-X kills the highlighted window.
+# The two-line --header is the on-screen key guide.
+sel=$(
+  "$SELF" --list \
   | "$FZF" --ansi --delimiter=$'\t' --with-nth=2 \
+        --sync $START_OPT \
         --preview="'$SELF' --preview {1} '$JOBS_CACHE'" \
-        --preview-window='right:70%' \
+        --preview-window="right:${PREVIEW_PCT}%" \
         --reverse --prompt='search ❯ ' \
-        --header='jk:move  g/G:ends  s:search  ⏎:switch  esc:cancel' \
+        --header-first \
+        --header=$'jk/↑↓ move · g/G ends\ns search · ⏎ switch\nM-k/M-j reorder project\nM-N +project · M-C +win\nM-X kill · esc cancel' \
         --no-input \
         --bind 'j:down,k:up,g:first,G:last' \
         --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up' \
-        --bind 's:unbind(j,k,g,G,s)+show-input'
+        --bind 's:unbind(j,k,g,G,s)+show-input' \
+        --bind "alt-k:execute-silent('$SELF' --reorder up {3})+reload-sync('$SELF' --list)+transform('$SELF' --posline)" \
+        --bind "alt-j:execute-silent('$SELF' --reorder down {3})+reload-sync('$SELF' --list)+transform('$SELF' --posline)" \
+        --bind "alt-N:execute('$SELF' --new-session)+reload-sync('$SELF' --list)+transform('$SELF' --posline)" \
+        --bind "alt-C:execute-silent('$SELF' --new {3})+reload-sync('$SELF' --list)+transform('$SELF' --posline)" \
+        --bind "alt-X:execute-silent('$SELF' --kill {1} {3})+reload-sync('$SELF' --list)+transform('$SELF' --posline)"
 )
 
-[ -n "${sel:-}" ] && tmux switch-client -t "${sel%%$'\t'*}"
+# Field 1 is the target (session:index), empty for section-header rows — so
+# landing ⏎ on a header is a harmless no-op rather than a bad switch-client.
+target="${sel%%$'\t'*}"
+[ -n "$target" ] && tmux switch-client -t "$target"

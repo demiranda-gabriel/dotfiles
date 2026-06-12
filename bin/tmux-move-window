@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# tmux-move-window SRC_WINDOW_ID DEST_SESSION
+#
+# Move the window identified by SRC_WINDOW_ID (e.g. @46) into DEST_SESSION,
+# appending it at the end. If DEST_SESSION doesn't exist it is created — WITHOUT
+# leaving behind the throwaway placeholder window that `new-session` would add.
+#
+# Bound to prefix+M in tmux.conf:
+#   bind M command-prompt -p "move window to session:" \
+#     "run-shell '~/.local/bin/tmux-move-window #{window_id} %%'"
+# (#{window_id} is the window where prefix+M was pressed; run-shell expands it.)
+set -eu
+
+src="${1:-}"
+dst="${2:-}"
+[ -z "$src" ] && { tmux display-message "move-window: no source window"; exit 0; }
+[ -z "$dst" ] && exit 0          # empty prompt → user cancelled
+
+if tmux has-session -t "=$dst" 2>/dev/null; then
+  tmux move-window -s "$src" -t "$dst:"
+else
+  # Create detached, note the lone placeholder window, move ours in, drop it.
+  tmux new-session -d -s "$dst"
+  ph="$(tmux list-windows -t "=$dst" -F '#{window_id}')"
+  tmux move-window -s "$src" -t "$dst:"
+  tmux kill-window -t "$ph"
+fi
+tmux display-message "→ moved window to session '$dst'"
