@@ -158,9 +158,11 @@ dotfiles/
 │   ├── 50-backup.sh                     ← backup / restore / cloudsave aliases
 │   └── 60-lf.sh                         ← EDITOR=nvim + lfcd cd-on-exit wrapper
 ├── scripts/                             ← cluster-specific helper scripts
-│   └── vscode/                          ← FASRC VSCode-on-compute-node toolkit (→ ~/scripts/vscode)
+│   ├── vscode/                          ← FASRC VSCode-on-compute-node toolkit (→ ~/scripts/vscode)
+│   └── hq/                              ← HyperQueue standing-fleet (server, orchestrator, PBS templates, shim, install.sh)
 ├── docs/                                ← long-form guides (read with md-view)
-│   └── alcf-vscode-tunnel.md            ← VS Code remote tunnel on Polaris/Aurora login nodes
+│   ├── alcf-vscode-tunnel.md            ← VS Code remote tunnel on Polaris/Aurora login nodes
+│   └── hyperqueue-fleet.md              ← HyperQueue fleet setup + mirroring to another cluster
 ├── claude/                              ← Claude Code config
 │   ├── skills/                          ← symlinked into ~/.claude/skills
 │   │   └── backup-to-gdrive/SKILL.md

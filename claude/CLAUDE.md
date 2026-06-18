@@ -108,6 +108,11 @@ automatically (default `--crash-limit 5`).
 
 ### Architecture (set up 2026-06-12; do not re-invent)
 
+To replicate this fleet on another cluster, the tracked reference scripts +
+installer + full guide live in the dotfiles: `scripts/hq/` and
+`~/dotfiles/docs/hyperqueue-fleet.md` (PBS reference; SLURM-adaptation section
+included).
+
 | Piece | What / where |
 |-------|--------------|
 | HQ server | `polaris-login-01`, tmux session `hq`, journal `~/.hq/journal`, log `~/.hq/server.log` |

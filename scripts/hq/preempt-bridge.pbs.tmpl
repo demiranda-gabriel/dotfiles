@@ -1,0 +1,26 @@
+#!/bin/bash
+#PBS -A __ACCOUNT__
+#PBS -q __BRIDGE_QUEUE__
+#PBS -l select=__NODES__:system=__SYSTEM__
+#PBS -l walltime=__BRIDGE_WALL__
+#PBS -l filesystems=__FILESYSTEMS__
+#PBS -l place=scatter
+#PBS -N hq-bridge
+#PBS -j oe
+#PBS -o __HQDIR__/bridge-workers.log
+
+# Preemptable bridge allocation managed by hq-fleet: covers the gap while the
+# primary capacity job is queued. Same worker pattern as capacity-workers.pbs —
+# one worker per node, no idle timeout (the fleet orchestrator decides when this
+# allocation is no longer needed and qdels it once its workers are idle). May be
+# preempted at any time; hq's default crash-limit=5 restarts interrupted tasks
+# on surviving workers.
+export PATH=$HOME/.local/bin:$PATH
+
+NNODES=$(wc -l < "$PBS_NODEFILE")
+
+while true; do
+    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none hq worker start --on-server-lost finish-running
+    echo "$(date): workers exited; retrying in 60s (server restart?)"
+    sleep 60
+done

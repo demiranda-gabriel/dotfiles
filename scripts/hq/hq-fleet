@@ -1,0 +1,193 @@
+#!/bin/bash
+# hq-fleet — keep a standing HyperQueue worker fleet attached at all times.
+#
+# Fleet size is set by `select=` in the two PBS scripts (2 nodes on Polaris).
+# Policy (Polaris, agreed 2026-06-12; see docs/hyperqueue-fleet.md):
+#   * Primary: a long job on the `capacity` queue (hq-capacity). The project
+#     gets at most 2 capacity slots (queued+running, held jobs count), so next
+#     week's job usually can't be queued until the current one ends.
+#   * Bridge: a `preemptable` job (hq-bridge), ensured whenever no capacity job
+#     is RUNNING, or the running one has less than LEAD_HOURS left. Resubmitted
+#     automatically if preempted.
+#   * Overlap: once a capacity job is running with comfortable time left, the
+#     bridge is qdel'd — immediately while still queued, but only once no HQ
+#     task is running anywhere if its workers are already attached (conservative
+#     global-idle check; protects long non-checkpointed tasks).
+#   * Also supervises the HQ server each tick via hq-server-up (idempotent).
+#
+# This file is PBS-specific (qsub/qstat/qdel/qselect). For a SLURM cluster the
+# allocation layer must be translated — see the guide.
+#
+# Subcommands:
+#   tick    one evaluation pass (DRY_RUN=1 to print actions instead)
+#   run     tick every CHECK_INTERVAL seconds, forever
+#   up      start `run` in tmux session 'hq-fleet' (idempotent)
+#   status  human summary
+#   down    stop the tmux session (jobs/allocations are left untouched)
+set -uo pipefail
+
+LEAD_HOURS=${LEAD_HOURS:-24}
+CHECK_INTERVAL=${CHECK_INTERVAL:-600}
+CAP_NAME=${HQ_CAP_NAME:-hq-capacity}      # must match `#PBS -N` in the cap script
+BRIDGE_NAME=${HQ_BRIDGE_NAME:-hq-bridge}  # must match `#PBS -N` in the bridge script
+CAP_SCRIPT=$HOME/.hq/capacity-workers.pbs
+BRIDGE_SCRIPT=$HOME/.hq/preempt-bridge.pbs
+LOG=$HOME/.hq/fleet.log
+STATE=$HOME/.hq/fleet.state   # throttle timestamps + last-seen job states
+export PATH=$HOME/.local/bin:$PATH
+[[ -f $HOME/.hq/fleet.env ]] && source "$HOME/.hq/fleet.env"   # SLACK_WEBHOOK / NTFY_TOPIC / HQ_FLEET_LABEL
+FLEET_LABEL=${HQ_FLEET_LABEL:-Polaris}
+
+log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$LOG"; }
+
+notify() {  # push via Slack webhook and/or ntfy.sh; never fails the tick
+    log "NOTIFY: $1"
+    if [[ -n ${SLACK_WEBHOOK:-} ]]; then
+        curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"*hq-fleet @ $FLEET_LABEL*: $1\"}" \
+            "$SLACK_WEBHOOK" >/dev/null 2>&1 \
+            || log "WARN: slack push failed"
+    fi
+    if [[ -n ${NTFY_TOPIC:-} ]]; then
+        curl -fsS -m 10 -H "Title: hq-fleet @ $FLEET_LABEL" -d "$1" \
+            "https://ntfy.sh/$NTFY_TOPIC" >/dev/null 2>&1 \
+            || log "WARN: ntfy push failed"
+    fi
+}
+
+state_put() {  # state_put <key> <value...>
+    { grep -v "^$1 " "$STATE" 2>/dev/null; echo "$*"; } > "$STATE.tmp" \
+        && mv "$STATE.tmp" "$STATE"
+}
+
+track() {  # track <key> <cur_id> <cur_state> <label> — notify on transitions
+    local key=$1 id=${2:-none} st=${3:--} label=$4
+    local prev pid pst
+    prev=$(awk -v k="$key" '$1==k {print $2" "$3}' "$STATE" 2>/dev/null)
+    local cur="${id%%.*} $st"
+    [[ "$prev" == "$cur" ]] && return 0
+    state_put "$key" "$cur"
+    [[ -z $prev ]] && return 0          # first observation: just record
+    read -r pid pst <<<"$prev"
+    if [[ $st == R && $pst != R ]]; then
+        notify "▶ $label ${id%%.*} is RUNNING"
+    elif [[ $id == none && $pst == R ]]; then
+        notify "■ $label $pid ended"
+    fi
+}
+
+act() {  # act <description> <cmd...>
+    local desc=$1; shift
+    if [[ "${DRY_RUN:-0}" == 1 ]]; then
+        log "DRY_RUN: would $desc: $*"
+    else
+        if out=$("$@" 2>&1); then
+            log "$desc: $out"
+            notify "$desc: ${out%%.*}"
+        else
+            log "FAILED $desc: $out"
+            return 1
+        fi
+    fi
+}
+
+# job_lookup <name> -> "<jobid> <state> <remaining_hours_or_->"
+# Newest matching job in state Q/R/H; remaining hours only when running.
+job_lookup() {
+    local name=$1 best="" id st
+    for id in $(qselect -u "$USER" -s QRH 2>/dev/null); do
+        local info; info=$(qstat -f "$id" 2>/dev/null) || continue
+        grep -q "Job_Name = $name$" <<<"$info" || continue
+        st=$(awk '/job_state =/ {print $3}' <<<"$info")
+        local rem="-"
+        if [[ $st == R ]]; then
+            local wall used
+            wall=$(awk -F' = ' '/Resource_List.walltime/ {print $2}' <<<"$info")
+            used=$(awk -F' = ' '/resources_used.walltime/ {print $2}' <<<"$info")
+            rem=$(awk -v w="$wall" -v u="${used:-00:00:00}" 'BEGIN {
+                split(w,a,":"); split(u,b,":");
+                printf "%.1f", (a[1]*3600+a[2]*60+a[3]-b[1]*3600-b[2]*60-b[3])/3600 }')
+        fi
+        best="$id $st $rem"
+        [[ $st == R ]] && break   # prefer the running one
+    done
+    echo "$best"
+}
+
+hq_running_tasks() {  # global count of RUNNING tasks (conservative idle check)
+    hq job list 2>/dev/null | grep -c RUNNING || true
+}
+
+throttled_log() {  # throttled_log <key> <message> — at most once/hour per key
+    local key=$1 msg=$2 now last
+    now=$(date +%s)
+    last=$(grep "^$key " "$STATE" 2>/dev/null | awk '{print $2}')
+    if [[ -z ${last:-} || $((now - last)) -gt 3600 ]]; then
+        log "$msg"
+        { grep -v "^$key " "$STATE" 2>/dev/null; echo "$key $now"; } > "$STATE.tmp" \
+            && mv "$STATE.tmp" "$STATE"
+    fi
+}
+
+tick() {
+    hq-server-up >/dev/null 2>&1 || throttled_log srv "WARNING: hq-server-up failed"
+
+    read -r cap_id cap_st cap_rem <<<"$(job_lookup $CAP_NAME)"
+    read -r br_id br_st _ <<<"$(job_lookup $BRIDGE_NAME)"
+
+    track cap_state "${cap_id:-none}" "${cap_st:--}" "capacity allocation"
+    track br_state "${br_id:-none}" "${br_st:--}" "bridge allocation"
+
+    # --- capacity lane: always keep one queued or running
+    if [[ -z ${cap_id:-} ]]; then
+        act "submit capacity job" qsub "$CAP_SCRIPT" \
+            || throttled_log cap "capacity slot still full (likely project limit); will retry"
+    fi
+
+    # --- does the fleet need the bridge?
+    local need_bridge=0 reason=""
+    if [[ ${cap_st:-} != R ]]; then
+        need_bridge=1; reason="no capacity job running"
+    elif awk -v r="$cap_rem" -v l="$LEAD_HOURS" 'BEGIN{exit !(r<l)}'; then
+        need_bridge=1; reason="capacity job $cap_id has only ${cap_rem}h left"
+    fi
+
+    if [[ $need_bridge == 1 && -z ${br_id:-} ]]; then
+        act "submit bridge job ($reason)" qsub "$BRIDGE_SCRIPT"
+    elif [[ $need_bridge == 0 && -n ${br_id:-} ]]; then
+        if [[ $br_st == Q || $br_st == H ]]; then
+            act "cancel queued bridge $br_id (capacity healthy, ${cap_rem}h left)" qdel "$br_id"
+        else
+            local running; running=$(hq_running_tasks)
+            if [[ ${running:-0} -eq 0 ]]; then
+                act "cancel idle bridge $br_id (capacity healthy, ${cap_rem}h left)" qdel "$br_id"
+            else
+                throttled_log drain "bridge $br_id kept: $running HQ job(s) still running (waiting for idle)"
+            fi
+        fi
+    fi
+}
+
+status() {
+    read -r cap_id cap_st cap_rem <<<"$(job_lookup $CAP_NAME)"
+    read -r br_id br_st br_rem <<<"$(job_lookup $BRIDGE_NAME)"
+    echo "capacity : ${cap_id:-none} state=${cap_st:--} remaining=${cap_rem:--}h"
+    echo "bridge   : ${br_id:-none} state=${br_st:--} remaining=${br_rem:--}h"
+    echo "workers  :"; hq worker list 2>/dev/null | tail -n +2
+    echo "orchestr.: $(tmux has-session -t hq-fleet 2>/dev/null && echo running || echo STOPPED)"
+}
+
+case "${1:-}" in
+    tick)   tick ;;
+    run)    log "fleet orchestrator started (lead=${LEAD_HOURS}h, interval=${CHECK_INTERVAL}s)"
+            while true; do tick; sleep "$CHECK_INTERVAL"; done ;;
+    up)     if tmux has-session -t hq-fleet 2>/dev/null; then
+                echo "hq-fleet already running"
+            else
+                tmux new-session -d -s hq-fleet "$HOME/.local/bin/hq-fleet run"
+                echo "hq-fleet started (tmux session 'hq-fleet')"
+            fi ;;
+    down)   tmux kill-session -t hq-fleet 2>/dev/null && echo stopped || echo "not running" ;;
+    status) status ;;
+    *)      echo "usage: hq-fleet {tick|run|up|down|status}   (env: DRY_RUN, LEAD_HOURS, CHECK_INTERVAL)"; exit 1 ;;
+esac

@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -A __ACCOUNT__
+#PBS -q __CAP_QUEUE__
+#PBS -l select=__NODES__:system=__SYSTEM__
+#PBS -l walltime=__CAP_WALL__
+#PBS -l filesystems=__FILESYSTEMS__
+#PBS -l place=scatter
+#PBS -N hq-capacity
+#PBS -j oe
+#PBS -o __HQDIR__/capacity-workers.log
+
+# Primary standing allocation: one HyperQueue worker per node, attached to the
+# HQ server on the login node (via the shared ~/.hq-server access file) for the
+# full walltime. No idle timeout — holding the nodes IS the point of this
+# reservation. The #PBS values above are rendered by install.sh from its
+# per-cluster env (HQ_ACCOUNT, HQ_SYSTEM, HQ_NODES, ...).
+export PATH=$HOME/.local/bin:$PATH
+
+NNODES=$(wc -l < "$PBS_NODEFILE")
+
+# --on-server-lost finish-running: if the login-node server restarts, let
+# running tasks finish instead of killing them. The loop re-attaches the
+# workers afterwards so the reservation survives server restarts.
+while true; do
+    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none hq worker start --on-server-lost finish-running
+    echo "$(date): workers exited; retrying in 60s (server restart?)"
+    sleep 60
+done

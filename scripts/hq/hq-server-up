@@ -1,0 +1,51 @@
+#!/bin/bash
+# Start (or restart) the HyperQueue server on the chosen login node, pinned to
+# 8 CPUs. The pin is REQUIRED on ALCF login nodes: each user is confined to a
+# hidden cgroup (cpu.max=8 cores, pids.max=256 counting THREADS). Unpinned,
+# tokio sizes its pool to the hundreds of hardware threads it detects and eats
+# ~130 pids, starving every other process (new fork/pthread_create fails
+# session-wide). See docs/hyperqueue-fleet.md.
+#
+# The server must always run on the SAME host: clients and workers dial the
+# host recorded in ~/.hq-server/. Set HQ_SERVER_HOST to your stable login node
+# (default polaris-login-01) and always ssh to that node before (re)starting.
+set -euo pipefail
+
+HQ="$HOME/.local/bin/hq"
+JOURNAL="$HOME/.hq/journal"
+LOG="$HOME/.hq/server.log"
+SERVER_HOST="${HQ_SERVER_HOST:-polaris-login-01}"
+
+if [[ "$(hostname -s)" != "$SERVER_HOST" ]]; then
+    echo "ERROR: run on $SERVER_HOST (clients dial the host in ~/.hq-server/)." >&2
+    echo "       Override with HQ_SERVER_HOST=<your-login-node> if intended." >&2
+    exit 1
+fi
+
+if pgrep -u "$USER" -x hq >/dev/null && "$HQ" server info >/dev/null 2>&1; then
+    echo "hq server already running:"
+    pgrep -u "$USER" -x hq | xargs -r ps -o pid,nlwp,args -p
+    exit 0
+fi
+
+mkdir -p "$(dirname "$JOURNAL")"
+# taskset alone is NOT enough: the HiGHS C++ LP solver inside hq lazily spawns a
+# global pool sized by std::thread::hardware_concurrency(), which reads raw core
+# count via glibc get_nprocs() and ignores the affinity mask (128 threads here,
+# half the 256-pid cgroup budget; pool creation can even SIGABRT the server when
+# the pid cap is near). The shim interposes get_nprocs to return 8.
+# Source + build: ~/.hq/shim/nproc8.c
+SHIM="$HOME/.hq/shim/nproc8.so"
+[[ -f "$SHIM" ]] || { echo "ERROR: $SHIM missing; rebuild: gcc -shared -fPIC -o $SHIM ~/.hq/shim/nproc8.c" >&2; exit 1; }
+tmux kill-session -t hq 2>/dev/null || true
+tmux new-session -d -s hq \
+    "LD_PRELOAD=$SHIM taskset -c 0-7 $HQ server start --journal $JOURNAL >> $LOG 2>&1"
+sleep 3
+
+if "$HQ" server info >/dev/null 2>&1; then
+    echo "hq server started (tmux session 'hq', pinned to cpus 0-7):"
+    pgrep -u "$USER" -x hq | xargs -r ps -o pid,nlwp,args -p
+else
+    echo "ERROR: server failed to start; see $LOG" >&2
+    exit 1
+fi
