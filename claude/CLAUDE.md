@@ -119,6 +119,13 @@ automatically (default `--crash-limit 5`).
 
 The fleet self-heals: each tick re-runs `hq-server-up` (idempotent), resubmits
 capacity when the project slot frees, resubmits the bridge if preempted.
+`shell/41-polaris.sh` re-ups the fleet from any login-01 shell after reboots.
+
+**Notifications**: the fleet pushes state transitions (allocation start/end,
+submissions, bridge handover) to a Slack DM via incoming webhook, plus
+ntfy.sh while it remains configured. Secrets (`SLACK_WEBHOOK`, `NTFY_TOPIC`)
+live in `~/.hq/fleet.env` (per-host — never commit it). Detection latency
+≤ one tick (10 min).
 
 **Resizing the fleet**: `qalter -l select=...` is BLOCKED by ALCF's
 account_check hook — resizing requires resubmission. Edit `select=` in both
