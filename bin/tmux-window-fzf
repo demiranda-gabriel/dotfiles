@@ -16,6 +16,14 @@ set -eo pipefail
 # Absolute path to this script, so fzf's --preview can re-invoke it.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
+# Run every tmux client command with stdin detached from the tty. This tmux build
+# aborts client commands with "missing or unsuitable terminal" whenever stdin is a
+# tty (which it always is when we run inside a display-popup), so list-sessions /
+# list-windows would return nothing and the chooser would come up empty. None of
+# our tmux calls read stdin, so /dev/null is always safe and keeps fzf — the only
+# thing that needs the real tty — untouched.
+tmux() { command tmux "$@" </dev/null; }
+
 # Column width ratio:  window-list : pane-preview : jobs.  Tweak to taste.
 # Drives both the fzf list/preview split AND the pane/jobs split inside the
 # preview, so the three columns end up in these proportions across the popup.
