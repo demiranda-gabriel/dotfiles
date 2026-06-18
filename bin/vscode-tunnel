@@ -1,0 +1,51 @@
+#!/bin/bash
+# Manage the VS Code login-node remote tunnel in a detached tmux session, so it
+# survives SSH disconnects. The login-node counterpart to scripts/vscode/
+# vscode-up.sh (which holds a SLURM compute node on FASRC) — this one just runs
+# `code tunnel` on the login node for light editing, no allocation. See
+# docs/alcf-vscode-tunnel.md.
+#
+#   vscode-tunnel              # start (or report if already running)
+#   vscode-tunnel up <name>    # start with an explicit tunnel name
+#   vscode-tunnel attach       # attach to the session (Ctrl-b d to detach)
+#   vscode-tunnel status       # tmux session + registered tunnel + pid usage
+#   vscode-tunnel down         # stop the tunnel + kill the tmux session
+set -uo pipefail
+SESS=vscode
+TUNNEL="$HOME/.local/bin/vscode-login-tunnel.sh"
+
+cmd="${1:-up}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  status)
+    tmux has-session -t "$SESS" 2>/dev/null \
+      && echo "tmux '$SESS': running   (attach: vscode-tunnel attach)" \
+      || echo "tmux '$SESS': absent    (start: vscode-tunnel)"
+    [[ -f "$HOME/.vscode/cli/code_tunnel.json" ]] \
+      && echo "tunnel:       $(cat "$HOME/.vscode/cli/code_tunnel.json")"
+    p="/sys/fs/cgroup/users/$USER/pids.current"
+    [[ -r "$p" ]] && echo "login pids:   $(cat "$p") / 256 (cgroup cap)"
+    ;;
+  down)
+    tmux kill-session -t "$SESS" 2>/dev/null \
+      && echo "Stopped tmux '$SESS' (credential cache kept for next time)." \
+      || echo "tmux '$SESS' was not running."
+    echo "To fully unregister this machine from your VS Code list:"
+    echo "    $HOME/.local/bin/code tunnel unregister"
+    ;;
+  attach)
+    tmux attach -t "$SESS" ;;
+  up)
+    name="${1:-}"
+    if tmux has-session -t "$SESS" 2>/dev/null; then
+      echo "tmux '$SESS' already running. Attach: vscode-tunnel attach"
+    else
+      tmux new-session -d -s "$SESS" "'$TUNNEL' $name"
+      echo "Started tmux '$SESS'."
+      echo "First run needs a GitHub device-code login — attach to complete it:"
+      echo "    vscode-tunnel attach     # enter the code shown at the printed URL"
+    fi
+    ;;
+  *) echo "usage: vscode-tunnel [up [name]|attach|status|down]"; exit 1 ;;
+esac

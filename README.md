@@ -139,6 +139,8 @@ dotfiles/
 │   ├── img-view                         ← image filling terminal via kitten icat
 │   ├── tmux-merge                       ← gather/restore windows as panes (prefix g/G)
 │   ├── tmux-window-fzf                  ← fzf window chooser popup (M-j; needs fzf)
+│   ├── vscode-login-tunnel.sh           ← `code tunnel` on an ALCF login node (cgroup-pinned)
+│   ├── vscode-tunnel                    ← tmux up/attach/status/down for the tunnel
 │   └── claude-tmux-{state,watch,set,extwait}  ← Claude-state tab glyph (see "tmux config")
 ├── config/                              ← per-file symlinks into ~/.config/<app>
 │   ├── lf/{lfrc,preview,cleaner}
@@ -148,7 +150,8 @@ dotfiles/
 │   ├── install-tmux.sh
 │   ├── install-tectonic.sh
 │   ├── install-pandoc.sh
-│   └── install-termpdf.sh
+│   ├── install-termpdf.sh
+│   └── install-vscode-cli.sh            ← VS Code CLI (`code`) for login-node tunnels
 ├── shell/                               ← sourced from ~/.bashrc by bootstrap
 │   ├── 00-path.sh                       ← prepends ~/.local/bin to $PATH
 │   ├── 40-fasrc.sh                      ← FASRC SLURM alloc helpers + vscode aliases (no-op off FASRC)
@@ -156,6 +159,8 @@ dotfiles/
 │   └── 60-lf.sh                         ← EDITOR=nvim + lfcd cd-on-exit wrapper
 ├── scripts/                             ← cluster-specific helper scripts
 │   └── vscode/                          ← FASRC VSCode-on-compute-node toolkit (→ ~/scripts/vscode)
+├── docs/                                ← long-form guides (read with md-view)
+│   └── alcf-vscode-tunnel.md            ← VS Code remote tunnel on Polaris/Aurora login nodes
 ├── claude/                              ← Claude Code config
 │   ├── skills/                          ← symlinked into ~/.claude/skills
 │   │   └── backup-to-gdrive/SKILL.md
