@@ -17,10 +17,15 @@
 # on surviving workers.
 export PATH=$HOME/.local/bin:$PATH
 
+# Per-host knobs (HQ_WORKER_RESOURCES etc.); never overwritten by install.sh.
+[ -f "__HQDIR__/fleet.env" ] && . "__HQDIR__/fleet.env"
+
 NNODES=$(wc -l < "$PBS_NODEFILE")
 
+# ${HQ_WORKER_RESOURCES}: extra `hq worker start` args from fleet.env (e.g.
+# registering GPUs HQ can't auto-detect). Unquoted so tokens word-split.
 while true; do
-    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none hq worker start --on-server-lost finish-running
+    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none hq worker start --on-server-lost finish-running ${HQ_WORKER_RESOURCES:-}
     echo "$(date): workers exited; retrying in 60s (server restart?)"
     sleep 60
 done

@@ -139,6 +139,13 @@ else
     echo "⚠ gcc not found — build the shim later: gcc -shared -fPIC -o $HQDIR/shim/nproc8.so $HQDIR/shim/nproc8.c"
 fi
 
+# GPU-affinity wrapper: maps HQ-assigned gpus/* indices to ZE_AFFINITY_MASK
+# for accelerators HQ can't auto-detect (e.g. Intel PVC on Aurora). Pair with
+# HQ_WORKER_RESOURCES in fleet.env. Used as: hq submit ... -- $HQDIR/hq-xpu-bind.sh <cmd>
+cp -f "$DIR/hq-xpu-bind.sh" "$HQDIR/hq-xpu-bind.sh"
+chmod +x "$HQDIR/hq-xpu-bind.sh"
+echo "✓ installed $HQDIR/hq-xpu-bind.sh"
+
 render() {  # render <template> <dest>
     sed -e "s|__ACCOUNT__|$HQ_ACCOUNT|g" \
         -e "s|__SYSTEM__|$HQ_SYSTEM|g" \
