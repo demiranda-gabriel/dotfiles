@@ -189,7 +189,9 @@ hq-fleet down [--all]                           # workers (+ server with --all)
 ```
 
 - `hq-fleet up` auto-starts the server (idempotent) and **stacks** (call again
-  to add lanes). Server lane = `sapphire` 3-day CPU; guaranteed GPUs =
+  to add lanes). Server lane = `sapphire` (instant, no-preempt) and **self-chains**
+  past its 3-day cap (queues a dependent successor → effectively immortal;
+  `HQ_NO_CHAIN=1` to disable; `down --all` stops the chain). Guaranteed GPUs =
   `kozinsky_gpu` (only 2 nodes — don't monopolize); preemptable = `gpu_requeue`.
 - Install/refresh: `HQ_SCHED=slurm ~/dotfiles/scripts/hq/install.sh` (links the
   `scripts/hq/slurm/` variants; auto-detected from `sbatch`). No login-node

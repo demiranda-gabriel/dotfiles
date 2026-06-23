@@ -59,6 +59,12 @@ seed_fleet_env() {
 # SLURM / FASRC — on-demand allocator
 # =============================================================================
 if [[ "$HQ_SCHED" == slurm ]]; then
+    # Server lane on sapphire: the only FASRC CPU partition that schedules
+    # instantly without preempting anyone. Its 3-day cap is fine because the
+    # server SELF-CHAINS (server.sbatch queues a dependent successor that takes
+    # over at expiry — see that template), so the server is effectively immortal.
+    # kozinsky(7d)/intermediate(14d)/unrestricted(365d) are knob alternatives,
+    # but on FASRC they're either jammed for hours/weeks or preempt others.
     HQ_SRV_PART="${HQ_SRV_PART:-sapphire}"
     HQ_SRV_CPUS="${HQ_SRV_CPUS:-2}"
     HQ_SRV_MEM="${HQ_SRV_MEM:-4G}"

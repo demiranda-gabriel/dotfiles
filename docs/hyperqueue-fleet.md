@@ -305,7 +305,7 @@ the same server.
 
 | Lane | Partition | Notes |
 |---|---|---|
-| server | `sapphire` (3-day) | tiny CPU alloc; `HQ_SRV_*` knobs. Restarts at walltime → journal restores state |
+| server | `sapphire` (3-day) | tiny CPU alloc; **self-chains** — queues a dependent successor at startup, so it's effectively immortal despite the 3-day cap. sapphire is the only instant, non-preempting CPU partition (kozinsky/intermediate jam, unrestricted preempts). `HQ_SRV_*` knobs switch it |
 | guaranteed GPUs | `kozinsky_gpu` (7-day) | lab-owned, only 2× (4×A100-80GB) nodes — don't monopolize |
 | preemptable GPUs | `gpu_requeue` (3-day) | plentiful A100 pool; preempted tasks rerun (`--crash-limit`) |
 | quick test | `gpu_test` (12h) | stricter: needs `-c <8` and `-m <64000M` per GPU |
@@ -318,9 +318,13 @@ the same server.
   `hq` with no server recorded prints how to start one.
 - **No login-node shim/taskset** needed (FASRC's pid cap is effectively
   unlimited; the ALCF cgroup trap doesn't apply).
-- **Server walltime = max server lifetime**; on restart it lands on a new node,
-  the access file + `~/.hq/server-node` update, and workers reconnect via the
-  retry loop. `unrestricted` (365-day) is an option for a near-permanent server.
+- **Server self-chains** past its 3-day walltime: each server queues a
+  dependent successor (`sbatch --dependency=afterany`) that takes over at
+  expiry. On handoff it lands on a new node, the access file + `~/.hq/server-node`
+  update, the journal restores state, and workers reconnect via their retry loop
+  (gap = seconds). `hq-fleet down --all` drops `~/.hq/server-stop` then scancels
+  the chain; a successor released by that scancel sees the sentinel and exits.
+  `HQ_NO_CHAIN=1` runs a single non-chaining server.
 
 ---
 

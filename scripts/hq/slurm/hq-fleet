@@ -88,9 +88,11 @@ cmd_down() {
     echo "cancelling worker jobs (name=$WORKER_JOBNAME) ..."
     scancel -u "$USER" -n "$WORKER_JOBNAME" 2>/dev/null && echo "  done" || echo "  (none)"
     if [[ $all == 1 ]]; then
-        echo "cancelling server job (name=$SERVER_JOBNAME) ..."
+        echo "stopping server + self-chain (name=$SERVER_JOBNAME) ..."
+        touch "$HQDIR/server-stop"   # a successor released by the scancel sees this and exits
         scancel -u "$USER" -n "$SERVER_JOBNAME" 2>/dev/null && echo "  done" || echo "  (none)"
         rm -f "$NODEFILE"
+        # NB: sentinel is intentionally left in place; hq-server-up clears it on next start.
     fi
 }
 

@@ -6,23 +6,45 @@
 #SBATCH -t __SRV_WALL__
 #SBATCH -o __HQDIR__/server.%j.log
 
-# HyperQueue server, hosted ON A COMPUTE NODE.
+# HyperQueue server, hosted ON A COMPUTE NODE, with SELF-CHAINING auto-restart.
 #
-# Why not the login node (as on Polaris)? FASRC firewalls login<->compute on
-# arbitrary ports in BOTH directions: a worker on a compute node cannot dial
-# back to a login-node server, and the login client cannot reach a compute-node
-# server's ports either. The open paths are compute<->compute (workers reach the
-# server) and ssh login->compute (the `hq` client bridges via ssh; see the `hq`
-# wrapper in shell/42-fasrc-hq.sh). So the server lives in this small CPU
-# allocation; its node name is published to ~/.hq/server-node for the bridge,
-# and workers read the access file in ~/.hq-server over shared (NFS) $HOME.
+# Why a compute node: FASRC firewalls login<->compute on arbitrary ports both
+# ways, so the server can't live on a login node (workers can't dial back; the
+# login client can't reach it). Workers reach it compute<->compute; the `hq`
+# client ssh-bridges to the node recorded in ~/.hq/server-node.
 #
-# The journal restores submitted jobs + autoalloc queues if this allocation
-# restarts on a new node. Rendered from this template by install.sh.
+# Why self-chaining: FASRC's only instant, non-preempting CPU partition
+# (sapphire) caps at 3 days — equal to the GPU worker max — and FASRC forbids
+# raising walltime in place. The longer partitions are jammed (kozinsky/
+# intermediate) or preempt others (unrestricted). So instead each server queues
+# a DEPENDENT successor (afterany) that starts the instant this one ends; the
+# journal (~/.hq/journal) hands off all state and workers reconnect via their
+# retry loop (gap = a few seconds). Net: an effectively immortal server on the
+# free, instant partition. `hq-fleet down --all` drops the ~/.hq/server-stop
+# sentinel then scancels the chain; a successor released by that scancel sees
+# the sentinel and exits. Set HQ_NO_CHAIN=1 for a single, non-chaining server.
 export PATH=$HOME/.local/bin:$PATH
+HQDIR="$HOME/.hq"
+STOP="$HQDIR/server-stop"
+SELF="$HQDIR/server.sbatch"
 
-echo "[hq-server] node=$(hostname -s) ip=$(hostname -i) start=$(date -u +%FT%TZ)"
-echo "$(hostname -s)" > "$HOME/.hq/server-node"
-trap 'rm -f "$HOME/.hq/server-node"' EXIT
+# Teardown sentinel: a successor released by `down --all`'s scancel exits here.
+if [[ -e "$STOP" ]]; then
+    echo "[hq-server] stop sentinel present ($STOP) — not starting; chain ends."
+    exit 0
+fi
 
-exec hq server start --journal "$HOME/.hq/journal"
+echo "[hq-server] node=$(hostname -s) ip=$(hostname -i) job=${SLURM_JOB_ID:-?} start=$(date -u +%FT%TZ)"
+echo "$(hostname -s)" > "$HQDIR/server-node"
+trap 'rm -f "$HQDIR/server-node"' EXIT
+
+# Queue the successor BEFORE serving, so the chain survives even an abrupt end.
+if [[ "${HQ_NO_CHAIN:-0}" != 1 && -n "${SLURM_JOB_ID:-}" && -f "$SELF" ]]; then
+    if succ=$(sbatch --parsable --dependency=afterany:"$SLURM_JOB_ID" "$SELF" 2>/dev/null); then
+        echo "[hq-server] queued successor $succ (starts afterany:$SLURM_JOB_ID)"
+    else
+        echo "[hq-server] WARN: could not queue successor (chain will not self-renew)"
+    fi
+fi
+
+exec hq server start --journal "$HQDIR/journal"

@@ -37,7 +37,8 @@ fi
     exit 1
 }
 
-rm -f "$NODEFILE"   # drop any stale pointer from a dead job
+rm -f "$NODEFILE"            # drop any stale pointer from a dead job
+rm -f "$HQDIR/server-stop"   # clear any teardown sentinel so the chain may run
 jid=$(sbatch --parsable "$SERVER_SBATCH")
 echo "submitted hq server job $jid; waiting for it to start ..."
 for _ in $(seq 1 "$WAIT_TRIES"); do
