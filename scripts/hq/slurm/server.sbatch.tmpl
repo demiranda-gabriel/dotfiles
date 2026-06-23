@@ -1,0 +1,28 @@
+#!/bin/bash
+#SBATCH -J hq-server
+#SBATCH -p __SRV_PART__
+#SBATCH -c __SRV_CPUS__
+#SBATCH --mem=__SRV_MEM__
+#SBATCH -t __SRV_WALL__
+#SBATCH -o __HQDIR__/server.%j.log
+
+# HyperQueue server, hosted ON A COMPUTE NODE.
+#
+# Why not the login node (as on Polaris)? FASRC firewalls login<->compute on
+# arbitrary ports in BOTH directions: a worker on a compute node cannot dial
+# back to a login-node server, and the login client cannot reach a compute-node
+# server's ports either. The open paths are compute<->compute (workers reach the
+# server) and ssh login->compute (the `hq` client bridges via ssh; see the `hq`
+# wrapper in shell/42-fasrc-hq.sh). So the server lives in this small CPU
+# allocation; its node name is published to ~/.hq/server-node for the bridge,
+# and workers read the access file in ~/.hq-server over shared (NFS) $HOME.
+#
+# The journal restores submitted jobs + autoalloc queues if this allocation
+# restarts on a new node. Rendered from this template by install.sh.
+export PATH=$HOME/.local/bin:$PATH
+
+echo "[hq-server] node=$(hostname -s) ip=$(hostname -i) start=$(date -u +%FT%TZ)"
+echo "$(hostname -s)" > "$HOME/.hq/server-node"
+trap 'rm -f "$HOME/.hq/server-node"' EXIT
+
+exec hq server start --journal "$HOME/.hq/journal"

@@ -155,11 +155,13 @@ dotfiles/
 ├── shell/                               ← sourced from ~/.bashrc by bootstrap
 │   ├── 00-path.sh                       ← prepends ~/.local/bin to $PATH
 │   ├── 40-fasrc.sh                      ← FASRC SLURM alloc helpers + vscode aliases (no-op off FASRC)
+│   ├── 41-polaris.sh                    ← Polaris login helpers + HQ fleet auto-up (no-op off ALCF)
+│   ├── 42-fasrc-hq.sh                   ← FASRC `hq` ssh-bridge wrapper (no-op off FASRC)
 │   ├── 50-backup.sh                     ← backup / restore / cloudsave aliases
 │   └── 60-lf.sh                         ← EDITOR=nvim + lfcd cd-on-exit wrapper
 ├── scripts/                             ← cluster-specific helper scripts
 │   ├── vscode/                          ← FASRC VSCode-on-compute-node toolkit (→ ~/scripts/vscode)
-│   └── hq/                              ← HyperQueue standing-fleet (server, orchestrator, PBS templates, shim, install.sh)
+│   └── hq/                              ← HyperQueue: PBS 24/7 fleet + slurm/ on-demand allocator (install.sh is scheduler-aware)
 ├── docs/                                ← long-form guides (read with md-view)
 │   ├── alcf-vscode-tunnel.md            ← VS Code remote tunnel on Polaris/Aurora login nodes
 │   └── hyperqueue-fleet.md              ← HyperQueue fleet setup + mirroring to another cluster

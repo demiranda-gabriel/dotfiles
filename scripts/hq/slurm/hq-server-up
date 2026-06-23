@@ -1,0 +1,51 @@
+#!/bin/bash
+# hq-server-up (FASRC/SLURM) — ensure the HyperQueue server is running on a
+# compute node. Idempotent: a no-op if a server job is already running and its
+# node is recorded + reachable; otherwise (re)submits the server allocation and
+# waits for it to publish its node.
+#
+# FASRC firewalls login<->compute on arbitrary ports both ways, so the server
+# CANNOT live on a login node (cf. Polaris). It runs in a small CPU allocation
+# (rendered ~/.hq/server.sbatch); workers reach it compute<->compute and the
+# `hq` client reaches it via ssh to the recorded node (shell/42-fasrc-hq.sh).
+set -euo pipefail
+
+HQDIR="$HOME/.hq"
+NODEFILE="$HQDIR/server-node"
+SERVER_SBATCH="$HQDIR/server.sbatch"
+JOBNAME="hq-server"
+WAIT_TRIES="${HQ_SERVER_WAIT_TRIES:-72}"   # x5s = 6 min for the CPU alloc to start
+
+mkdir -p "$HQDIR"
+
+server_node() { [[ -s "$NODEFILE" ]] && cat "$NODEFILE" || true; }
+server_job()  { squeue -u "$USER" -h -n "$JOBNAME" -t R -o "%i" 2>/dev/null | head -1; }
+
+node="$(server_node)"; job="$(server_job)"
+if [[ -n "$job" && -n "$node" ]]; then
+    if timeout 25 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=10 "$node" \
+            'PATH=$HOME/.local/bin:$PATH hq server info' >/dev/null 2>&1; then
+        echo "hq server already up on $node (job $job)"
+        exit 0
+    fi
+    echo "server job $job on $node not reachable — resubmitting"
+fi
+
+[[ -f "$SERVER_SBATCH" ]] || {
+    echo "ERROR: $SERVER_SBATCH missing; run scripts/hq/install.sh (HQ_SCHED=slurm)" >&2
+    exit 1
+}
+
+rm -f "$NODEFILE"   # drop any stale pointer from a dead job
+jid=$(sbatch --parsable "$SERVER_SBATCH")
+echo "submitted hq server job $jid; waiting for it to start ..."
+for _ in $(seq 1 "$WAIT_TRIES"); do
+    n="$(server_node)"
+    if [[ -n "$n" ]]; then echo "hq server up on $n (job $jid)"; exit 0; fi
+    st=$(squeue -j "$jid" -h -o "%t" 2>/dev/null || true)
+    [[ -z "$st" ]] && { echo "ERROR: server job $jid vanished; see $HQDIR/server.$jid.log" >&2; exit 1; }
+    sleep 5
+done
+echo "ERROR: server did not publish its node within timeout; check 'squeue -j $jid' and $HQDIR/server.$jid.log" >&2
+exit 1

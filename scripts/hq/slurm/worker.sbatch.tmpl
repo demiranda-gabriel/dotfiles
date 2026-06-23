@@ -1,0 +1,38 @@
+#!/bin/bash
+#SBATCH -J hq-worker
+#SBATCH -p gpu_requeue
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH -c 16
+#SBATCH --mem=64G
+#SBATCH -t 08:00:00
+#SBATCH -o __HQDIR__/worker.%x.%j.log
+# NB: no hardcoded --constraint here on purpose. hq-fleet passes --constraint on
+# the sbatch CLI (default a100), so `hq-fleet up -C ''` can actually DROP it — a
+# directive could only be overridden, never removed.
+
+# One HyperQueue worker per node, attached to the server recorded in
+# ~/.hq-server (shared/NFS $HOME) over the compute<->compute fabric.
+#
+# The #SBATCH lines above are DEFAULTS only — `hq-fleet up` overrides partition,
+# node count, gpus, cpus, mem, walltime, and constraint via sbatch CLI flags
+# (which win over directives), so this single rendered file serves every
+# on-demand allocation. (__HQDIR__ is substituted by install.sh.)
+#
+# The retry loop lets workers survive a server move/restart: with
+# --on-server-lost finish-running the worker drains its running tasks and exits
+# when the server is unreachable, then the loop reconnects (re-reading the
+# possibly-updated access file). `hq-fleet down` scancels the job to stop it.
+export PATH=$HOME/.local/bin:$PATH
+
+GPN="${SLURM_GPUS_ON_NODE:-0}"
+[[ "$GPN" -gt 0 ]] && SRUN_GRES="--gres=gpu:$GPN" || SRUN_GRES=""
+echo "[hq-worker] job=${SLURM_JOB_ID:-?} nodes=${SLURM_NNODES:-1} gpus/node=$GPN nodelist=${SLURM_JOB_NODELIST:-?}"
+
+while true; do
+    srun --ntasks="${SLURM_NNODES:-1}" --ntasks-per-node=1 $SRUN_GRES \
+        hq worker start --on-server-lost finish-running --manager slurm
+    echo "$(date): worker(s) exited; retry in 30s (server move/restart?)"
+    sleep 30
+done

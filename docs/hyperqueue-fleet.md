@@ -5,9 +5,12 @@ another cluster, from these dotfiles. The goal: a meta-scheduler where you
 `hq submit` tasks that **start within seconds** on a pool of nodes HQ keeps
 attached for you — instead of waiting in the batch queue per job.
 
-Reference implementation lives in `scripts/hq/`. It is **PBS-specific**
-(Polaris, Aurora, and other ALCF PBS Pro systems); a SLURM-adaptation section
-is at the end.
+Two implementations live in `scripts/hq/`:
+- **PBS/ALCF** (Polaris, Aurora, …) — the 24/7 standing fleet described below.
+  This is the bulk of the guide.
+- **SLURM/FASRC** (`scripts/hq/slurm/`) — an **on-demand** allocator, not a
+  standing fleet. FASRC's login↔compute firewall forces a different topology;
+  see [Running it on FASRC (SLURM)](#running-it-on-fasrc-slurm) at the end.
 
 ---
 
@@ -239,13 +242,91 @@ fleet — carry it over only if you want it.)
 
 ---
 
-## Adapting to a SLURM cluster (e.g. FASRC)
+## Running it on FASRC (SLURM)
 
-The server, workers, shim, and `hq alloc` autoalloc concepts are scheduler-
-agnostic. What must be rewritten is the **direct-submission layer** in
-`hq-fleet` and the `.pbs` scripts:
+This is **implemented** in `scripts/hq/slurm/` and works today — but the
+topology differs from Polaris, forced by one hard network constraint.
 
-| PBS (this repo) | SLURM equivalent |
+### The constraint that changes everything
+
+FASRC **firewalls login↔compute on arbitrary ports, in BOTH directions**
+(verified 2026-06-23). A worker on a compute node times out dialing an HQ
+server on a login node, and a login-node client can't reach a compute-node
+server's ports either. Only two paths are open:
+- **compute↔compute** — workers reach a server that lives on a compute node;
+- **ssh login→compute** — you can ssh to a node where you hold a job.
+
+So the Polaris model (server on the login node, free and always-on) is
+**impossible** here. Instead:
+
+```
+  you @ login ──ssh bridge──> hq server (compute node, in a small CPU alloc)
+                                  │ dispatches over the open compute fabric
+                                  ▼
+                       hq workers (GPU compute nodes, sized on request)
+```
+
+### On-demand, not 24/7
+
+FASRC GPU resources are shared (the lab owns only 2 `kozinsky_gpu` nodes), so
+there is **no standing fleet**. You request an allocation sized to your needs,
+attach workers, submit, and tear down. `hq-fleet` here is an *allocator*, not
+the self-healing orchestrator.
+
+### Install
+
+```bash
+# hq binary on PATH first (see "Install HyperQueue" above)
+HQ_SCHED=slurm ~/dotfiles/scripts/hq/install.sh   # auto-detected anyway
+# links hq-server-up + hq-fleet, renders ~/.hq/{server,worker}.sbatch
+```
+
+`shell/42-fasrc-hq.sh` (auto-sourced) defines the **`hq` ssh-bridge wrapper**:
+every `hq …` runs on the server node via ssh, transparently.
+
+### Day-to-day
+
+```bash
+hq-fleet up                                     # 1 GPU on gpu_requeue (polite default)
+hq-fleet up -p kozinsky_gpu -g 4 -t 1-00:00:00  # a whole lab A100 node, guaranteed
+hq-fleet up -p gpu_requeue  -N 2 -g 4           # +2 preemptable nodes (stacks)
+hq submit --resource gpus/nvidia=1 -- python train.py
+hq job list ; hq-fleet status
+hq-fleet down            # stop workers
+hq-fleet down --all      # stop workers + server
+```
+
+`hq-fleet up` auto-starts the server (idempotent — reused across calls) and
+**stacks**: call it repeatedly to mix lanes (e.g. one guaranteed
+`kozinsky_gpu` node + several preemptable `gpu_requeue` nodes), all attached to
+the same server.
+
+### Partition map (FASRC)
+
+| Lane | Partition | Notes |
+|---|---|---|
+| server | `sapphire` (3-day) | tiny CPU alloc; `HQ_SRV_*` knobs. Restarts at walltime → journal restores state |
+| guaranteed GPUs | `kozinsky_gpu` (7-day) | lab-owned, only 2× (4×A100-80GB) nodes — don't monopolize |
+| preemptable GPUs | `gpu_requeue` (3-day) | plentiful A100 pool; preempted tasks rerun (`--crash-limit`) |
+| quick test | `gpu_test` (12h) | stricter: needs `-c <8` and `-m <64000M` per GPU |
+
+### FASRC gotchas
+
+- **No constraint directive** in `worker.sbatch`: `hq-fleet` passes
+  `--constraint` (default `a100`) on the CLI so `-C ''` can actually drop it.
+- **`hq` only works through the wrapper** (ssh to the server node). A bare
+  `hq` with no server recorded prints how to start one.
+- **No login-node shim/taskset** needed (FASRC's pid cap is effectively
+  unlimited; the ALCF cgroup trap doesn't apply).
+- **Server walltime = max server lifetime**; on restart it lands on a new node,
+  the access file + `~/.hq/server-node` update, and workers reconnect via the
+  retry loop. `unrestricted` (365-day) is an option for a near-permanent server.
+
+---
+
+## PBS↔SLURM translation (reference)
+
+| PBS | SLURM |
 |---|---|
 | `qsub script.pbs` | `sbatch script.sbatch` |
 | `qstat -f <id>` / `qselect -s QRH` | `squeue -j <id>` / `squeue -u $USER -t PD,R` |
@@ -256,23 +337,25 @@ agnostic. What must be rewritten is the **direct-submission layer** in
 | `hq alloc add pbs ...` | `hq alloc add slurm ...` |
 | state codes `Q/R/H` | `PD/R/...` |
 
-Easiest path: fork `hq-fleet`'s `job_lookup`/`act`/`tick` to call
-`squeue/sbatch/scancel` and parse SLURM states, and write `.sbatch` workers
-using `srun`. The orchestration *logic* (two lanes, lead-time bridge, idle
-drain, server supervision) ports unchanged.
-
 ---
 
 ## Files in this repo
 
 | File | Installs to | Role |
 |---|---|---|
+| **PBS / ALCF** | | |
 | `scripts/hq/hq-server-up` | `~/.local/bin/` | start the server, cgroup-pinned + shimmed |
-| `scripts/hq/hq-fleet` | `~/.local/bin/` | the orchestrator (tick/run/up/down/status) |
+| `scripts/hq/hq-fleet` | `~/.local/bin/` | the 24/7 orchestrator (tick/run/up/down/status) |
 | `scripts/hq/shim/nproc8.c` | `~/.hq/shim/` (compiled to `.so`) | fakes `get_nprocs()=8` |
 | `scripts/hq/*.pbs.tmpl` | `~/.hq/*.pbs` (rendered) | capacity + bridge worker allocations |
+| **SLURM / FASRC** | | |
+| `scripts/hq/slurm/hq-server-up` | `~/.local/bin/` | ensure server in a compute-node CPU alloc |
+| `scripts/hq/slurm/hq-fleet` | `~/.local/bin/` | on-demand allocator (up/status/down) |
+| `scripts/hq/slurm/{server,worker}.sbatch.tmpl` | `~/.hq/*.sbatch` (rendered) | server + worker allocations |
+| `shell/42-fasrc-hq.sh` | sourced by `.bashrc` | the `hq` ssh-bridge wrapper |
+| **shared** | | |
 | `scripts/hq/fleet.env.example` | `~/.hq/fleet.env` (seeded) | secrets/notifications — **never committed** |
-| `scripts/hq/install.sh` | — | renders + links the above |
+| `scripts/hq/install.sh` | — | scheduler-aware; renders + links the above |
 
-`~/.hq/fleet.env`, `~/.hq/journal`, logs, and `~/.hq-server/` are runtime state
-— per-host, never in git.
+`~/.hq/fleet.env`, `~/.hq/journal`, `~/.hq/server-node`, logs, and
+`~/.hq-server/` are runtime state — per-host, never in git.

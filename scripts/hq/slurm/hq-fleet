@@ -1,0 +1,102 @@
+#!/bin/bash
+# hq-fleet (FASRC/SLURM) — ON-DEMAND HyperQueue allocator.
+#
+# This is deliberately NOT the Polaris hq-fleet (a 24/7 self-healing two-lane
+# orchestrator). FASRC usage is on-demand: request a GPU allocation sized to
+# your needs, HQ workers attach to it, you submit tasks, then tear down. There
+# is no standing fleet and no tick loop.
+#
+# The HQ server runs on a compute node (see hq-server-up; FASRC firewalls
+# login<->compute). The `hq` CLIENT reaches it by ssh (the `hq` wrapper in
+# shell/42-fasrc-hq.sh); this script uses the same bridge for status.
+#
+# Subcommands:
+#   up [opts]     ensure the server is up, then submit ONE worker allocation.
+#                 Call repeatedly to STACK allocations (e.g. a kozinsky_gpu node
+#                 plus some gpu_requeue nodes — all attach to the same server).
+#   status        server node + SLURM hq jobs + (ssh-bridged) hq workers/jobs
+#   down [--all]  scancel hq-worker jobs; with --all also stop the server
+#
+# `up` options (all optional; polite defaults — 1 GPU on the plentiful,
+# preemptable gpu_requeue pool, so nothing blocks labmates by default):
+#   -p PART   partition       (default gpu_requeue; e.g. kozinsky_gpu, gpu, seas_gpu)
+#   -N N      nodes           (default 1)
+#   -g G      gpus per node   (default 1; use 4 for a whole A100 node)
+#   -c C      cpus per node   (default 16)
+#   -m MEM    mem per node    (default 64G; or 0 for all node memory)
+#   -t WALL   walltime        (default 08:00:00)
+#   -C CON    --constraint    (default a100; pass -C '' to drop)
+#   -J NAME   job name        (default hq-worker)
+set -uo pipefail
+
+HQDIR="$HOME/.hq"
+WORKER_SBATCH="$HQDIR/worker.sbatch"
+NODEFILE="$HQDIR/server-node"
+WORKER_JOBNAME="hq-worker"
+SERVER_JOBNAME="hq-server"
+export PATH="$HOME/.local/bin:$PATH"
+
+ssh_srv() {  # run an hq client command on the server node via the ssh bridge
+    local node; node=$(cat "$NODEFILE" 2>/dev/null || true)
+    [[ -z "$node" ]] && return 1
+    timeout 25 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=10 "$node" "PATH=\$HOME/.local/bin:\$PATH hq $*"
+}
+
+cmd_up() {
+    local PART=gpu_requeue N=1 G=1 C=16 MEM=64G WALL=08:00:00 CON=a100 JN="$WORKER_JOBNAME"
+    local OPTIND opt
+    while getopts "p:N:g:c:m:t:C:J:" opt; do
+        case $opt in
+            p) PART=$OPTARG;;  N) N=$OPTARG;;  g) G=$OPTARG;;  c) C=$OPTARG;;
+            m) MEM=$OPTARG;;   t) WALL=$OPTARG;; C) CON=$OPTARG;; J) JN=$OPTARG;;
+            *) echo "hq-fleet up: bad option" >&2; return 1;;
+        esac
+    done
+    [[ -f "$WORKER_SBATCH" ]] || {
+        echo "ERROR: $WORKER_SBATCH missing; run scripts/hq/install.sh (HQ_SCHED=slurm)" >&2; return 1; }
+
+    echo "ensuring HQ server is up ..."
+    hq-server-up || { echo "ERROR: could not bring up the server" >&2; return 1; }
+
+    local con_flag=()
+    [[ -n "$CON" ]] && con_flag=(--constraint="$CON")
+    echo "submitting worker allocation: part=$PART nodes=$N gpus/node=$G cpus=$C mem=$MEM wall=$WALL constraint=${CON:-none}"
+    local jid
+    jid=$(sbatch --parsable -J "$JN" -p "$PART" -N "$N" --gres=gpu:"$G" \
+            -c "$C" --mem="$MEM" -t "$WALL" "${con_flag[@]}" "$WORKER_SBATCH") \
+        || { echo "ERROR: sbatch failed" >&2; return 1; }
+    echo "submitted worker job $jid (watch: squeue -j $jid; workers attach once it starts)"
+    echo "then submit tasks, e.g.:  hq submit --resource gpus/nvidia=1 -- python train.py"
+}
+
+cmd_status() {
+    local node; node=$(cat "$NODEFILE" 2>/dev/null || true)
+    echo "server node : ${node:-none}"
+    echo "server job  :"
+    squeue -u "$USER" -h -n "$SERVER_JOBNAME" -o "  %.12i %.4t %.10M %.10L %N" 2>/dev/null
+    echo "worker jobs :"
+    squeue -u "$USER" -h -n "$WORKER_JOBNAME" -o "  %.12i %.14P %.4t %.10M %.10L %.4D %N" 2>/dev/null
+    if [[ -n "$node" ]]; then
+        echo "hq workers  :"; ssh_srv worker list 2>/dev/null || echo "  (server unreachable)"
+        echo "hq jobs     :"; ssh_srv job list 2>/dev/null || true
+    fi
+}
+
+cmd_down() {
+    local all=0; [[ "${1:-}" == "--all" ]] && all=1
+    echo "cancelling worker jobs (name=$WORKER_JOBNAME) ..."
+    scancel -u "$USER" -n "$WORKER_JOBNAME" 2>/dev/null && echo "  done" || echo "  (none)"
+    if [[ $all == 1 ]]; then
+        echo "cancelling server job (name=$SERVER_JOBNAME) ..."
+        scancel -u "$USER" -n "$SERVER_JOBNAME" 2>/dev/null && echo "  done" || echo "  (none)"
+        rm -f "$NODEFILE"
+    fi
+}
+
+case "${1:-}" in
+    up)     shift; cmd_up "$@";;
+    status) cmd_status;;
+    down)   shift; cmd_down "$@";;
+    *) echo "usage: hq-fleet {up [-p part -N n -g gpus -c cpus -m mem -t wall -C constraint -J name] | status | down [--all]}"; exit 1;;
+esac

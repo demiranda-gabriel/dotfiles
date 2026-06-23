@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# Install the HyperQueue standing-fleet on a PBS/ALCF cluster (Polaris, Aurora,
-# ...). Symlinks the orchestrator scripts onto PATH, builds the login-node
-# get_nprocs shim, and renders the PBS allocation scripts into ~/.hq/ from the
-# per-cluster knobs below. Idempotent; never overwrites an existing ~/.hq/*.pbs
-# or fleet.env unless you pass --force. Does NOT start anything — see the
-# printed next steps and docs/hyperqueue-fleet.md.
+# Install the HyperQueue fleet scripts. Scheduler-aware:
+#   * PBS/ALCF (Polaris, Aurora, ...): the 24/7 standing-fleet orchestrator
+#     (login-node server + capacity/bridge allocations + get_nprocs shim).
+#   * SLURM/FASRC: an ON-DEMAND allocator (compute-node server + ssh-bridged
+#     client + worker allocations sized on request). No standing fleet.
 #
-# Per-cluster knobs (env overrides; defaults = Polaris):
+# Symlinks the right orchestrator scripts onto PATH and renders the allocation
+# scripts into ~/.hq/ from the per-cluster knobs below. Idempotent; never
+# overwrites an existing ~/.hq/*.{pbs,sbatch} or fleet.env unless you pass
+# --force. Does NOT start anything — see the printed next steps and
+# docs/hyperqueue-fleet.md.
+#
+# Scheduler is auto-detected (sbatch -> slurm, qsub -> pbs); override HQ_SCHED.
+#
+# PBS knobs (env; defaults = Polaris):
 #   HQ_ACCOUNT, HQ_SYSTEM, HQ_NODES, HQ_FILESYSTEMS,
-#   HQ_CAP_QUEUE, HQ_CAP_WALL, HQ_BRIDGE_QUEUE, HQ_BRIDGE_WALL,
-#   HQ_DEBUG_QUEUE (autoalloc safety-net queue, for the printed commands)
-#
-# Example (Aurora-ish): HQ_SYSTEM=aurora HQ_FILESYSTEMS=home:flare \
-#                       HQ_CAP_QUEUE=... ./install.sh
+#   HQ_CAP_QUEUE, HQ_CAP_WALL, HQ_BRIDGE_QUEUE, HQ_BRIDGE_WALL, HQ_DEBUG_QUEUE
+# SLURM knobs (env; defaults = FASRC server lane):
+#   HQ_SRV_PART, HQ_SRV_CPUS, HQ_SRV_MEM, HQ_SRV_WALL
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +26,88 @@ HQDIR="$HOME/.hq"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
+# --- scheduler detection -----------------------------------------------------
+HQ_SCHED="${HQ_SCHED:-auto}"
+if [[ "$HQ_SCHED" == auto ]]; then
+    if   command -v sbatch >/dev/null 2>&1; then HQ_SCHED=slurm
+    elif command -v qsub   >/dev/null 2>&1; then HQ_SCHED=pbs
+    else echo "ERROR: neither sbatch nor qsub on PATH; set HQ_SCHED=slurm|pbs" >&2; exit 1; fi
+fi
+
+mkdir -p "$LOCAL_BIN" "$HQDIR"
+
+link_script() {  # link_script <src-abspath> <name>
+    local src=$1 name=$2 t="$LOCAL_BIN/$2"
+    chmod +x "$src"
+    if [[ -e "$t" || -L "$t" ]]; then
+        if [[ "$(readlink -f "$t" 2>/dev/null)" == "$src" ]]; then
+            echo "✓ $name already linked"
+        else
+            echo "⚠ $t exists and points elsewhere — leaving it (relink manually if intended)"
+        fi
+    else
+        ln -s "$src" "$t"; echo "✓ linked $name"
+    fi
+}
+
+seed_fleet_env() {
+    if [[ -e "$HQDIR/fleet.env" ]]; then echo "✓ fleet.env exists — kept"
+    else cp "$DIR/fleet.env.example" "$HQDIR/fleet.env"; echo "✓ seeded $HQDIR/fleet.env (edit it; NOT tracked)"; fi
+}
+
+# =============================================================================
+# SLURM / FASRC — on-demand allocator
+# =============================================================================
+if [[ "$HQ_SCHED" == slurm ]]; then
+    HQ_SRV_PART="${HQ_SRV_PART:-sapphire}"
+    HQ_SRV_CPUS="${HQ_SRV_CPUS:-2}"
+    HQ_SRV_MEM="${HQ_SRV_MEM:-4G}"
+    HQ_SRV_WALL="${HQ_SRV_WALL:-3-00:00:00}"
+
+    echo "=== HyperQueue install (SLURM / on-demand; server lane: $HQ_SRV_PART $HQ_SRV_WALL) ==="
+
+    link_script "$DIR/slurm/hq-server-up" hq-server-up
+    link_script "$DIR/slurm/hq-fleet"     hq-fleet
+
+    render_slurm() {  # render_slurm <template> <dest>
+        sed -e "s|__SRV_PART__|$HQ_SRV_PART|g" \
+            -e "s|__SRV_CPUS__|$HQ_SRV_CPUS|g" \
+            -e "s|__SRV_MEM__|$HQ_SRV_MEM|g" \
+            -e "s|__SRV_WALL__|$HQ_SRV_WALL|g" \
+            -e "s|__HQDIR__|$HQDIR|g" \
+            "$1" > "$2"
+    }
+    for pair in "slurm/server.sbatch.tmpl:server.sbatch" "slurm/worker.sbatch.tmpl:worker.sbatch"; do
+        src="${pair%%:*}"; dst="$HQDIR/${pair##*:}"
+        if [[ -e "$dst" && $FORCE -ne 1 ]]; then echo "✓ ${pair##*:} exists — kept (--force to regen)"
+        else render_slurm "$DIR/$src" "$dst"; echo "✓ wrote $dst"; fi
+    done
+
+    seed_fleet_env
+
+    cat <<EOF
+
+=== Next steps (SLURM / on-demand) ===
+  1. Ensure 'hq' is on PATH (see docs/hyperqueue-fleet.md to install the binary).
+  2. Make sure shell/42-fasrc-hq.sh is sourced (the \`hq\` ssh-bridge wrapper).
+  3. Review ~/.hq/server.sbatch (server lane) and ~/.hq/worker.sbatch (defaults).
+  4. Bring up a fleet sized to your needs (starts the server automatically):
+       hq-fleet up                                        # 1 GPU on gpu_requeue
+       hq-fleet up -p kozinsky_gpu -g 4 -t 1-00:00:00     # a whole lab A100 node
+       hq-fleet up -p gpu_requeue  -N 2 -g 4              # +2 preemptable nodes
+  5. Submit work (ssh-bridged to the server node automatically):
+       hq submit --resource gpus/nvidia=1 -- python train.py
+       hq job list ; hq-fleet status
+  6. Tear down when done:
+       hq-fleet down            # stop workers
+       hq-fleet down --all      # stop workers + server
+EOF
+    exit 0
+fi
+
+# =============================================================================
+# PBS / ALCF — 24/7 standing fleet
+# =============================================================================
 HQ_ACCOUNT="${HQ_ACCOUNT:-HetRxnEnergy}"
 HQ_SYSTEM="${HQ_SYSTEM:-polaris}"
 HQ_NODES="${HQ_NODES:-2}"
@@ -31,25 +118,13 @@ HQ_BRIDGE_QUEUE="${HQ_BRIDGE_QUEUE:-preemptable}"
 HQ_BRIDGE_WALL="${HQ_BRIDGE_WALL:-72:00:00}"
 HQ_DEBUG_QUEUE="${HQ_DEBUG_QUEUE:-debug}"
 
-echo "=== HyperQueue fleet install (account=$HQ_ACCOUNT system=$HQ_SYSTEM nodes=$HQ_NODES) ==="
-mkdir -p "$LOCAL_BIN" "$HQDIR/shim"
+echo "=== HyperQueue fleet install (PBS; account=$HQ_ACCOUNT system=$HQ_SYSTEM nodes=$HQ_NODES) ==="
+mkdir -p "$HQDIR/shim"
 
-# 1. Orchestrator scripts onto PATH
-for s in hq-server-up hq-fleet; do
-    chmod +x "$DIR/$s"
-    t="$LOCAL_BIN/$s"
-    if [[ -e "$t" || -L "$t" ]]; then
-        if [[ "$(readlink -f "$t" 2>/dev/null)" == "$DIR/$s" ]]; then
-            echo "✓ $s already linked"
-        else
-            echo "⚠ $t exists and points elsewhere — leaving it (use the repo copy manually if intended)"
-        fi
-    else
-        ln -s "$DIR/$s" "$t"; echo "✓ linked $s"
-    fi
-done
+link_script "$DIR/hq-server-up" hq-server-up
+link_script "$DIR/hq-fleet"     hq-fleet
 
-# 2. Build the login-node get_nprocs shim
+# Build the login-node get_nprocs shim
 cp -f "$DIR/shim/nproc8.c" "$HQDIR/shim/nproc8.c"
 if command -v gcc >/dev/null 2>&1; then
     gcc -shared -fPIC -o "$HQDIR/shim/nproc8.so" "$HQDIR/shim/nproc8.c" \
@@ -58,7 +133,6 @@ else
     echo "⚠ gcc not found — build the shim later: gcc -shared -fPIC -o $HQDIR/shim/nproc8.so $HQDIR/shim/nproc8.c"
 fi
 
-# 3. Render the PBS allocation scripts
 render() {  # render <template> <dest>
     sed -e "s|__ACCOUNT__|$HQ_ACCOUNT|g" \
         -e "s|__SYSTEM__|$HQ_SYSTEM|g" \
@@ -80,13 +154,7 @@ for pair in "capacity-workers.pbs.tmpl:capacity-workers.pbs" "preempt-bridge.pbs
     fi
 done
 
-# 4. fleet.env (secrets, notifications) — never overwrite
-if [[ -e "$HQDIR/fleet.env" ]]; then
-    echo "✓ fleet.env exists — kept"
-else
-    cp "$DIR/fleet.env.example" "$HQDIR/fleet.env"
-    echo "✓ seeded $HQDIR/fleet.env from example (edit it; it is NOT tracked)"
-fi
+seed_fleet_env
 
 cat <<EOF
 

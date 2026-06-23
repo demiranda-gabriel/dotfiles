@@ -167,6 +167,35 @@ Diagnose with `cat /sys/fs/cgroup/users/$USER/pids.{current,events}`.
 - Pause everything (e.g. budget): `hq-fleet down`, then `qdel` the
   `hq-capacity` / `hq-bridge` jobs.
 
+## Job submission on FASRC (Cannon) — HyperQueue (on-demand)
+
+**FASRC-only section** (SLURM; other clusters ignore). Unlike Polaris, there is
+**no 24/7 fleet** — usage is on-demand. Set up 2026-06-23; full guide in
+`~/dotfiles/docs/hyperqueue-fleet.md` (§ Running it on FASRC).
+
+**Why it differs:** FASRC firewalls login↔compute on arbitrary ports **both
+ways**, so the HQ server can't live on a login node (Polaris's model). It runs
+on a **compute node** (small CPU alloc); workers reach it compute↔compute; the
+`hq` CLIENT is an **ssh bridge** to that node (wrapper in `shell/42-fasrc-hq.sh`,
+reads `~/.hq/server-node`). `hq` only works through that wrapper.
+
+```bash
+hq-fleet up                                     # 1 GPU on gpu_requeue (polite default)
+hq-fleet up -p kozinsky_gpu -g 4 -t 1-00:00:00  # whole lab A100 node, guaranteed
+hq-fleet up -p gpu_requeue  -N 2 -g 4           # +2 preemptable nodes (stacks)
+hq submit --resource gpus/nvidia=1 -- python train.py
+hq job list ; hq-fleet status
+hq-fleet down [--all]                           # workers (+ server with --all)
+```
+
+- `hq-fleet up` auto-starts the server (idempotent) and **stacks** (call again
+  to add lanes). Server lane = `sapphire` 3-day CPU; guaranteed GPUs =
+  `kozinsky_gpu` (only 2 nodes — don't monopolize); preemptable = `gpu_requeue`.
+- Install/refresh: `HQ_SCHED=slurm ~/dotfiles/scripts/hq/install.sh` (links the
+  `scripts/hq/slurm/` variants; auto-detected from `sbatch`). No login-node
+  shim/taskset needed here (no ALCF pid cap).
+- `gpu_test` is stricter: `-c <8` and `-m <64000M` per GPU.
+
 ## New-cluster recipe
 
 ```bash
