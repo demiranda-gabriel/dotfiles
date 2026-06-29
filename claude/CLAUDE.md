@@ -3,6 +3,19 @@
 Loaded for every Claude Code session under this home directory,
 regardless of project.
 
+## Plotting conventions
+
+Defaults for every figure/plot I generate (matplotlib or otherwise),
+unless a specific request says otherwise:
+
+- **No figure suptitle.** Don't add `fig.suptitle`. Put context in the
+  per-panel titles, axis labels, legend, and the surrounding
+  notes/README instead.
+- **Keep the canvas compact.** Prefer a smaller `figsize` so the text
+  (titles, ticks, value labels, legend) renders large and legible
+  relative to the figure, rather than small on a sprawling canvas. Err
+  toward a tight figure and let the fonts read clearly.
+
 ## Backup / cross-cluster data workflow
 
 Bulk data (datasets, raw artefacts, run outputs that are too large for
