@@ -10,10 +10,28 @@
 #     tmux new -s vscode -d vscode-login-tunnel.sh
 #
 # First run triggers a GitHub device-code login (prints a URL + code to open on
-# your laptop); the credential then caches under ~/.vscode-cli for next time.
+# your laptop); the credential then caches under the CLI data dir for next time.
 set -uo pipefail
 export VSCODE_CLI_DISABLE_KEYCHAIN_ENCRYPT=1   # no system keychain on clusters
 CODE="$HOME/.local/bin/code"
+
+# Per-node CLI data dir. ALCF login nodes share $HOME over Lustre, but
+# `code tunnel` keeps exactly ONE singleton lock + ONE machine registration per
+# data dir. With the default shared dir all login nodes look like one machine:
+# a tunnel started on a second node can't seize the first node's lock (the
+# holder pid is alive on another host, so it looks dead but un-takeable) and
+# loops "access singleton" forever, while the registered name flip-flops between
+# whichever node last ran `code tunnel`. A dir per node makes each node's tunnel
+# fully independent, so it always comes up cleanly and its name matches the node.
+export VSCODE_CLI_DATA_DIR="${VSCODE_CLI_DATA_DIR:-$HOME/.vscode/cli-$(hostname -s)}"
+
+# First run on a node: seed auth from the legacy shared dir so you don't redo
+# the GitHub device-code login on every login node.
+if [[ ! -f "$VSCODE_CLI_DATA_DIR/token.json" && -f "$HOME/.vscode/cli/token.json" ]]; then
+  mkdir -p "$VSCODE_CLI_DATA_DIR"
+  cp -p "$HOME/.vscode/cli/token.json" "$HOME/.vscode/cli/agent-host-token" \
+        "$VSCODE_CLI_DATA_DIR/" 2>/dev/null || true
+fi
 
 # Tunnel/machine name. Defaults to <cluster>-<node-number> derived from the
 # hostname (polaris-login-01 -> polaris-01, aurora-uan-0009 -> aurora-0009), so
