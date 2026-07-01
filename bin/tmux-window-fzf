@@ -13,6 +13,18 @@
 # re-run on every keystroke). It mirrors:  lq = squeue -u <me> -S t -o "%.30j %.12T"
 set -eo pipefail
 
+# fzf is a Go binary: its runtime sizes GOMAXPROCS (and thus its OS-thread pool)
+# from the CPU-affinity mask via sched_getaffinity, NOT from OMP_NUM_THREADS or
+# nproc. On an ALCF login node that mask is the raw 256 cores, so fzf tries to
+# spawn ~256 OS threads and dies with "failed to create new OS thread (errno=11)"
+# against the per-user 256-pid login cgroup — the popup then flashes and closes.
+# (This is why the shell's OMP_/MKL_ caps in 41-polaris.sh don't help here, and
+# why a display-popup child — which inherits the tmux server's affinity, not a
+# fresh login shell — is affected.) Cap it here so the chooser works regardless
+# of the server's affinity; overridable, and harmless off login nodes (fzf is
+# I/O-bound and never needs many threads).
+export GOMAXPROCS="${GOMAXPROCS:-8}"
+
 # Absolute path to this script, so fzf's --preview can re-invoke it.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
@@ -86,6 +98,18 @@ if [ "${1:-}" = "--preview" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Hidden sessions: background daemons (the HyperQueue server, the hq-fleet
+# orchestrator, the VS Code tunnel host) that you never switch to, so they only
+# clutter the chooser. Space-separated *substrings* read from the @twf_hide
+# global option (editable in tmux.conf); a session is hidden when its name
+# contains any token — so "hq" alone also covers "hq-fleet". Falls back to this
+# default when the option is unset. Computed here, after the per-keystroke
+# --preview path has already exited, so it costs one show-options per open.
+# ---------------------------------------------------------------------------
+TWF_HIDE="$(tmux show-options -gv @twf_hide 2>/dev/null || true)"
+[ -n "$TWF_HIDE" ] || TWF_HIDE="hq hq-fleet vscode"
+
+# ---------------------------------------------------------------------------
 # List sub-command: `tmux-window-fzf --list`
 # Emits the grouped, ordered window list that fzf consumes (and reloads on every
 # reorder). Sessions are ranked by the per-session @order option (lower = higher
@@ -96,8 +120,11 @@ fi
 # and reads {1}=target (switch / preview) and {3}=session (reorder / cursor).
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--list" ]; then
-  awk -F'\t' '
+  awk -F'\t' -v hide="$TWF_HIDE" '
+      BEGIN { nh = split(hide, H, /[ \t]+/) }
+      function hidden(s,   i) { for (i=1;i<=nh;i++) if (H[i]!="" && index(s,H[i])) return 1; return 0 }
       NR==FNR { ord[$1] = ($2=="" ? 1000000000 : $2); next }   # session → @order rank
+      hidden($1) { next }                                       # drop hidden background sessions
       { o = (($1 in ord) ? ord[$1] : 1000000000) + 0
         printf "%015d\t%s\t%05d\t%s:%s\t%s\t%s\t%s\n", o, $1, $2, $1, $2, $3, $4, $5 }
     ' \
@@ -135,10 +162,14 @@ if [ "${1:-}" = "--reorder" ]; then
   # against). Set even on a no-op edge so the cursor simply stays put.
   tmux set-option -g @twf_moved "$sess"
 
-  # Sessions in current display order — identical ranking to --list.
+  # Sessions in current display order — identical ranking and hiding to --list,
+  # so reordering visible projects never swaps ranks with a hidden session.
   mapfile -t order < <(
     tmux list-sessions -F $'#{session_name}\t#{@order}' \
-    | awk -F'\t' '{ printf "%015d\t%s\n", ($2=="" ? 1000000000 : $2), $1 }' \
+    | awk -F'\t' -v hide="$TWF_HIDE" '
+        BEGIN { nh = split(hide, H, /[ \t]+/) }
+        { for (i=1;i<=nh;i++) if (H[i]!="" && index($1,H[i])) next
+          printf "%015d\t%s\n", ($2=="" ? 1000000000 : $2), $1 }' \
     | sort -t$'\t' -k1,1 -k2,2 \
     | cut -f2
   )
