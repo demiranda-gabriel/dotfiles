@@ -55,11 +55,27 @@ if [[ -d /lus/eagle ]]; then
   # (`OMP_NUM_THREADS=32 cmd`), and are login-node-gated so HQ tasks on compute
   # nodes are unaffected.
   if [[ "$(hostname -s)" == polaris-login-* ]]; then
+    # No core dumps on login nodes. When the pid cap is hit, a failed
+    # fork()/pthread_create() makes the native Claude binary (and Node tools)
+    # abort with SIGABRT — and Polaris's default `ulimit -c unlimited` +
+    # core_pattern=core then writes a multi-GB core into the cwd (a 6.5 GB
+    # core.<pid> was found in $HOME). That fills the disk and page cache,
+    # deepening the very memory pressure that triggered the abort. The cores
+    # are worthless here (no debugging of stripped release binaries), so
+    # suppress them; compute nodes are unaffected by this login-node gate.
+    ulimit -c 0
+
     export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
     export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
     export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-8}"
     export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-8}"
     export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-8}"
+    # Go's runtime ignores all of the above: it sizes GOMAXPROCS (and its OS-thread
+    # pool) from the raw CPU-affinity mask — 256 cores here — so an uncapped Go tool
+    # (fzf, lazygit, gh) spawns ~256 threads and trips the 256-pid cgroup. Cap it to
+    # match the 8-core allotment. (The M-j chooser also self-caps in tmux-window-fzf,
+    # since a display-popup child doesn't source this rc.)
+    export GOMAXPROCS="${GOMAXPROCS:-8}"
 
     # pidbudget — on-demand view of the cgroup budget + top thread consumers.
     pidbudget() {
