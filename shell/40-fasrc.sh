@@ -81,9 +81,15 @@ alias is_gpu_1_32='salloc -p kozinsky_gpu,gpu -t 0-06:00 -N 1 --ntasks-per-node=
 alias is_gpu_2='salloc -p kozinsky_gpu,gpu -t 0-06:00 -N 1 --ntasks-per-node=2 --gpus-per-node=2 --cpus-per-task=8 --gres=gpu:2 --constraint=a100 --mem-per-gpu=120000'
 alias is_cpu='salloc -p sapphire,kozinsky -t 0-12:00 -N 1 --ntasks-per-node=1 --cpus-per-task=16 --mem-per-cpu=8G'
 
-  # VSCode Remote-SSH on a compute node (toolkit: ~/scripts/vscode → dotfiles/scripts/vscode)
-  alias vscode='~/scripts/vscode/vscode-up.sh up'
-  alias vscode-status='~/scripts/vscode/vscode-up.sh status'
-  alias vscode-down='~/scripts/vscode/vscode-up.sh down'
-  alias tunnel='cd ~/scripts/vscode && sbatch vscode.job && tail -F out'
+  # VS Code tunnel on a compute node (toolkit: ~/scripts/vscode → dotfiles/scripts/vscode)
+  # `vscode` submits the tunnel job if it isn't already up, walks you through the
+  # one-time GitHub device login, and prints the connect URL. Re-run it whenever
+  # the allocation has ended.
+  alias vscode='~/scripts/vscode/vscode-tunnel-up.sh up'
+  alias vscode-status='~/scripts/vscode/vscode-tunnel-up.sh status'
+  alias vscode-down='~/scripts/vscode/vscode-tunnel-up.sh down'
+  alias vscode-log='~/scripts/vscode/vscode-tunnel-up.sh log'
+  # Legacy Remote-SSH-to-compute-node workflow (salloc + fasrc-compute host):
+  alias vscode-ssh='~/scripts/vscode/vscode-up.sh up'
+  alias tunnel='~/scripts/vscode/vscode-tunnel-up.sh up'
 fi
