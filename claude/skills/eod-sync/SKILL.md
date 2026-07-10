@@ -1,6 +1,6 @@
 ---
 name: eod-sync
-description: End-of-day scan + backup across all research projects. Discovers every repo with a DATA_MANAGEMENT.md, skips experiments with active SLURM jobs, commits+pushes git-tracked changes, pushes gdrive-tracked data (packaging models as .nequip.zip first), and asks how to classify any new top-level entry not yet in the data-management plan — then updates the plan and proceeds. Use when the user says "end of day", "eod sync", "eod-sync", "daily backup", "scan and back up my projects", "wrap up for the day", or invokes /eod-sync.
+description: End-of-day scan + backup across all research projects. Discovers every repo with a DATA_MANAGEMENT.md, skips experiments with active SLURM jobs, commits+pushes git-tracked changes, pushes gdrive-tracked data (packaging models as .nequip.zip first), and asks how to classify any new top-level entry not yet in the data-management plan — then updates the plan and proceeds. Also always syncs the ~/dotfiles repo (commit local edits, reconcile with the remote via rebase, push). Use when the user says "end of day", "eod sync", "eod-sync", "daily backup", "scan and back up my projects", "wrap up for the day", or invokes /eod-sync.
 ---
 
 # eod-sync
@@ -110,11 +110,42 @@ scripts (`gdrive-push` / `gdrive-archive`).
 **3d. Verify.** Reuse the `sync-project` checks: working tree clean and
 pushed; every gdrive-tracked path present on Drive.
 
-### 4. Report
+### 4. Dotfiles sync (`~/dotfiles`)
+**Always sync the dotfiles repo too** — it is the cross-cluster source of
+truth for shell config, scripts, and Claude skills (including this one).
+It lives outside the projects root and has no `DATA_MANAGEMENT.md`, so it
+is handled here explicitly, not by the per-project loop. It is git-only
+(no gdrive tier).
+
+- `git -C ~/dotfiles fetch`, then read `git status` and ahead/behind
+  (`git rev-list --left-right --count @{u}...HEAD`).
+- **Local uncommitted changes** (tracked edits, or new untracked files):
+  these are real config edits, not disposable. Inspect the diff first so
+  the message is honest, then stage + commit — safe mechanics, like a
+  project's git-tracked changes (step 3b).
+- **Behind the remote** (commits pushed from another cluster): reconcile.
+  Pure fast-forward + clean tree → fast-forward. Local commits/edits **and**
+  remote commits (cross-cluster divergence) → commit local first, then
+  `git rebase origin/<branch>`. A clean rebase that keeps both sides needs
+  no prompt; **surface any merge conflict interactively** (show the local
+  vs incoming hunks; ask take-local / take-remote / manual) — never
+  auto-resolve a dotfiles merge. When the same file was edited
+  independently on two clusters, the goal is to keep both changes.
+- **Ahead** (unpushed commits): push to the tracking branch.
+- End on `0 0` and a clean working tree. Remind the user that the *other*
+  cluster's checkout still needs a pull before its next edit, so the
+  dotfiles don't re-diverge.
+- Note: the active skill copies under `~/.claude/skills/` may be plain
+  copies rather than symlinks into `~/dotfiles` (bootstrap skips a target
+  that already exists). If a skill edit is committed here, also refresh
+  the active copy so it takes effect this session.
+
+### 5. Report
 Per project, summarise: commits made (with SHAs) and pushed, Drive
 pushes / packages built, experiments skipped (active jobs), plan entries
 added, and anything still needing attention. Close with an overall
-**PASS / NEEDS-ATTENTION** line per project.
+**PASS / NEEDS-ATTENTION** line per project. Add a final line for the
+**dotfiles** repo (commit SHA + push, or already-clean / needs-attention).
 
 ## Guardrails
 - Skip experiments with active SLURM jobs — never touch their in-flight outputs.
@@ -123,6 +154,7 @@ added, and anything still needing attention. Close with an overall
 - Never edit third-party / vendored / site-packages source.
 - Confirm a recent push before deleting any local gdrive-tracked copy; deletion needs explicit user say-so.
 - Commits/pushes target the current working branch.
+- Always sync `~/dotfiles` too (step 4). Commit + push its tracked edits as safe mechanics, but on cross-cluster divergence surface merge conflicts interactively — never auto-resolve a dotfiles merge.
 
 ## Related skills
 - `backup-to-gdrive` — push/pull/archive mechanics and the `mir-backup:` remote layout.
