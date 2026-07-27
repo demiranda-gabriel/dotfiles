@@ -34,6 +34,7 @@ CAP_SCRIPT=$HOME/.hq/capacity-workers.pbs
 BRIDGE_SCRIPT=$HOME/.hq/preempt-bridge.pbs
 LOG=$HOME/.hq/fleet.log
 STATE=$HOME/.hq/fleet.state   # throttle timestamps + last-seen job states
+PAUSE_FLAG=$HOME/.hq/PAUSED   # while present, `up` refuses and `tick` no-ops
 export PATH=$HOME/.local/bin:$PATH
 [[ -f $HOME/.hq/fleet.env ]] && source "$HOME/.hq/fleet.env"   # SLACK_WEBHOOK / NTFY_TOPIC / HQ_FLEET_LABEL
 FLEET_LABEL=${HQ_FLEET_LABEL:-Polaris}
@@ -130,6 +131,10 @@ throttled_log() {  # throttled_log <key> <message> — at most once/hour per key
 }
 
 tick() {
+    if [[ -e $PAUSE_FLAG ]]; then
+        throttled_log paused "fleet is paused ($PAUSE_FLAG present) — skipping tick"
+        return 0
+    fi
     hq-server-up >/dev/null 2>&1 || throttled_log srv "WARNING: hq-server-up failed"
 
     read -r cap_id cap_st cap_rem <<<"$(job_lookup $CAP_NAME)"
@@ -175,19 +180,29 @@ status() {
     echo "bridge   : ${br_id:-none} state=${br_st:--} remaining=${br_rem:--}h"
     echo "workers  :"; hq worker list 2>/dev/null | tail -n +2
     echo "orchestr.: $(tmux has-session -t hq-fleet 2>/dev/null && echo running || echo STOPPED)"
+    [[ -e $PAUSE_FLAG ]] && echo "PAUSED   : yes ($PAUSE_FLAG) — 'hq-fleet resume' to re-enable"
 }
 
 case "${1:-}" in
     tick)   tick ;;
     run)    log "fleet orchestrator started (lead=${LEAD_HOURS}h, interval=${CHECK_INTERVAL}s)"
             while true; do tick; sleep "$CHECK_INTERVAL"; done ;;
-    up)     if tmux has-session -t hq-fleet 2>/dev/null; then
+    up)     if [[ -e $PAUSE_FLAG ]]; then
+                echo "hq-fleet is paused ($PAUSE_FLAG present) — 'hq-fleet resume' to re-enable"
+            elif tmux has-session -t hq-fleet 2>/dev/null; then
                 echo "hq-fleet already running"
             else
                 tmux new-session -d -s hq-fleet "$HOME/.local/bin/hq-fleet run"
                 echo "hq-fleet started (tmux session 'hq-fleet')"
             fi ;;
     down)   tmux kill-session -t hq-fleet 2>/dev/null && echo stopped || echo "not running" ;;
+    pause)  touch "$PAUSE_FLAG"
+            tmux kill-session -t hq-fleet 2>/dev/null
+            log "fleet PAUSED (flag $PAUSE_FLAG created, orchestrator stopped)"
+            echo "paused — allocations are left untouched (qdel them separately)" ;;
+    resume) rm -f "$PAUSE_FLAG"
+            log "fleet RESUMED (pause flag removed)"
+            "$0" up ;;
     status) status ;;
-    *)      echo "usage: hq-fleet {tick|run|up|down|status}   (env: DRY_RUN, LEAD_HOURS, CHECK_INTERVAL)"; exit 1 ;;
+    *)      echo "usage: hq-fleet {tick|run|up|down|pause|resume|status}   (env: DRY_RUN, LEAD_HOURS, CHECK_INTERVAL)"; exit 1 ;;
 esac
