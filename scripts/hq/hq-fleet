@@ -3,12 +3,14 @@
 #
 # Fleet size is set by `select=` in the two PBS scripts (2 nodes on Polaris).
 # Policy (Polaris, agreed 2026-06-12; see docs/hyperqueue-fleet.md):
-#   * Primary: a long job on the `capacity` queue (hq-capacity). The project
-#     gets at most 2 capacity slots (queued+running, held jobs count), so next
-#     week's job usually can't be queued until the current one ends.
+#   * Primary: HQ_CAP_JOBS jobs on the `capacity` queue (hq-capacity), kept in
+#     flight (running + queued). The project gets at most 2 capacity slots
+#     (queued+running, held jobs count). Current Polaris policy (2026-07-27,
+#     group-shared fleet): HQ_CAP_JOBS=2 — one running, one queued back-to-back.
 #   * Bridge: a `preemptable` job (hq-bridge), ensured whenever no capacity job
 #     is RUNNING, or the running one has less than LEAD_HOURS left. Resubmitted
-#     automatically if preempted.
+#     automatically if preempted. HQ_NO_BRIDGE=1 disables the lane entirely
+#     (current Polaris policy: disabled; any leftover bridge is drained/qdel'd).
 #   * Overlap: once a capacity job is running with comfortable time left, the
 #     bridge is qdel'd — immediately while still queued, but only once no HQ
 #     task is running anywhere if its workers are already attached (conservative
@@ -36,8 +38,10 @@ LOG=$HOME/.hq/fleet.log
 STATE=$HOME/.hq/fleet.state   # throttle timestamps + last-seen job states
 PAUSE_FLAG=$HOME/.hq/PAUSED   # while present, `up` refuses and `tick` no-ops
 export PATH=$HOME/.local/bin:$PATH
-[[ -f $HOME/.hq/fleet.env ]] && source "$HOME/.hq/fleet.env"   # SLACK_WEBHOOK / NTFY_TOPIC / HQ_FLEET_LABEL
+[[ -f $HOME/.hq/fleet.env ]] && source "$HOME/.hq/fleet.env"   # SLACK_WEBHOOK / NTFY_TOPIC / HQ_FLEET_LABEL / lane knobs
 FLEET_LABEL=${HQ_FLEET_LABEL:-Polaris}
+CAP_JOBS=${HQ_CAP_JOBS:-1}      # capacity jobs to keep in flight (running+queued)
+NO_BRIDGE=${HQ_NO_BRIDGE:-0}    # 1 = bridge lane disabled (leftover bridges drained)
 
 log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$LOG"; }
 
@@ -115,6 +119,14 @@ job_lookup() {
     echo "$best"
 }
 
+job_count() {  # number of Q/R/H jobs with this exact name
+    local name=$1 n=0 id
+    for id in $(qselect -u "$USER" -s QRH 2>/dev/null); do
+        qstat -f "$id" 2>/dev/null | grep -q "Job_Name = $name$" && n=$((n+1))
+    done
+    echo $n
+}
+
 hq_running_tasks() {  # global count of RUNNING tasks (conservative idle check)
     hq job list 2>/dev/null | grep -c RUNNING || true
 }
@@ -143,15 +155,20 @@ tick() {
     track cap_state "${cap_id:-none}" "${cap_st:--}" "capacity allocation"
     track br_state "${br_id:-none}" "${br_st:--}" "bridge allocation"
 
-    # --- capacity lane: always keep one queued or running
-    if [[ -z ${cap_id:-} ]]; then
-        act "submit capacity job" qsub "$CAP_SCRIPT" \
+    # --- capacity lane: keep CAP_JOBS jobs in flight (running + queued).
+    # One submission per tick, so a cold start reaches the target over
+    # CAP_JOBS ticks rather than qsub-bursting.
+    local cap_n; cap_n=$(job_count $CAP_NAME)
+    if [[ $cap_n -lt $CAP_JOBS ]]; then
+        act "submit capacity job ($cap_n/$CAP_JOBS in flight)" qsub "$CAP_SCRIPT" \
             || throttled_log cap "capacity slot still full (likely project limit); will retry"
     fi
 
     # --- does the fleet need the bridge?
     local need_bridge=0 reason=""
-    if [[ ${cap_st:-} != R ]]; then
+    if [[ $NO_BRIDGE == 1 ]]; then
+        need_bridge=0   # lane disabled; leftover bridges are drained below
+    elif [[ ${cap_st:-} != R ]]; then
         need_bridge=1; reason="no capacity job running"
     elif awk -v r="$cap_rem" -v l="$LEAD_HOURS" 'BEGIN{exit !(r<l)}'; then
         need_bridge=1; reason="capacity job $cap_id has only ${cap_rem}h left"
@@ -176,8 +193,13 @@ tick() {
 status() {
     read -r cap_id cap_st cap_rem <<<"$(job_lookup $CAP_NAME)"
     read -r br_id br_st br_rem <<<"$(job_lookup $BRIDGE_NAME)"
-    echo "capacity : ${cap_id:-none} state=${cap_st:--} remaining=${cap_rem:--}h"
-    echo "bridge   : ${br_id:-none} state=${br_st:--} remaining=${br_rem:--}h"
+    local cap_n; cap_n=$(job_count $CAP_NAME)
+    echo "capacity : ${cap_id:-none} state=${cap_st:--} remaining=${cap_rem:--}h (${cap_n}/${CAP_JOBS} in flight)"
+    if [[ $NO_BRIDGE == 1 ]]; then
+        echo "bridge   : disabled (HQ_NO_BRIDGE=1)${br_id:+ — leftover $br_id state=$br_st will be drained}"
+    else
+        echo "bridge   : ${br_id:-none} state=${br_st:--} remaining=${br_rem:--}h"
+    fi
     echo "workers  :"; hq worker list 2>/dev/null | tail -n +2
     echo "orchestr.: $(tmux has-session -t hq-fleet 2>/dev/null && echo running || echo STOPPED)"
     [[ -e $PAUSE_FLAG ]] && echo "PAUSED   : yes ($PAUSE_FLAG) — 'hq-fleet resume' to re-enable"

@@ -131,13 +131,15 @@ included).
 | HQ server | `polaris-login-01`, tmux session `hq`, journal `~/.hq/journal`, log `~/.hq/server.log` |
 | `hq-server-up` | THE ONLY way to (re)start the server — applies LD_PRELOAD shim + taskset (see cgroup note) |
 | `hq-fleet` | orchestrator, tmux session `hq-fleet`; subcommands `status/up/down/tick`, `DRY_RUN=1` to preview; log `~/.hq/fleet.log` |
-| Primary allocation | 2-node/168h `capacity` job `hq-capacity` (`~/.hq/capacity-workers.pbs`) |
-| Bridge allocation | 2-node/72h `preemptable` job `hq-bridge` (`~/.hq/preempt-bridge.pbs`), ensured when no capacity job runs or <24h remains; auto-cancelled when capacity is healthy AND no HQ task is running |
+| Primary allocation | 2-node/168h `capacity` jobs `hq-capacity` (`~/.hq/capacity-workers.pbs`); **`HQ_CAP_JOBS=2` in fleet.env keeps one RUNNING + one QUEUED back-to-back** (uses both project capacity slots) |
+| Bridge allocation | **DISABLED since 2026-07-27** (`HQ_NO_BRIDGE=1` in fleet.env; capacity-only policy for the group-shared fleet). The `preemptable` `hq-bridge` machinery (`~/.hq/preempt-bridge.pbs`) still exists — re-enable by removing the knob |
 | Autoalloc queues | `debug` (1n/1h) and `preempt` (1n/72h) — HQ auto-qsubs only when tasks wait uncovered; safety net, normally silent |
+| Group sharing | fleet is shared with all HetRxnEnergy members via `/lus/eagle/projects/HetRxnEnergy/hq-shared/` (client access file + `hq`/`hq-submit`/`hq-gpus` + user README). Tasks run as demiranda; server keys pinned via `~/.hq/access/full.json` |
 
-The fleet self-heals: each tick re-runs `hq-server-up` (idempotent), resubmits
-capacity when the project slot frees, resubmits the bridge if preempted.
+The fleet self-heals: each tick re-runs `hq-server-up` (idempotent) and tops
+capacity back up to `HQ_CAP_JOBS` in flight.
 `shell/41-polaris.sh` re-ups the fleet from any login-01 shell after reboots.
+On Polaris, `~/dotfiles` stays on branch `polaris-shared-fleet` (never `main`).
 
 **Notifications**: the fleet pushes state transitions (allocation start/end,
 submissions, bridge handover) to a Slack DM via incoming webhook, plus

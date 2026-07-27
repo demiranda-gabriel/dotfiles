@@ -65,15 +65,23 @@ Four cooperating pieces, all living in the user's space (no admin needed):
 
 ### The two allocation lanes the fleet maintains
 
-- **Capacity (primary):** a long job (`168h` on Polaris) on the `capacity`
-  queue, named `hq-capacity`. ALCF allows only **2 capacity slots per project**
-  (queued+running, *held jobs count*), so next week's job usually can't be
-  queued until the current one ends.
+- **Capacity (primary):** long jobs (`168h` on Polaris) on the `capacity`
+  queue, named `hq-capacity`. The fleet keeps `HQ_CAP_JOBS` of them in flight
+  (running + queued; default 1). ALCF allows only **2 capacity slots per
+  project** (queued+running, *held jobs count*).
 - **Bridge (gap filler):** a `preemptable` job (`72h`), named `hq-bridge`,
   submitted whenever no capacity job is **running** or the running one has
   `< LEAD_HOURS` (24h) left. It can be preempted any time; HQ's default
   `--crash-limit 5` reruns interrupted tasks on surviving workers. Once
-  capacity is healthy *and* no HQ task is running, the fleet `qdel`s the bridge.
+  capacity is healthy *and* no HQ task is running, the fleet `qdel`s the
+  bridge. `HQ_NO_BRIDGE=1` disables the lane entirely (leftover bridge jobs
+  are drained and qdel'd).
+
+> **Current Polaris policy (2026-07-27, group-shared fleet):** capacity-only —
+> `HQ_CAP_JOBS=2` (one running + one queued back-to-back, using both project
+> slots) and `HQ_NO_BRIDGE=1`, set in `~/.hq/fleet.env`. The weekly handover
+> may leave a short worker gap (PBS start latency); crash-limit reruns cover
+> tasks cut off at the walltime edge.
 
 Each `tick` (every 10 min) the fleet also re-runs `hq-server-up` (idempotent),
 so a crashed/rebooted server self-heals; the journal restores jobs + autoalloc.
@@ -199,6 +207,8 @@ What changes between clusters (everything else is portable):
 | `HQ_BRIDGE_QUEUE` / `HQ_BRIDGE_WALL` | `preemptable` / `72:00:00` | gap-filler lane |
 | `HQ_FLEET_LABEL` | `Polaris` | tag in notifications |
 | `LEAD_HOURS` | `24` | resubmit bridge when capacity has < this left |
+| `HQ_CAP_JOBS` | `2` | capacity jobs kept in flight (running+queued); default 1 |
+| `HQ_NO_BRIDGE` | `1` | disable the bridge lane; default 0 (enabled) |
 
 `#PBS` directives can't read shell vars, so the queue/account/walltime live as
 literal lines in the rendered `~/.hq/*.pbs` — `install.sh` substitutes them, or
