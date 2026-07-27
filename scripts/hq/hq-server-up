@@ -15,6 +15,14 @@ HQ="$HOME/.local/bin/hq"
 JOURNAL="$HOME/.hq/journal"
 LOG="$HOME/.hq/server.log"
 SERVER_HOST="${HQ_SERVER_HOST:-polaris-login-01}"
+# Pinned access file (optional): pre-generated via
+#   hq server generate-access ~/.hq/access/full.json \
+#     --client-file=... --worker-file=... --host <server-host> \
+#     --client-port <p1> --worker-port <p2>
+# With it, keys+ports survive restarts, so a group-shared *client* access file
+# stays valid forever (without it the server mints new keys every restart and
+# any shared copy goes stale). Absent the file, behavior is unchanged.
+ACCESS_FILE="${HQ_ACCESS_FILE:-$HOME/.hq/access/full.json}"
 
 if [[ "$(hostname -s)" != "$SERVER_HOST" ]]; then
     echo "ERROR: run on $SERVER_HOST (clients dial the host in ~/.hq-server/)." >&2
@@ -37,13 +45,15 @@ mkdir -p "$(dirname "$JOURNAL")"
 # Source + build: ~/.hq/shim/nproc8.c
 SHIM="$HOME/.hq/shim/nproc8.so"
 [[ -f "$SHIM" ]] || { echo "ERROR: $SHIM missing; rebuild: gcc -shared -fPIC -o $SHIM ~/.hq/shim/nproc8.c" >&2; exit 1; }
+ACCESS_OPT=""
+[[ -f "$ACCESS_FILE" ]] && ACCESS_OPT="--access-file $ACCESS_FILE"
 tmux kill-session -t hq 2>/dev/null || true
 tmux new-session -d -s hq \
-    "LD_PRELOAD=$SHIM taskset -c 0-7 $HQ server start --journal $JOURNAL >> $LOG 2>&1"
+    "LD_PRELOAD=$SHIM taskset -c 0-7 $HQ server start --journal $JOURNAL $ACCESS_OPT >> $LOG 2>&1"
 sleep 3
 
 if "$HQ" server info >/dev/null 2>&1; then
-    echo "hq server started (tmux session 'hq', pinned to cpus 0-7):"
+    echo "hq server started (tmux session 'hq', pinned to cpus 0-7${ACCESS_OPT:+, pinned keys from $ACCESS_FILE}):"
     pgrep -u "$USER" -x hq | xargs -r ps -o pid,nlwp,args -p
 else
     echo "ERROR: server failed to start; see $LOG" >&2

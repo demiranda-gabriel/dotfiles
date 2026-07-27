@@ -16,6 +16,10 @@
 # preempted at any time; hq's default crash-limit=5 restarts interrupted tasks
 # on surviving workers.
 export PATH=$HOME/.local/bin:$PATH
+# Group-shared fleet: tasks may be submitted by any project member but run as
+# this job's owner. umask 002 (workers inherit it) + setgid project dirs keep
+# task outputs group-writable so submitters can manage their own files.
+umask 002
 
 NNODES=$(wc -l < "$PBS_NODEFILE")
 

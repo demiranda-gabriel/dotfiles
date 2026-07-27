@@ -242,6 +242,47 @@ fleet — carry it over only if you want it.)
 
 ---
 
+## Sharing the fleet with your project group
+
+HQ has no user isolation — sharing is the documented "group of users that
+trust each other" model. Anyone holding the **client** key can submit/query/
+cancel *everything*, and tasks execute **as the fleet owner's account** on the
+workers. Get your facility's blessing first (others executing under your UID
+can conflict with account-sharing policy; a service account is the clean fix).
+
+Mechanics (set up on Polaris 2026-07-27, `/lus/eagle/projects/HetRxnEnergy/hq-shared/`):
+
+1. **Pin the server keys.** By default the server mints new keys+ports every
+   restart, so any shared copy goes stale within one self-heal tick. Generate
+   once:
+   ```bash
+   mkdir -p ~/.hq/access && chmod 700 ~/.hq/access
+   hq server generate-access ~/.hq/access/full.json \
+       --client-file=$HOME/.hq/access/client.json \
+       --worker-file=$HOME/.hq/access/worker.json \
+       --host <server-host> --client-port <p1> --worker-port <p2>
+   chmod 600 ~/.hq/access/*.json
+   ```
+   `hq-server-up` auto-detects `~/.hq/access/full.json` and starts the server
+   with `--access-file` (keys/ports then survive restarts). Restart the server
+   to switch — do it while no workers are attached; note a clean `hq server
+   stop` finalizes finished jobs (history no longer listed after restore) and
+   **autoalloc pause state does not survive restarts** (re-`hq alloc pause` after).
+2. **Publish the client half** (never the worker/full files) on the project
+   filesystem, group-readable:
+   `$SHARE/client/hq-current/access.json` (dirs 750, file 640, project group).
+   Ship the matching `hq` binary in `$SHARE/bin` (access files are
+   version-checked). Users set `HQ_SERVER_DIR=$SHARE/client`.
+3. **Group-writable outputs.** Workers run `umask 002` (in the `.pbs` scripts)
+   and users submit from setgid project dirs — task outputs (owned by the
+   fleet owner) stay manageable by the submitter. Submitting from `$HOME`
+   fails: the owner can't write there.
+4. **Attribution convention.** The server can't distinguish submitters — a
+   `hq-submit` wrapper in `$SHARE/bin` injects `--name "$USER:<cmd>"`.
+   Scheduling is FIFO + `--priority`; fairness is social, not enforced.
+
+---
+
 ## Running it on FASRC (SLURM)
 
 This is **implemented** in `scripts/hq/slurm/` and works today — but the
