@@ -1,0 +1,146 @@
+#!/bin/bash
+# bravo-fleet — the PREEMPTABLE companion to alpha-fleet (hq-fleet, capacity).
+#
+#   alpha-fleet : `capacity` queue, up to 4 nodes x 168 h, managed by hq-fleet.
+#                 Big and stable, but the project is limited to ~2 jobs, so when
+#                 a teammate holds the slots we get NOTHING (that is what
+#                 stalled all tracks for 44 h on 2026-08-13..15).
+#   bravo-fleet : `preemptable` queue, MANY 1-node x <=72 h jobs. Limits are far
+#                 looser (10 running / 20 queued per project), single-node jobs
+#                 fit backfill, and preemption costs one node instead of the
+#                 whole fleet.
+#
+# Both attach to the SAME HQ server, so tasks flow to whichever workers exist.
+# Nothing about task submission changes; this only adds worker supply.
+#
+# STAGGERED WALLTIMES are the point: identical allocations submitted together
+# expire together and recreate the gap. Initial jobs get spread walltimes, and
+# the daily top-up keeps refreshing the tail.
+#
+# Usage:
+#   bravo-fleet up [N]     submit N jobs now (default $BRAVO_INITIAL) staggered
+#   bravo-fleet tick       one top-up pass: add $BRAVO_DAILY if under the cap
+#   bravo-fleet run        tick every $BRAVO_INTERVAL seconds, forever (tmux)
+#   bravo-fleet status     show bravo jobs + HQ workers
+#   bravo-fleet down       qdel every bravo job
+#
+# No crontab on Polaris (user crontabs are denied), hence `run` as a resident
+# loop — same pattern as hq-fleet. Re-run `bravo-fleet run` after a login-node
+# reboot; `up`/`tick` are idempotent with respect to the cap.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+PBS_SCRIPT=$HOME/.hq/bravo-1node.pbs
+LOG=$HOME/.hq/bravo/fleet.log
+STATE=$HOME/.hq/bravo
+mkdir -p "$STATE"
+[[ -f $HOME/.hq/fleet.env ]] && source "$HOME/.hq/fleet.env"   # SLACK_WEBHOOK / NTFY_TOPIC
+
+BRAVO_INITIAL=${BRAVO_INITIAL:-5}          # jobs submitted by `up` with no arg
+BRAVO_DAILY=${BRAVO_DAILY:-2}              # jobs added per `tick`
+BRAVO_MAX_INFLIGHT=${BRAVO_MAX_INFLIGHT:-10}  # queue allows 10 running / 20 queued per project
+BRAVO_INTERVAL=${BRAVO_INTERVAL:-86400}    # `run` tick period (24 h)
+# Staggered walltimes, cycled. Spread so expiries land on different days.
+BRAVO_WALLTIMES=${BRAVO_WALLTIMES:-"72:00:00 60:00:00 48:00:00 36:00:00 24:00:00"}
+
+log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$LOG"; }
+
+notify() {  # best-effort; never fails a tick
+  local msg="$1"
+  [[ -n "${SLACK_WEBHOOK:-}" ]] && curl -sf -X POST -H 'Content-type: application/json' \
+     --data "{\"text\":\"[bravo-fleet] ${msg}\"}" "$SLACK_WEBHOOK" >/dev/null 2>&1
+  [[ -n "${NTFY_TOPIC:-}" ]] && curl -sf -d "[bravo-fleet] ${msg}" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null 2>&1
+  return 0
+}
+
+# Job IDs of every bravo allocation still queued or running.
+bravo_jobs() {
+  # NOTE: `qstat -u` truncates Jobname to ~10 chars, so match PREFIXES, never
+  # full names. `hq-preemp` is the 2026-08-15 pilot allocation — same PBS
+  # script and queue, so it is a bravo worker in all but name; count it.
+  qstat -u "$USER" 2>/dev/null | awk '/bravo-1n|hq-preemp/ && ($10=="Q"||$10=="R"||$10=="H") {print $1}' | sed 's/\..*//'
+}
+bravo_count() { bravo_jobs | grep -c . ; }
+
+submit_one() {
+  local wt="$1"
+  local out jid
+  out=$(qsub -l "walltime=$wt" "$PBS_SCRIPT" 2>&1)
+  jid=$(echo "$out" | grep -oE '^[0-9]+')
+  if [[ -n "$jid" ]]; then
+    log "submitted bravo job $jid (walltime $wt)"
+    echo "$jid"
+  else
+    log "SUBMIT FAILED (walltime $wt): $out"
+    return 1
+  fi
+}
+
+cmd_up() {
+  local n=${1:-$BRAVO_INITIAL}
+  local have room i=0 wts submitted=0
+  have=$(bravo_count)
+  room=$(( BRAVO_MAX_INFLIGHT - have ))
+  if (( room <= 0 )); then
+    log "cap reached: $have in flight >= BRAVO_MAX_INFLIGHT=$BRAVO_MAX_INFLIGHT — nothing to do"
+    return 0
+  fi
+  (( n > room )) && { log "requested $n but only $room slot(s) under the cap; submitting $room"; n=$room; }
+  read -ra wts <<< "$BRAVO_WALLTIMES"
+  while (( i < n )); do
+    submit_one "${wts[$(( (have + i) % ${#wts[@]} ))]}" >/dev/null && (( submitted++ ))
+    (( i++ ))
+  done
+  log "up: submitted $submitted job(s); now $(bravo_count) in flight"
+  notify "up: +$submitted job(s), $(bravo_count) in flight"
+}
+
+cmd_tick() {
+  local have
+  have=$(bravo_count)
+  if (( have >= BRAVO_MAX_INFLIGHT )); then
+    log "tick: $have in flight, at cap ($BRAVO_MAX_INFLIGHT) — no top-up"
+    return 0
+  fi
+  log "tick: $have in flight, adding up to $BRAVO_DAILY"
+  cmd_up "$BRAVO_DAILY"
+}
+
+cmd_run() {
+  log "bravo-fleet run started (interval ${BRAVO_INTERVAL}s, daily +${BRAVO_DAILY}, cap ${BRAVO_MAX_INFLIGHT})"
+  # Sleep FIRST: `up` has already seeded the fleet, so ticking immediately would
+  # add the daily top-up on day zero and overshoot the intended ramp.
+  while true; do
+    sleep "$BRAVO_INTERVAL"
+    cmd_tick
+  done
+}
+
+cmd_status() {
+  echo "=== bravo-fleet (preemptable) ==="
+  local n; n=$(bravo_count)
+  echo "in flight: $n / cap $BRAVO_MAX_INFLIGHT   (daily top-up: +$BRAVO_DAILY)"
+  qstat -u "$USER" 2>/dev/null | awk 'NR<=5 || /bravo-1n/'
+  echo
+  echo "=== alpha-fleet (capacity) ==="
+  qstat -u "$USER" 2>/dev/null | awk '/hq-capaci/'   # truncated name
+  echo
+  echo "=== HQ workers (both fleets feed one server) ==="
+  hq worker list 2>/dev/null | tail -n +2 | head -20
+}
+
+cmd_down() {
+  local jobs; jobs=$(bravo_jobs)
+  [[ -z "$jobs" ]] && { log "down: no bravo jobs"; return 0; }
+  echo "$jobs" | xargs -r qdel 2>&1 | tail -2
+  log "down: qdel'd $(echo "$jobs" | wc -l) job(s)"
+}
+
+case "${1:-status}" in
+  up)     shift; cmd_up "$@" ;;
+  tick)   cmd_tick ;;
+  run)    cmd_run ;;
+  status) cmd_status ;;
+  down)   cmd_down ;;
+  *) echo "usage: bravo-fleet {up [N]|tick|run|status|down}"; exit 2 ;;
+esac

@@ -129,6 +129,7 @@ mkdir -p "$HQDIR/shim"
 
 link_script "$DIR/hq-server-up" hq-server-up
 link_script "$DIR/hq-fleet"     hq-fleet
+link_script "$DIR/bravo-fleet"  bravo-fleet   # preemptable companion fleet (PBS only)
 
 # Build the login-node get_nprocs shim
 cp -f "$DIR/shim/nproc8.c" "$HQDIR/shim/nproc8.c"
@@ -151,7 +152,7 @@ render() {  # render <template> <dest>
         -e "s|__HQDIR__|$HQDIR|g" \
         "$1" > "$2"
 }
-for pair in "capacity-workers.pbs.tmpl:capacity-workers.pbs" "preempt-bridge.pbs.tmpl:preempt-bridge.pbs"; do
+for pair in "capacity-workers.pbs.tmpl:capacity-workers.pbs" "preempt-bridge.pbs.tmpl:preempt-bridge.pbs" "bravo-1node.pbs.tmpl:bravo-1node.pbs"; do
     src="${pair%%:*}"; dst="$HQDIR/${pair##*:}"
     if [[ -e "$dst" && $FORCE -ne 1 ]]; then
         echo "✓ ${pair##*:} exists — kept (use --force to regenerate)"

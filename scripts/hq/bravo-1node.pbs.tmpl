@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -A __ACCOUNT__
+#PBS -q __BRIDGE_QUEUE__
+#PBS -l select=1:system=__SYSTEM__
+#PBS -l filesystems=__FILESYSTEMS__
+#PBS -l place=scatter
+#PBS -N bravo-1n
+#PBS -j oe
+#PBS -o __HQDIR__/bravo/workers.log
+#
+# BRAVO-FLEET worker: ONE node (4 A100s) on the `preemptable` queue, attached to
+# the same HQ server as alpha-fleet, so both fleets feed one task pool.
+#
+# Why one node and not four: on 2026-08-15 a 4-node preemptable request was
+# TERMINATED by the scheduler after 6 min without ever running
+# ("Insufficient amount of resource: queue_tags and terminated"), while a
+# 1-node request submitted 5 min later stayed queued healthily. Wide jobs must
+# find a block of tagged nodes; narrow ones fit ordinary backfill. Many small
+# allocations also decorrelate preemption — losing one costs one node, not the
+# whole fleet.
+#
+# WALLTIME IS SET AT SUBMIT TIME (`qsub -l walltime=...`), deliberately
+# staggered across the fleet so allocations do not all expire together and
+# recreate the very gap this fleet exists to cover.
+export PATH=$HOME/.local/bin:$PATH
+# Group-shared fleet: tasks may be submitted by any project member but run as
+# this job's owner. umask 002 keeps task outputs group-writable.
+umask 002
+
+NNODES=$(wc -l < "$PBS_NODEFILE")
+echo "$(date -u +%FT%TZ) bravo worker starting on $NNODES node(s): $(cat $PBS_NODEFILE | tr '\n' ' ')"
+
+while true; do
+    # --on-server-lost finish-running: a preemption or server blip must not
+    # discard work already in flight on this node.
+    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none hq worker start --on-server-lost finish-running
+    echo "$(date -u +%FT%TZ): workers exited; retrying in 60s (server restart or preemption?)"
+    sleep 60
+done

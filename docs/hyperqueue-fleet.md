@@ -414,3 +414,57 @@ the same server.
 
 `~/.hq/fleet.env`, `~/.hq/journal`, `~/.hq/server-node`, logs, and
 `~/.hq-server/` are runtime state — per-host, never in git.
+
+## Two fleets: alpha (capacity) and bravo (preemptable)
+
+Added 2026-08-15 after the `capacity` queue stalled every track for 44 h.
+
+| | **alpha-fleet** (`hq-fleet`) | **bravo-fleet** (`bravo-fleet`) |
+|---|---|---|
+| queue | `capacity` | `preemptable` |
+| shape | up to 4 nodes × 168 h | many **1-node** × ≤72 h |
+| project limits | ~2 jobs (queued+running) | **10 running / 20 queued** |
+| role | primary, stable | fills the gap when alpha is starved |
+
+Both attach to the **same HQ server**, so they feed one task pool — task
+submission does not change, only worker supply.
+
+### Why bravo is many small jobs, staggered
+
+- **The capacity limit is per *job*, not per node.** Two jobs is the whole
+  project allowance on `capacity`; on `preemptable` it is ten. Narrow jobs
+  therefore buy far more total capacity.
+- **Backfill.** A 1-node job fits scheduling gaps a 4-node block cannot.
+- **Decorrelated preemption.** Preemption kills a whole PBS job: losing one
+  1-node allocation costs one node and HQ retries its tasks on the survivors;
+  losing a 4-node allocation drops everything at once.
+- **Staggered walltimes are essential.** Identical allocations submitted
+  together *expire* together and recreate the gap the fleet exists to cover.
+  `bravo-fleet` cycles `BRAVO_WALLTIMES` (default 72/60/48/36/24 h) so expiries
+  land on different days, and tops up daily.
+
+### Usage
+
+```bash
+bravo-fleet up 5      # seed: 5 one-node jobs, staggered walltimes
+bravo-fleet run       # resident loop: +BRAVO_DAILY jobs/day, capped (tmux)
+bravo-fleet status    # bravo + alpha jobs + HQ workers
+bravo-fleet down      # qdel all bravo jobs
+```
+
+Knobs (env or `~/.hq/fleet.env`): `BRAVO_INITIAL`, `BRAVO_DAILY` (2),
+`BRAVO_MAX_INFLIGHT` (10), `BRAVO_INTERVAL` (86400), `BRAVO_WALLTIMES`.
+User crontabs are **denied** on Polaris, hence `run` as a tmux-resident loop —
+re-run it after a login-node reboot, like `hq-fleet`.
+
+### Two traps found while building it
+
+1. **`hq-fleet` will qdel any job named `hq-bridge`.** With `HQ_NO_BRIDGE=1`
+   the orchestrator drains leftover bridges, and `job_lookup` matches
+   `Job_Name` exactly. A 4-node preemptable test submitted straight from
+   `preempt-bridge.pbs` was cancelled within 6 minutes by our own fleet — it
+   looked like a scheduler rejection but was self-inflicted. Bravo jobs are
+   named `bravo-1n` precisely so they are invisible to that logic.
+2. **`HQ_CAP_JOBS` changes need an orchestrator restart** — `hq-fleet` sources
+   `fleet.env` once at startup, so editing the file under a running loop has no
+   effect and it keeps topping up to the old target.
