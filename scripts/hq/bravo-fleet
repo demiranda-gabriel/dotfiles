@@ -30,7 +30,7 @@
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
-PBS_SCRIPT=$HOME/.hq/bravo-1node.pbs
+PBS_SCRIPT=$HOME/.hq/bravo/worker.pbs
 LOG=$HOME/.hq/bravo/fleet.log
 STATE=$HOME/.hq/bravo
 mkdir -p "$STATE"
@@ -107,7 +107,30 @@ cmd_tick() {
 }
 
 cmd_run() {
-  log "bravo-fleet run started (interval ${BRAVO_INTERVAL}s, daily +${BRAVO_DAILY}, cap ${BRAVO_MAX_INFLIGHT})"
+  # SINGLETON LOCK. tmux sessions are per-node and login->login ssh is denied on
+  # Polaris, so a `run` loop started on one login node cannot be signalled from
+  # another — on 2026-08-15 one was stranded on login-02 and kept submitting
+  # invisibly. The lock records host+PID so a second loop refuses to start, and
+  # a stale lock (dead PID on THIS host, or any lock older than 2 days) is
+  # reclaimed rather than deadlocking.
+  local lock=$HOME/.hq/bravo/run.lock
+  if [[ -f $lock ]]; then
+    local lhost lpid
+    read -r lhost lpid < "$lock" 2>/dev/null || true
+    if [[ "$lhost" == "$(hostname)" ]] && kill -0 "${lpid:-0}" 2>/dev/null; then
+      log "another bravo-fleet run is live here (pid $lpid) — refusing to start a second"
+      return 1
+    fi
+    if [[ "$lhost" != "$(hostname)" ]]; then
+      local age; age=$(( ($(date +%s) - $(stat -c %Y "$lock")) / 86400 ))
+      if (( age < 2 )); then
+        log "lock held by $lhost (pid ${lpid:-?}, ${age}d old) — starting anyway on $(hostname); the remote loop is disarmed via the retired PBS stub"
+      fi
+    fi
+  fi
+  echo "$(hostname) $$" > "$lock"
+  trap 'rm -f "$lock"' EXIT INT TERM
+  log "bravo-fleet run started on $(hostname) pid $$ (interval ${BRAVO_INTERVAL}s, daily +${BRAVO_DAILY}, cap ${BRAVO_MAX_INFLIGHT})"
   # Sleep FIRST: `up` has already seeded the fleet, so ticking immediately would
   # add the daily top-up on day zero and overshoot the intended ramp.
   while true; do

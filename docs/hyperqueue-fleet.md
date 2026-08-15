@@ -468,3 +468,25 @@ re-run it after a login-node reboot, like `hq-fleet`.
 2. **`HQ_CAP_JOBS` changes need an orchestrator restart** — `hq-fleet` sources
    `fleet.env` once at startup, so editing the file under a running loop has no
    effect and it keeps topping up to the old target.
+
+### Running the tickers: BOTH belong on `polaris-login-01`
+
+`hq-fleet run` and `bravo-fleet run` are tmux-resident loops, and **tmux
+sessions are per-node while login->login ssh is denied on Polaris**. A loop
+started on login-02 therefore cannot be inspected, signalled or stopped from
+login-01 — it just keeps submitting invisibly. Both loops belong in tmux on
+**login-01**, next to the HQ server:
+
+```bash
+tmux new-session -d -s hq-fleet    '$HOME/.local/bin/hq-fleet run'
+tmux new-session -d -s bravo-fleet '$HOME/.local/bin/bravo-fleet run'
+```
+
+`bravo-fleet run` takes a singleton lock (`~/.hq/bravo/run.lock`, host+PID) and
+refuses to start a second loop on the same host; a stale lock is reclaimed.
+
+If a loop is ever stranded on another login node, it holds its PBS script path
+in memory — so **retiring that path disarms it**: move the real script and
+leave a stub whose queue does not exist, and its `qsub` fails at submit time
+while the managed loop uses the new path. That is why the bravo worker lives at
+`~/.hq/bravo/worker.pbs` and `~/.hq/bravo-1node.pbs` is a rejecting stub.

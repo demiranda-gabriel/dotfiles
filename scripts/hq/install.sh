@@ -152,7 +152,8 @@ render() {  # render <template> <dest>
         -e "s|__HQDIR__|$HQDIR|g" \
         "$1" > "$2"
 }
-for pair in "capacity-workers.pbs.tmpl:capacity-workers.pbs" "preempt-bridge.pbs.tmpl:preempt-bridge.pbs" "bravo-1node.pbs.tmpl:bravo-1node.pbs"; do
+mkdir -p "$HQDIR/bravo"
+for pair in "capacity-workers.pbs.tmpl:capacity-workers.pbs" "preempt-bridge.pbs.tmpl:preempt-bridge.pbs" "bravo-worker.pbs.tmpl:bravo/worker.pbs"; do
     src="${pair%%:*}"; dst="$HQDIR/${pair##*:}"
     if [[ -e "$dst" && $FORCE -ne 1 ]]; then
         echo "✓ ${pair##*:} exists — kept (use --force to regenerate)"
