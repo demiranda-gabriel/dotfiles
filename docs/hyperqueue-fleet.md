@@ -485,8 +485,18 @@ tmux new-session -d -s bravo-fleet '$HOME/.local/bin/bravo-fleet run'
 `bravo-fleet run` takes a singleton lock (`~/.hq/bravo/run.lock`, host+PID) and
 refuses to start a second loop on the same host; a stale lock is reclaimed.
 
-If a loop is ever stranded on another login node, it holds its PBS script path
-in memory — so **retiring that path disarms it**: move the real script and
-leave a stub whose queue does not exist, and its `qsub` fails at submit time
-while the managed loop uses the new path. That is why the bravo worker lives at
-`~/.hq/bravo/worker.pbs` and `~/.hq/bravo-1node.pbs` is a rejecting stub.
+**Reaching another login node.** `ssh polaris-login-02` works with the SHORT
+hostname; the FQDN (`polaris-login-02.hsn.cm.polaris.alcf.anl.gov`) is refused
+with `Permission denied (keyboard-interactive,hostbased)`. So a stranded loop
+*can* be killed — use the short name:
+
+```bash
+ssh polaris-login-02 'tmux kill-session -t bravo-fleet; pkill -f "bravo-fleet run"'
+```
+
+If ssh is ever genuinely unavailable, a stranded loop still holds its PBS script
+path in memory, so **retiring that path disarms it**: move the real script and
+leave a stub whose queue does not exist — its `qsub` then fails at submit time
+while the managed loop uses the new path. (Used once on 2026-08-15 before the
+short-hostname ssh route was found; the stub has since been removed.) The bravo
+worker lives at `~/.hq/bravo/worker.pbs`.
