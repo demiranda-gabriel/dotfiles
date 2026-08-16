@@ -30,10 +30,17 @@ umask 002
 NNODES=$(wc -l < "$PBS_NODEFILE")
 echo "$(date -u +%FT%TZ) bravo worker starting on $NNODES node(s): $(cat $PBS_NODEFILE | tr '\n' ' ')"
 
+# HQ >=0.26 creates a unix socket under $TMPDIR; the PBS per-job TMPDIR is too
+# long and blows the 108-char SUN_LEN limit (worker exits instantly; verified
+# on Polaris 2026-08-16 — crash-looped the whole first bravo fleet). Short
+# node-local dir instead; mkdir runs PER NODE inside the mpiexec.
+export TMPDIR=/local/scratch/$USER/tmp
+
 while true; do
     # --on-server-lost finish-running: a preemption or server blip must not
     # discard work already in flight on this node.
-    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none hq worker start --on-server-lost finish-running
+    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none \
+        bash -c 'mkdir -p "$TMPDIR" && exec hq worker start --on-server-lost finish-running' 
     echo "$(date -u +%FT%TZ): workers exited; retrying in 60s (server restart or preemption?)"
     sleep 60
 done
