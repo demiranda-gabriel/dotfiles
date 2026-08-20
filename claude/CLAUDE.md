@@ -102,9 +102,14 @@ incomplete — `xelatex`/`lualatex` missing `ucharcat.sty`, xcolor broken.
 ## Job submission on Polaris (ALCF) — HyperQueue workflow
 
 **Polaris-only section** (PBS Pro; other clusters ignore). All compute jobs
-go through **HyperQueue** (`hq`, `~/.local/bin/`), NOT raw `qsub`. A
-standing fleet of 2 nodes / 8 A100s is kept attached at all times; tasks
-submitted to the HQ server start within seconds on whatever workers are up.
+go through **HyperQueue** (`hq`, `~/.local/bin/`), NOT raw `qsub`. Two
+standing fleets feed ONE server/task pool (2026-08-15 →): **alpha** =
+`capacity`, 4 nodes / 16 A100s; **bravo** = `preemptable`, up to 20 staggered
+1-node jobs (max 10 running = 40 A100s). Tasks submitted to the HQ server
+start within seconds on whatever workers are up — you never pick a fleet.
+Because bravo workers can have <24 h left and may be preempted, write long
+payloads re-entrant (auto-resume from `last.ckpt`) and avoid `--time-request`
+longer than a worker's remaining walltime (task WAITS forever, silently).
 
 ### Submitting work
 
@@ -131,7 +136,8 @@ included).
 | HQ server | `polaris-login-01`, tmux session `hq`, journal `~/.hq/journal`, log `~/.hq/server.log` |
 | `hq-server-up` | THE ONLY way to (re)start the server — applies LD_PRELOAD shim + taskset (see cgroup note) |
 | `hq-fleet` | orchestrator, tmux session `hq-fleet`; subcommands `status/up/down/tick`, `DRY_RUN=1` to preview; log `~/.hq/fleet.log` |
-| Primary allocation | 2-node/168h `capacity` jobs `hq-capacity` (`~/.hq/capacity-workers.pbs`); **`HQ_CAP_JOBS=2` in fleet.env keeps one RUNNING + one QUEUED back-to-back** (uses both project capacity slots) |
+| Primary allocation | alpha: 4-node/168h `capacity` jobs `hq-capacity` (`~/.hq/capacity-workers.pbs`); `HQ_CAP_JOBS` in fleet.env sets how many are kept in flight (1 as of 2026-08) |
+| Bravo lane | `bravo-fleet {up N\|tick\|run\|status\|down}` (`~/.hq/bravo/worker.pbs`): many 1-node `preemptable` jobs named `bravo-1n`, staggered 24-72 h walltimes; ticker = tmux `bravo-fleet` on login-01 (added 2026-08-15) |
 | Bridge allocation | **DISABLED since 2026-07-27** (`HQ_NO_BRIDGE=1` in fleet.env; capacity-only policy for the group-shared fleet). The `preemptable` `hq-bridge` machinery (`~/.hq/preempt-bridge.pbs`) still exists — re-enable by removing the knob |
 | Autoalloc queues | `debug` (1n/1h) and `preempt` (1n/72h) — HQ auto-qsubs only when tasks wait uncovered; safety net, normally silent |
 | Group sharing | fleet is shared with all HetRxnEnergy members via `/lus/eagle/projects/HetRxnEnergy/hq-shared/` (client access file + `hq`/`hq-submit`/`hq-gpus` + user README). Tasks run as demiranda; server keys pinned via `~/.hq/access/full.json` |
