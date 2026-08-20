@@ -29,11 +29,32 @@ NNODES=$(wc -l < "$PBS_NODEFILE")
 # long and blows the 108-char SUN_LEN limit (worker exits instantly; verified
 # on Polaris 2026-08-16 — crash-looped the whole first bravo fleet). Short
 # node-local dir instead; mkdir runs PER NODE inside the mpiexec.
-export TMPDIR=/local/scratch/$USER/tmp
+#
+# CRITICAL (2026-08-16): exporting TMPDIR here is NOT enough. PALS `mpiexec`
+# does not propagate the override to the ranks — each rank gets the long
+# per-job PBS TMPDIR back, so the worker still died with "path must be shorter
+# than SUN_LEN" and the loop retried every 60 s forever, contributing ZERO GPUs
+# while still billing the allocation. Resolve the path on the mom node and pass
+# it into the rank command as a LITERAL; never rely on env propagation.
+WORKER_TMPDIR=/local/scratch/$USER/tmp
+# BOOTSTRAP (2026-08-20): create the short dir on EVERY node BEFORE exporting
+# the short TMPDIR — PALS itself creates its per-app dir under $TMPDIR on each
+# rank with a NON-recursive mkdir, so on nodes where the dir does not yet
+# exist the launch dies before the rank command's own `mkdir -p` ever runs
+# ("launch failed: Couldn't create directory ...: No such file or directory";
+# stranded 9 bravo nodes x 23 h on 2026-08-20). This mpiexec runs with the
+# default PBS TMPDIR, which always exists, so PALS can launch it anywhere.
+mpiexec -n "$NNODES" --ppn 1 bash -c "mkdir -p '$WORKER_TMPDIR'"
+# Kept for anything running on the mom node (safe now the dir exists).
+export TMPDIR=$WORKER_TMPDIR
 
 while true; do
+    # Quoting: "$WORKER_TMPDIR" expands HERE (mom node); \"\$TMPDIR\" stays
+    # escaped so it is read on the rank AFTER the export.
     mpiexec -n "$NNODES" --ppn 1 --cpu-bind none \
-        bash -c 'mkdir -p "$TMPDIR" && exec hq worker start --on-server-lost finish-running' 
+        bash -c "export TMPDIR='$WORKER_TMPDIR'
+                 mkdir -p \"\$TMPDIR\" || { echo \"FATAL: cannot mkdir \$TMPDIR on \$(hostname)\"; exit 1; }
+                 exec hq worker start --on-server-lost finish-running"
     echo "$(date): workers exited; retrying in 60s (server restart?)"
     sleep 60
 done

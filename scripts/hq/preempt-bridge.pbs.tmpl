@@ -23,8 +23,32 @@ umask 002
 
 NNODES=$(wc -l < "$PBS_NODEFILE")
 
+# HQ >=0.26 creates a unix socket under $TMPDIR. The per-job PBS TMPDIR is long
+# enough (63 chars on Polaris, before hq appends its subdir + socket name) to
+# blow the 108-char SUN_LEN limit: the worker exits instantly with "path must
+# be shorter than SUN_LEN" and the loop below retries every 60 s forever,
+# contributing ZERO GPUs while still billing the allocation (2026-08-16).
+#
+# The path MUST be resolved on the mom node and passed into the rank command as
+# a literal: PALS `mpiexec` does not propagate an exported TMPDIR to the ranks.
+WORKER_TMPDIR=/local/scratch/$USER/tmp
+# BOOTSTRAP (2026-08-20): create the short dir on EVERY node BEFORE exporting
+# the short TMPDIR — PALS itself creates its per-app dir under $TMPDIR on each
+# rank with a NON-recursive mkdir, so on nodes where the dir does not yet
+# exist the launch dies before the rank command's own `mkdir -p` ever runs
+# ("launch failed: Couldn't create directory ...: No such file or directory";
+# stranded 9 bravo nodes x 23 h on 2026-08-20). This mpiexec runs with the
+# default PBS TMPDIR, which always exists, so PALS can launch it anywhere.
+mpiexec -n "$NNODES" --ppn 1 bash -c "mkdir -p '$WORKER_TMPDIR'"
+# Kept for anything running on the mom node (safe now the dir exists).
+export TMPDIR=$WORKER_TMPDIR
+
 while true; do
-    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none hq worker start --on-server-lost finish-running
+    # mkdir must run PER NODE (inside mpiexec), not just on the mom node.
+    mpiexec -n "$NNODES" --ppn 1 --cpu-bind none \
+        bash -c "export TMPDIR='$WORKER_TMPDIR'
+                 mkdir -p \"\$TMPDIR\" || { echo \"FATAL: cannot mkdir \$TMPDIR on \$(hostname)\"; exit 1; }
+                 exec hq worker start --on-server-lost finish-running"
     echo "$(date): workers exited; retrying in 60s (server restart?)"
     sleep 60
 done
