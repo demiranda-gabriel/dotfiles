@@ -1,0 +1,20 @@
+#!/bin/bash
+# hq-gpus-all — per-GPU view of BOTH Polaris fleets: shared alpha (capacity)
+# and PRIVATE bravo (preemptable). demiranda-only: lives in ~/.local/bin via
+# dotfiles, NOT in hq-shared/bin, and the bravo half needs the private server
+# dir (~/.hq-bravo-server, mode 700) that only demiranda can read.
+#
+# Rendering is delegated to the group hq-gpus, which honors an existing
+# HQ_SERVER_DIR (it only setdefault()s the shared one). Extra args pass
+# through (e.g. --mock renders twice, harmlessly).
+set -uo pipefail
+
+HQ_GPUS=/lus/eagle/projects/HetRxnEnergy/hq-shared/bin/hq-gpus
+
+bold() { [[ -t 1 ]] && printf '\033[1m%s\033[0m\n' "$1" || printf '%s\n' "$1"; }
+
+bold "════════ alpha — capacity, group-shared (submit: hq) ════════"
+HQ_SERVER_DIR="$HOME/.hq-server" "$HQ_GPUS" "$@"
+echo
+bold "════════ bravo — preemptable, PRIVATE (submit: hqb) ════════"
+HQ_SERVER_DIR="$HOME/.hq-bravo-server" "$HQ_GPUS" "$@"

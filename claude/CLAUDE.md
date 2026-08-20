@@ -121,6 +121,7 @@ hq submit --resource gpus/nvidia=1 -- python train.py  # 1 GPU; HQ sets CUDA_VIS
 hq submit --cpus 16 -- ./analysis.sh                   # CPU-only
 hq job list / hq job info <id> / hq job cat <id> stdout
 hq-fleet status                                        # fleet at a glance
+hq-gpus-all                                            # per-GPU view, BOTH fleets (demiranda-only; hq-gpus = alpha only)
 ```
 
 Tasks are cheap (~ms overhead) — submit many small ones; HQ packs them

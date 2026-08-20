@@ -132,6 +132,7 @@ link_script "$DIR/hq-fleet"     hq-fleet
 link_script "$DIR/bravo-fleet"  bravo-fleet   # preemptable companion fleet (PBS only)
 link_script "$DIR/hq-bravo-server-up" hq-bravo-server-up  # PRIVATE bravo server (2026-08-20)
 link_script "$DIR/hqb"          hqb           # client for the private bravo server
+link_script "$DIR/hq-gpus-all"  hq-gpus-all   # per-GPU view of both fleets (private)
 
 # Build the login-node get_nprocs shim
 cp -f "$DIR/shim/nproc8.c" "$HQDIR/shim/nproc8.c"
