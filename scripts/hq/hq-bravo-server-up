@@ -1,0 +1,48 @@
+#!/bin/bash
+# Start (or restart) the PRIVATE bravo HyperQueue server on login-01.
+#
+# Why a second server exists (2026-08-20): the main server's client key is
+# group-shared via /lus/eagle/projects/HetRxnEnergy/hq-shared/, and HQ has no
+# per-user ACLs — one key = full access to every attached worker. Attaching
+# the bravo (preemptable) fleet there made it group-usable. This server is
+# demiranda-only: its access files live under ~/.hq-bravo/access (mode 600)
+# and MUST NEVER be copied into hq-shared/.
+#
+# Same login-node cgroup treatment as hq-server-up (shim + taskset) — see
+# that script for the full story. Ports are pinned one above the shared
+# server's (36152/44986 vs 36151/44985) so restarts never invalidate workers.
+set -euo pipefail
+
+HQ="$HOME/.local/bin/hq"
+SERVER_DIR="$HOME/.hq-bravo-server"
+JOURNAL="$HOME/.hq-bravo/journal"
+LOG="$HOME/.hq-bravo/server.log"
+SERVER_HOST="${HQ_SERVER_HOST:-polaris-login-01}"
+ACCESS_FILE="$HOME/.hq-bravo/access/full.json"
+
+if [[ "$(hostname -s)" != "$SERVER_HOST" ]]; then
+    echo "ERROR: run on $SERVER_HOST (workers dial the host in the access file)." >&2
+    exit 1
+fi
+
+if "$HQ" --server-dir "$SERVER_DIR" server info >/dev/null 2>&1; then
+    echo "bravo hq server already running (tmux session 'hq-bravo')."
+    exit 0
+fi
+
+mkdir -p "$(dirname "$JOURNAL")" "$SERVER_DIR" && chmod 700 "$SERVER_DIR"
+SHIM="$HOME/.hq/shim/nproc8.so"
+[[ -f "$SHIM" ]] || { echo "ERROR: $SHIM missing; rebuild: gcc -shared -fPIC -o $SHIM ~/.hq/shim/nproc8.c" >&2; exit 1; }
+[[ -f "$ACCESS_FILE" ]] || { echo "ERROR: $ACCESS_FILE missing (hq server generate-access ...)" >&2; exit 1; }
+
+tmux kill-session -t hq-bravo 2>/dev/null || true
+tmux new-session -d -s hq-bravo \
+    "LD_PRELOAD=$SHIM taskset -c 0-7 $HQ --server-dir $SERVER_DIR server start --journal $JOURNAL --access-file $ACCESS_FILE >> $LOG 2>&1"
+sleep 3
+
+if "$HQ" --server-dir "$SERVER_DIR" server info >/dev/null 2>&1; then
+    echo "bravo hq server started (tmux 'hq-bravo', server-dir $SERVER_DIR, ports 36152/44986)."
+else
+    echo "ERROR: bravo server failed to start; see $LOG" >&2
+    exit 1
+fi

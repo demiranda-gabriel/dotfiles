@@ -148,8 +148,8 @@ cmd_status() {
   echo "=== alpha-fleet (capacity) ==="
   qstat -u "$USER" 2>/dev/null | awk '/hq-capaci/'   # truncated name
   echo
-  echo "=== HQ workers (both fleets feed one server) ==="
-  hq worker list 2>/dev/null | tail -n +2 | head -20
+  echo "=== bravo workers (PRIVATE server, hqb) ==="
+  hq --server-dir $HOME/.hq-bravo-server worker list 2>/dev/null | tail -n +2 | head -20
 }
 
 cmd_down() {

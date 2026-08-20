@@ -1,0 +1,5 @@
+#!/bin/bash
+# hqb — hq client for the PRIVATE bravo server (demiranda-only preemptable
+# fleet, up to 40 A100s). Usage identical to hq: hqb submit ..., hqb job list,
+# hqb worker list. The shared server stays plain `hq` (alpha/capacity fleet).
+exec "$HOME/.local/bin/hq" --server-dir "$HOME/.hq-bravo-server" "$@"

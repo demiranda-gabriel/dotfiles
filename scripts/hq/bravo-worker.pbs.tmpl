@@ -61,7 +61,7 @@ while true; do
     mpiexec -n "$NNODES" --ppn 1 --cpu-bind none \
         bash -c "export TMPDIR='$WORKER_TMPDIR'
                  mkdir -p \"\$TMPDIR\" || { echo \"FATAL: cannot mkdir \$TMPDIR on \$(hostname)\"; exit 1; }
-                 exec hq worker start --on-server-lost finish-running"
+                 exec hq --server-dir $HOME/.hq-bravo-server worker start --on-server-lost finish-running"
     echo "$(date -u +%FT%TZ): workers exited; retrying in 60s (server restart or preemption?)"
     sleep 60
 done

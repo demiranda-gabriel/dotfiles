@@ -103,10 +103,13 @@ incomplete — `xelatex`/`lualatex` missing `ucharcat.sty`, xcolor broken.
 
 **Polaris-only section** (PBS Pro; other clusters ignore). All compute jobs
 go through **HyperQueue** (`hq`, `~/.local/bin/`), NOT raw `qsub`. Two
-standing fleets feed ONE server/task pool (2026-08-15 →): **alpha** =
-`capacity`, 4 nodes / 16 A100s; **bravo** = `preemptable`, up to 20 staggered
-1-node jobs (max 10 running = 40 A100s). Tasks submitted to the HQ server
-start within seconds on whatever workers are up — you never pick a fleet.
+standing fleets on TWO servers (private bravo split 2026-08-20): **alpha** =
+`capacity`, 4 nodes / 16 A100s, group-shared, client `hq`; **bravo** =
+`preemptable`, up to 20 staggered 1-node jobs (max 10 running = 40 A100s),
+PRIVATE — own server + keys, invisible to the group-shared client — client
+`hqb` (usage identical to `hq`). Default big training runs to `hqb`; treat
+alpha as the shared/overflow lane and check `hq job list` for teammates'
+work before large batches.
 Because bravo workers can have <24 h left and may be preempted, write long
 payloads re-entrant (auto-resume from `last.ckpt`) and avoid `--time-request`
 longer than a worker's remaining walltime (task WAITS forever, silently).
@@ -138,6 +141,7 @@ included).
 | `hq-fleet` | orchestrator, tmux session `hq-fleet`; subcommands `status/up/down/tick`, `DRY_RUN=1` to preview; log `~/.hq/fleet.log` |
 | Primary allocation | alpha: 4-node/168h `capacity` jobs `hq-capacity` (`~/.hq/capacity-workers.pbs`); `HQ_CAP_JOBS` in fleet.env sets how many are kept in flight (1 as of 2026-08) |
 | Bravo lane | `bravo-fleet {up N\|tick\|run\|status\|down}` (`~/.hq/bravo/worker.pbs`): many 1-node `preemptable` jobs named `bravo-1n`, staggered 24-72 h walltimes; ticker = tmux `bravo-fleet` on login-01 (added 2026-08-15) |
+| Bravo server (PRIVATE) | since 2026-08-20 bravo workers attach to a second server: tmux `hq-bravo`, started ONLY via `hq-bravo-server-up`, server-dir `~/.hq-bravo-server`, journal/log under `~/.hq-bravo/`, pinned ports 36152/44986. Client = `hqb`. Keys in `~/.hq-bravo/access/` are demiranda-only — NEVER copy them into `hq-shared/` |
 | Bridge allocation | **DISABLED since 2026-07-27** (`HQ_NO_BRIDGE=1` in fleet.env; capacity-only policy for the group-shared fleet). The `preemptable` `hq-bridge` machinery (`~/.hq/preempt-bridge.pbs`) still exists — re-enable by removing the knob |
 | Autoalloc queues | `debug` (1n/1h) and `preempt` (1n/72h) — HQ auto-qsubs only when tasks wait uncovered; safety net, normally silent |
 | Group sharing | fleet is shared with all HetRxnEnergy members via `/lus/eagle/projects/HetRxnEnergy/hq-shared/` (client access file + `hq`/`hq-submit`/`hq-gpus` + user README). Tasks run as demiranda; server keys pinned via `~/.hq/access/full.json` |
