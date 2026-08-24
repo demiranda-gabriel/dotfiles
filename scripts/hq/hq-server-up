@@ -47,7 +47,11 @@ SHIM="$HOME/.hq/shim/nproc8.so"
 [[ -f "$SHIM" ]] || { echo "ERROR: $SHIM missing; rebuild: gcc -shared -fPIC -o $SHIM ~/.hq/shim/nproc8.c" >&2; exit 1; }
 ACCESS_OPT=""
 [[ -f "$ACCESS_FILE" ]] && ACCESS_OPT="--access-file $ACCESS_FILE"
-tmux kill-session -t hq 2>/dev/null || true
+# Exact-match target ('=' prefix): a bare 'hq' target falls back to PREFIX
+# matching when no session is literally named 'hq', which silently killed
+# 'hq-bravo' (the private bravo server) and 'hq-fleet' (the orchestrator)
+# on every restart where this session was absent.
+tmux kill-session -t '=hq' 2>/dev/null || true
 tmux new-session -d -s hq \
     "LD_PRELOAD=$SHIM taskset -c 0-7 $HQ server start --journal $JOURNAL $ACCESS_OPT >> $LOG 2>&1"
 sleep 3

@@ -35,7 +35,7 @@ SHIM="$HOME/.hq/shim/nproc8.so"
 [[ -f "$SHIM" ]] || { echo "ERROR: $SHIM missing; rebuild: gcc -shared -fPIC -o $SHIM ~/.hq/shim/nproc8.c" >&2; exit 1; }
 [[ -f "$ACCESS_FILE" ]] || { echo "ERROR: $ACCESS_FILE missing (hq server generate-access ...)" >&2; exit 1; }
 
-tmux kill-session -t hq-bravo 2>/dev/null || true
+tmux kill-session -t '=hq-bravo' 2>/dev/null || true   # exact match; see hq-server-up
 tmux new-session -d -s hq-bravo \
     "LD_PRELOAD=$SHIM taskset -c 0-7 $HQ --server-dir $SERVER_DIR server start --journal $JOURNAL --access-file $ACCESS_FILE >> $LOG 2>&1"
 sleep 3
