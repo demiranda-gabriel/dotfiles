@@ -3,15 +3,16 @@
 # fleet, up to 40 A100s). Usage identical to hq: hqb submit ..., hqb job list,
 # hqb worker list. The shared server stays plain `hq` (alpha/capacity fleet).
 
-# Task-log routing (see hq-log-route.sh). This script cannot inherit the `hq()`
-# shell function — it execs the binary — so it applies the routing itself, or
-# every `hqb submit` drops a job-<id>/ dir into the cwd. Resolved via the
-# script's own real path so it works through the ~/.local/bin symlink.
+# Submit hooks — task-log routing + "<user>:" job-name prefix (see
+# hq-submit-hooks.sh). This script cannot inherit the `hq()` shell function — it
+# execs the binary — so it applies them itself, or every `hqb submit` drops a
+# job-<id>/ dir into the cwd and lands unowned in the fleet view. Resolved via
+# the script's own real path so it works through the ~/.local/bin symlink.
 _self="$(readlink -f "${BASH_SOURCE[0]}")"
-_route="${_self%/*}/hq-log-route.sh"
-if [[ -r "$_route" ]]; then
-    . "$_route"
-    hq_log_route_argv bravo "$@"
+_hooks="${_self%/*}/hq-submit-hooks.sh"
+if [[ -r "$_hooks" ]]; then
+    . "$_hooks"
+    hq_submit_hooks_argv bravo "$@"
     set -- "${HQ_ARGV[@]}"
 fi
 

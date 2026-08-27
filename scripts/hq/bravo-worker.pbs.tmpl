@@ -7,6 +7,10 @@
 #PBS -N bravo-1n
 #PBS -j oe
 #PBS -o __HQDIR__/bravo/workers.log
+# No scheduler mail (2026-08-27): PBS Pro defaults to Mail_Points=a, so every
+# aborted/preempted worker allocation mailed the account address. The fleet's
+# Slack webhook (~/.hq/fleet.env) already reports every state transition.
+#PBS -m n
 #
 # BRAVO-FLEET worker: ONE node (4 A100s) on the `preemptable` queue, attached to
 # the same HQ server as alpha-fleet, so both fleets feed one task pool.

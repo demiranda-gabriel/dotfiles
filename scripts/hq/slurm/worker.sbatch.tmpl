@@ -8,6 +8,9 @@
 #SBATCH --mem=64G
 #SBATCH -t 08:00:00
 #SBATCH -o __HQDIR__/worker.%x.%j.log
+# No scheduler mail: match the PBS side (#PBS -m n) — the fleet's Slack webhook
+# already reports every state transition.
+#SBATCH --mail-type=NONE
 # NB: no hardcoded --constraint here on purpose. hq-fleet passes --constraint on
 # the sbatch CLI (default a100), so `hq-fleet up -C ''` can actually DROP it — a
 # directive could only be overridden, never removed.

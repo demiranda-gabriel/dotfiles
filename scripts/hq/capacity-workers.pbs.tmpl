@@ -8,6 +8,10 @@
 #PBS -N hq-capacity
 #PBS -j oe
 #PBS -o __HQDIR__/capacity-workers.log
+# No scheduler mail (2026-08-27): PBS Pro defaults to Mail_Points=a, so every
+# aborted/preempted worker allocation mailed the account address. The fleet's
+# Slack webhook (~/.hq/fleet.env) already reports every state transition.
+#PBS -m n
 
 # Primary standing allocation: one HyperQueue worker per node, attached to the
 # HQ server on the login node (via the shared ~/.hq-server access file) for the

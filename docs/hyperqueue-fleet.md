@@ -161,13 +161,14 @@ A backstop that auto-submits short allocations only when tasks wait uncovered:
 
 ```bash
 hq alloc add pbs --name debug   --time-limit 1h    -- \
-  -A <proj> -q debug       -l filesystems=<fs> -l place=scatter
+  -A <proj> -q debug       -l filesystems=<fs> -l place=scatter -m n
 hq alloc add pbs --name preempt --time-limit 3days -- \
-  -A <proj> -q preemptable -l filesystems=<fs> -l place=scatter
+  -A <proj> -q preemptable -l filesystems=<fs> -l place=scatter -m n
 hq alloc list
 ```
 
-(HQ injects `select=`/worker resources itself and auto-detects GPUs.)
+(HQ injects `select=`/worker resources itself and auto-detects GPUs. `-m n`
+suppresses PBS's default abort mail — the fleet reports via Slack instead.)
 
 ### 5. Start the standing fleet
 
@@ -287,8 +288,13 @@ Mechanics (set up on Polaris 2026-07-27, `/lus/eagle/projects/HetRxnEnergy/hq-sh
    and users submit from setgid project dirs — task outputs (owned by the
    fleet owner) stay manageable by the submitter. Submitting from `$HOME`
    fails: the owner can't write there.
-4. **Attribution convention.** The server can't distinguish submitters — a
-   `hq-submit` wrapper in `$SHARE/bin` injects `--name "$USER:<cmd>"`.
+4. **Attribution convention.** The server can't distinguish submitters — job
+   names carry a `<user>:` prefix instead. `$SHARE/bin/hq-submit` injects
+   `--name "$USER:<cmd>"` for teammates; the operator's own clients apply it in
+   `scripts/hq/hq-submit-hooks.sh` (sourced by the `hq()` shell function and by
+   `hqb`), which also prefixes an *explicit* `--name` — without that, every
+   named submit landed unowned. `hq-gpus` falls back to the job's submit
+   directory for anything that still slips through, marking it `~`.
    Scheduling is FIFO + `--priority`; fairness is social, not enforced.
 
 ---

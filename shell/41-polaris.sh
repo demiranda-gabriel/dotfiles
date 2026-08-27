@@ -23,18 +23,22 @@ if [[ -d /lus/eagle ]]; then
   # untouched), and any explicit --stdout/--stderr/--stream is respected.
   # `hq job cat <id>` keeps working — HQ records the resolved path in its journal.
   #
-  # The logic lives in scripts/hq/hq-log-route.sh so the `hqb` client (a real
+  # Submits also get a "<user>:" job-name prefix: the HQ server records no
+  # submitter, so that prefix is what `hq-gpus` attributes a job by, and jobs
+  # named explicitly used to show up unowned ("?") in the fleet view.
+  #
+  # Both hooks live in scripts/hq/hq-submit-hooks.sh so the `hqb` client (a real
   # script, which execs the binary and so can never inherit this function) gets
   # the same treatment — see that file's header for the job-*/ leak it fixes.
-  _hq_route="${BASH_SOURCE[0]%/shell/*}/scripts/hq/hq-log-route.sh"
-  if [[ -r "$_hq_route" ]]; then
-    . "$_hq_route"
+  _hq_hooks="${BASH_SOURCE[0]%/shell/*}/scripts/hq/hq-submit-hooks.sh"
+  if [[ -r "$_hq_hooks" ]]; then
+    . "$_hq_hooks"
     hq() {
-      hq_log_route_argv "" "$@"
+      hq_submit_hooks_argv "" "$@"
       command hq "${HQ_ARGV[@]}"
     }
   fi
-  unset _hq_route
+  unset _hq_hooks
 
   # --- Login-node thread-budget guard ----------------------------------------
   # Login nodes expose 256 physical cores but confine each user to a cgroup of

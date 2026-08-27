@@ -177,9 +177,9 @@ cat <<EOF
        HQ_SERVER_HOST=\$(hostname -s) hq-server-up
   5. (Optional) autoalloc safety-net queues, after the server is up:
        hq alloc add pbs --name debug   --time-limit 1h    -- \\
-         -A $HQ_ACCOUNT -q $HQ_DEBUG_QUEUE -l filesystems=$HQ_FILESYSTEMS -l place=scatter
+         -A $HQ_ACCOUNT -q $HQ_DEBUG_QUEUE -l filesystems=$HQ_FILESYSTEMS -l place=scatter -m n
        hq alloc add pbs --name preempt --time-limit 3days -- \\
-         -A $HQ_ACCOUNT -q $HQ_BRIDGE_QUEUE -l filesystems=$HQ_FILESYSTEMS -l place=scatter
+         -A $HQ_ACCOUNT -q $HQ_BRIDGE_QUEUE -l filesystems=$HQ_FILESYSTEMS -l place=scatter -m n
   6. Start the standing fleet:
        HQ_SERVER_HOST=\$(hostname -s) HQ_FLEET_LABEL=$HQ_SYSTEM hq-fleet up
        hq-fleet status

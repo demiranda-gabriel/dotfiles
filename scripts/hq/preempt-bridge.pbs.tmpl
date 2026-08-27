@@ -8,6 +8,10 @@
 #PBS -N hq-bridge
 #PBS -j oe
 #PBS -o __HQDIR__/bridge-workers.log
+# No scheduler mail (2026-08-27): PBS Pro defaults to Mail_Points=a, so every
+# aborted/preempted worker allocation mailed the account address. The fleet's
+# Slack webhook (~/.hq/fleet.env) already reports every state transition.
+#PBS -m n
 
 # Preemptable bridge allocation managed by hq-fleet: covers the gap while the
 # primary capacity job is queued. Same worker pattern as capacity-workers.pbs —

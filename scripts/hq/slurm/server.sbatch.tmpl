@@ -5,6 +5,9 @@
 #SBATCH --mem=__SRV_MEM__
 #SBATCH -t __SRV_WALL__
 #SBATCH -o __HQDIR__/server.%j.log
+# No scheduler mail: match the PBS side (#PBS -m n) — the fleet's Slack webhook
+# already reports every state transition.
+#SBATCH --mail-type=NONE
 
 # HyperQueue server, hosted ON A COMPUTE NODE, with SELF-CHAINING auto-restart.
 #
