@@ -30,9 +30,13 @@ GPN="${SLURM_GPUS_ON_NODE:-0}"
 [[ "$GPN" -gt 0 ]] && SRUN_GRES="--gres=gpu:$GPN" || SRUN_GRES=""
 echo "[hq-worker] job=${SLURM_JOB_ID:-?} nodes=${SLURM_NNODES:-1} gpus/node=$GPN nodelist=${SLURM_JOB_NODELIST:-?}"
 
+# ulimit -c 0 on the RANK: a crashing task otherwise dumps a multi-GB core into
+# its cwd (= the submit dir, i.e. a repo root). srun does propagate rlimits, but
+# setting it inside the rank shell keeps this identical to the PBS lane and
+# survives a site default of `ulimit -c unlimited`. Tasks inherit it.
 while true; do
     srun --ntasks="${SLURM_NNODES:-1}" --ntasks-per-node=1 $SRUN_GRES \
-        hq worker start --on-server-lost finish-running --manager slurm
+        bash -c 'ulimit -c 0; exec hq worker start --on-server-lost finish-running --manager slurm'
     echo "$(date): worker(s) exited; retry in 30s (server move/restart?)"
     sleep 30
 done

@@ -22,25 +22,19 @@ if [[ -d /lus/eagle ]]; then
   # ~/.hq/logs. Only the `submit` subcommand is touched (server/fleet/autoalloc
   # untouched), and any explicit --stdout/--stderr/--stream is respected.
   # `hq job cat <id>` keeps working — HQ records the resolved path in its journal.
-  hq() {
-    if [[ "$1" == submit ]] \
-        && [[ " $* " != *" --stdout "* ]] \
-        && [[ " $* " != *" --stderr "* ]] \
-        && [[ " $* " != *" --stream "* ]]; then
-      shift
-      local d="$HQ_LOG_DIR"
-      if [[ -z "$d" ]]; then
-        local root; root="$(git rev-parse --show-toplevel 2>/dev/null)"
-        if [[ -n "$root" && -d "$root/runs" ]]; then d="$root/runs/_hq_logs"
-        else d="$HOME/.hq/logs"; fi
-      fi
-      command hq submit \
-        --stdout "$d/job-%{JOB_ID}/%{TASK_ID}.stdout" \
-        --stderr "$d/job-%{JOB_ID}/%{TASK_ID}.stderr" "$@"
-    else
-      command hq "$@"
-    fi
-  }
+  #
+  # The logic lives in scripts/hq/hq-log-route.sh so the `hqb` client (a real
+  # script, which execs the binary and so can never inherit this function) gets
+  # the same treatment — see that file's header for the job-*/ leak it fixes.
+  _hq_route="${BASH_SOURCE[0]%/shell/*}/scripts/hq/hq-log-route.sh"
+  if [[ -r "$_hq_route" ]]; then
+    . "$_hq_route"
+    hq() {
+      hq_log_route_argv "" "$@"
+      command hq "${HQ_ARGV[@]}"
+    }
+  fi
+  unset _hq_route
 
   # --- Login-node thread-budget guard ----------------------------------------
   # Login nodes expose 256 physical cores but confine each user to a cgroup of

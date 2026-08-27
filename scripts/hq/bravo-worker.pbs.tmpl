@@ -27,6 +27,16 @@ export PATH=$HOME/.local/bin:$PATH
 # this job's owner. umask 002 keeps task outputs group-writable.
 umask 002
 
+# No core dumps from tasks (2026-08-27). Polaris's default `ulimit -c unlimited`
+# + core_pattern=core means any SIGSEGV/SIGABRT in a task writes a core into the
+# task's cwd — which is the SUBMIT dir, i.e. someone's repo root. A torch python
+# crash cores at ~1.5 GB: 12 of them (16 GB) were found in the multifidelity root
+# on 2026-08-25. The login-node guard in dotfiles/shell/41-polaris.sh is
+# hostname-gated and so never covered compute nodes. Set it on the RANK, not just
+# here on the mom node: PBS/PALS launches ranks from the per-node daemon, which
+# does not inherit the mom shell's rlimits. Tasks inherit it from the worker.
+ulimit -c 0
+
 NNODES=$(wc -l < "$PBS_NODEFILE")
 echo "$(date -u +%FT%TZ) bravo worker starting on $NNODES node(s): $(cat $PBS_NODEFILE | tr '\n' ' ')"
 
@@ -61,6 +71,7 @@ while true; do
     mpiexec -n "$NNODES" --ppn 1 --cpu-bind none \
         bash -c "export TMPDIR='$WORKER_TMPDIR'
                  mkdir -p \"\$TMPDIR\" || { echo \"FATAL: cannot mkdir \$TMPDIR on \$(hostname)\"; exit 1; }
+                 ulimit -c 0
                  exec hq --server-dir $HOME/.hq-bravo-server worker start --on-server-lost finish-running"
     echo "$(date -u +%FT%TZ): workers exited; retrying in 60s (server restart or preemption?)"
     sleep 60
