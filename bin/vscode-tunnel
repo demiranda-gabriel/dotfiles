@@ -22,8 +22,12 @@ case "$cmd" in
     tmux has-session -t "$SESS" 2>/dev/null \
       && echo "tmux '$SESS': running   (attach: vscode-tunnel attach)" \
       || echo "tmux '$SESS': absent    (start: vscode-tunnel)"
-    [[ -f "$HOME/.vscode/cli/code_tunnel.json" ]] \
-      && echo "tunnel:       $(cat "$HOME/.vscode/cli/code_tunnel.json")"
+    # Must match the per-node dir vscode-login-tunnel.sh exports; the legacy
+    # shared ~/.vscode/cli holds a stale `null` and would hide a live tunnel.
+    dd="${VSCODE_CLI_DATA_DIR:-$HOME/.vscode/cli-$(hostname -s)}"
+    [[ -f "$dd/code_tunnel.json" ]] \
+      && echo "tunnel:       $(cat "$dd/code_tunnel.json")" \
+      || echo "tunnel:       none registered on $(hostname -s)"
     p="/sys/fs/cgroup/users/$USER/pids.current"
     [[ -r "$p" ]] && echo "login pids:   $(cat "$p") / 256 (cgroup cap)"
     ;;
