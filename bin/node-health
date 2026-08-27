@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+# node-health — inspect a login node's resource state and reap stale PIDs.
+#
+# Why this exists: cluster login nodes confine each user to a cgroup with a
+# hard pid cap that counts THREADS (Polaris: 256). When it fills, every
+# fork()/pthread_create() fails with EAGAIN and bash retries with exponential
+# backoff — which presents as "commands run with extreme delay", not a clean
+# error. On 2026-08-13 an ffmpeg transcode (thread pool sized from the login
+# node's 256 raw cores) wedged polaris-login-01 for hours.
+#
+# DESIGN CONSTRAINT: the scan and the kill path use ONLY bash builtins —
+# /proc globbing, `read`, `[[ ]]`, `kill`. No ps/awk/grep/sed anywhere that
+# matters. Every external command needs a fork, which is precisely what is
+# broken in the situation this tool exists to fix. This script must work at
+# 256/256 pids.
+#
+# Default is REPORT-ONLY. Pass --clean to actually kill.
+#
+# Exit: 0 healthy, 1 warn, 2 critical, 3 usage error.
+
+set -uo pipefail
+
+VERSION=1.0.0
+
+MIN_AGE_MIN=60          # a leaked shell must be at least this old to be reaped
+WARN_PCT=60             # pid usage % -> warn
+CRIT_PCT=85             # pid usage % -> critical
+DO_CLEAN=0
+AGGRESSIVE=0
+BRIEF=0
+ASSUME_HZ=100           # USER_HZ; 100 on every mainstream Linux x86-64
+
+usage() {
+    cat <<'EOF'
+node-health — inspect login-node resource state and reap stale PIDs
+
+USAGE
+    node-health [options]
+
+OPTIONS
+    (no args)        Report only. Never kills anything. This is the default.
+    --clean          Reap the CONFIDENT stale PIDs (SIGTERM).
+    --aggressive     Also treat SUSPECT candidates as reapable. Use with
+                     --clean. Read the suspect list first.
+    --min-age MIN    Minimum age in minutes for a leaked shell to count as
+                     stale (default 60).
+    --brief          One-line verdict, for prompts/cron.
+    -h, --help       This text.
+    --version
+
+WHAT COUNTS AS STALE
+  CONFIDENT (reaped by --clean)
+    * Leaked argless shells: cmdline is exactly /bin/sh or /bin/bash, zero
+      children, single-threaded, older than --min-age, AND parented by a
+      VS Code / Cursor CLI process. These leak ~1/day from `code tunnel`
+      and never get reaped.
+    * Orphaned CLI agent hosts: `code --cli-data-dir DIR agent host` where
+      no other live process references DIR and it has zero children — the
+      leftover when you move to a per-node data dir.
+
+  SUSPECT (listed, reaped only with --aggressive)
+    * Argless orphaned shells (reparented to init) not traceable to a
+      VS Code/Cursor CLI.
+
+  REPORTED, NEVER KILLED
+    Zombies (need the parent to reap), long-lived ssh ControlMasters,
+    detached tmux servers, anything running real work.
+
+SAFETY
+    Never kills: PID 1, itself, any ancestor of itself (your shell, tmux,
+    Claude session), anything not owned by you, or anything with children.
+
+EXIT CODES
+    0 healthy   1 warn (>60% pids)   2 critical (>85% pids)   3 usage error
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --clean)      DO_CLEAN=1 ;;
+        --aggressive) AGGRESSIVE=1 ;;
+        --brief)      BRIEF=1 ;;
+        --min-age)    shift; MIN_AGE_MIN="${1:-60}" ;;
+        -h|--help)    usage; exit 0 ;;
+        --version)    echo "node-health $VERSION"; exit 0 ;;
+        *) echo "node-health: unknown option '$1' (try --help)" >&2; exit 3 ;;
+    esac
+    shift
+done
+
+if [[ -t 1 ]]; then
+    B=$'\033[1m'; R=$'\033[31m'; Y=$'\033[33m'; G=$'\033[32m'; D=$'\033[2m'; N=$'\033[0m'
+else
+    B=''; R=''; Y=''; G=''; D=''; N=''
+fi
+
+hr() { printf '%s\n' "------------------------------------------------------------"; }
+
+# ---------------------------------------------------------------- cgroup ----
+# Layouts seen in the wild:
+#   ALCF/Polaris custom : /sys/fs/cgroup/users/$USER
+#   systemd cgroup v2   : /sys/fs/cgroup/user.slice/user-<uid>.slice
+#   cgroup v1           : /sys/fs/cgroup/pids/user.slice/user-<uid>.slice
+CG=""; CG_KIND=""
+detect_cgroup() {
+    local uid=$UID
+    if [[ -r "/sys/fs/cgroup/users/$USER/pids.current" ]]; then
+        CG="/sys/fs/cgroup/users/$USER"; CG_KIND="v2-alcf"; return
+    fi
+    if [[ -r "/sys/fs/cgroup/user.slice/user-$uid.slice/pids.current" ]]; then
+        CG="/sys/fs/cgroup/user.slice/user-$uid.slice"; CG_KIND="v2-systemd"; return
+    fi
+    if [[ -r "/sys/fs/cgroup/pids/user.slice/user-$uid.slice/pids.current" ]]; then
+        CG="/sys/fs/cgroup/pids/user.slice/user-$uid.slice"; CG_KIND="v1"; return
+    fi
+    CG_KIND="none"
+}
+
+cgval() {  # cgval <file> -> value or empty; builtin read, no fork
+    local f="$CG/$1" v=""
+    [[ -n $CG && -r $f ]] && read -r v < "$f" 2>/dev/null
+    printf '%s' "$v"
+}
+
+cgfield() {  # cgfield <file> <key> -> value from a "key value" flat-keyed file
+    local f="$CG/$1" key="$2" k v
+    [[ -n $CG && -r $f ]] || return
+    while read -r k v; do
+        [[ $k == "$key" ]] && { printf '%s' "$v"; return; }
+    done < "$f" 2>/dev/null
+}
+
+# ------------------------------------------------------------- proc scan ----
+declare -A P_PPID P_STATE P_THREADS P_AGE P_CMD P_ARGC P_ARG0 P_NCHILD P_MINE
+PIDS=()
+
+uptime_s=0
+scan_procs() {
+    local up idle
+    read -r up idle < /proc/uptime 2>/dev/null || up=0
+    uptime_s=${up%%.*}
+
+    local d p line rest arr state ppid nthr start age cmd argc arg0 arg
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [[ -r "$d/stat" ]] || continue
+
+        read -r line < "$d/stat" 2>/dev/null || continue
+        # comm is parenthesised and may contain spaces or ')': strip through
+        # the LAST ") " so field offsets are reliable.
+        rest=${line##*') '}
+        # shellcheck disable=SC2206
+        arr=($rest)
+        state=${arr[0]:-?}      # stat field 3
+        ppid=${arr[1]:-0}       # stat field 4
+        nthr=${arr[17]:-1}      # stat field 20 (num_threads)
+        start=${arr[19]:-0}     # stat field 22 (starttime, ticks since boot)
+
+        age=$(( uptime_s - start / ASSUME_HZ ))
+        (( age < 0 )) && age=0
+
+        cmd=""; argc=0; arg0=""
+        if [[ -r "$d/cmdline" ]]; then
+            while IFS= read -r -d '' arg; do
+                (( argc == 0 )) && arg0="$arg"
+                cmd+="$arg "
+                (( argc++ ))
+            done < "$d/cmdline" 2>/dev/null
+        fi
+
+        PIDS+=("$p")
+        P_PPID[$p]=$ppid
+        P_STATE[$p]=$state
+        P_THREADS[$p]=$nthr
+        P_AGE[$p]=$age
+        P_CMD[$p]="${cmd% }"
+        P_ARGC[$p]=$argc
+        P_ARG0[$p]="$arg0"
+        P_NCHILD[$p]=0
+        # [[ -O ]] is a builtin ownership test — no fork, no `stat` call.
+        if [[ -O "$d" ]]; then P_MINE[$p]=1; else P_MINE[$p]=0; fi
+    done
+
+    # child counts, second pass
+    local q
+    for q in "${PIDS[@]}"; do
+        local par=${P_PPID[$q]}
+        [[ -n ${P_NCHILD[$par]:-} ]] && (( P_NCHILD[$par]++ ))
+    done
+}
+
+# ------------------------------------------------------------- protection --
+declare -A PROTECT
+protect_ancestors() {
+    local p=$$ guard=0
+    while [[ -n $p && $p != 0 && $guard -lt 64 ]]; do
+        PROTECT[$p]=1
+        p=${P_PPID[$p]:-0}
+        (( guard++ ))
+    done
+    PROTECT[1]=1
+    PROTECT[$$]=1
+    PROTECT[$PPID]=1
+}
+
+is_vscode_cli() {  # does this cmdline look like a VS Code/Cursor CLI supervisor?
+    local c="$1"
+    [[ $c == *"code tunnel"*        ]] && return 0
+    [[ $c == *"agent host"*         ]] && return 0
+    [[ $c == *".vscode/cli"*        ]] && return 0
+    [[ $c == *".vscode-server"*     ]] && return 0
+    [[ $c == *".cursor-server"*     ]] && return 0
+    [[ $c == *"code-server"*        ]] && return 0
+    return 1
+}
+
+# --------------------------------------------------------------- classify --
+CONFIDENT=(); CONFIDENT_WHY=()
+SUSPECT=();   SUSPECT_WHY=()
+ZOMBIES=();   NOTABLE=()
+
+classify() {
+    local min_age_s=$(( MIN_AGE_MIN * 60 ))
+    local p base parent pcmd datadir q found
+
+    for p in "${PIDS[@]}"; do
+        [[ ${PROTECT[$p]:-0} == 1 ]] && continue
+        [[ ${P_MINE[$p]} == 1 ]] || continue
+
+        # --- zombies: report only, killing them does nothing ---------------
+        if [[ ${P_STATE[$p]} == Z ]]; then
+            ZOMBIES+=("$p")
+            continue
+        fi
+
+        base=${P_ARG0[$p]##*/}
+
+        # --- rule A: leaked argless shell ----------------------------------
+        if [[ ${P_ARGC[$p]} -eq 1 && ( $base == sh || $base == bash || $base == dash ) \
+              && ${P_NCHILD[$p]} -eq 0 && ${P_THREADS[$p]} -eq 1 \
+              && ${P_AGE[$p]} -ge $min_age_s ]]; then
+            parent=${P_PPID[$p]}
+            pcmd=${P_CMD[$parent]:-}
+            if is_vscode_cli "$pcmd"; then
+                CONFIDENT+=("$p")
+                CONFIDENT_WHY+=("leaked shell from VS Code/Cursor CLI (ppid $parent), idle $(fmt_age "${P_AGE[$p]}")")
+                continue
+            elif [[ $parent -eq 1 ]]; then
+                SUSPECT+=("$p")
+                SUSPECT_WHY+=("orphaned argless shell (reparented to init), idle $(fmt_age "${P_AGE[$p]}")")
+                continue
+            fi
+        fi
+
+        # --- rule B: orphaned CLI agent host --------------------------------
+        if [[ ${P_CMD[$p]} == *"--cli-data-dir "*" agent host"* && ${P_NCHILD[$p]} -eq 0 ]]; then
+            datadir=${P_CMD[$p]#*--cli-data-dir }
+            datadir=${datadir%% *}
+            found=0
+            for q in "${PIDS[@]}"; do
+                [[ $q == "$p" ]] && continue
+                [[ ${P_MINE[$q]} == 1 ]] || continue
+                if [[ ${P_CMD[$q]} == *"$datadir"* ]]; then found=1; break; fi
+                # also consult VSCODE_CLI_DATA_DIR in the environment
+                if [[ -r /proc/$q/environ ]]; then
+                    local e
+                    while IFS= read -r -d '' e; do
+                        if [[ $e == VSCODE_CLI_DATA_DIR=* && ${e#*=} == "$datadir" ]]; then
+                            found=1; break
+                        fi
+                    done < "/proc/$q/environ" 2>/dev/null
+                    (( found )) && break
+                fi
+            done
+            if (( ! found )); then
+                CONFIDENT+=("$p")
+                CONFIDENT_WHY+=("agent host for unused data dir $datadir, no servers, age $(fmt_age "${P_AGE[$p]}")")
+                continue
+            fi
+        fi
+
+        # --- notable, never auto-killed -------------------------------------
+        if [[ ${P_CMD[$p]} == *"[mux]"* ]]; then
+            NOTABLE+=("$p|ssh ControlMaster, age $(fmt_age "${P_AGE[$p]}") — reuse or 'ssh -O exit'")
+        fi
+    done
+}
+
+fmt_age() {
+    local s=${1:-0}
+    if   (( s < 3600  )); then printf '%dm' $(( s / 60 ))
+    elif (( s < 86400 )); then printf '%dh%dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+    else printf '%dd%dh' $(( s / 86400 )) $(( (s % 86400) / 3600 ))
+    fi
+}
+
+# ------------------------------------------------- vscode server versions --
+# A VS Code update installs a NEW server version, but windows opened before the
+# update keep their OLD server alive. Both run at once, each costing 20-60
+# threads — routinely the single largest consumer on a login node, and it grows
+# silently with every update. Report only: killing a server version kills a live
+# editing window, so this is never auto-reaped.
+SRV_VERS=()        # "version|procs|threads"
+SRV_CUR=""         # version VS Code considers current (head of lru.json)
+SRV_UNUSED=()      # installed on disk, nothing running — disk reclaim
+SRV_DUP=0          # running versions beyond the current one
+
+scan_server_versions() {
+    local p cmd tmp ver pre dir sdir="" line b
+    local -A vthr vproc
+    for p in "${PIDS[@]}"; do
+        [[ ${P_MINE[$p]} == 1 ]] || continue
+        cmd=${P_CMD[$p]}
+        [[ $cmd == */servers/Stable-* ]] || continue
+        tmp=${cmd#*/servers/}; ver=${tmp%%/*}
+        [[ $ver == Stable-* ]] || continue
+        pre=${cmd%%/servers/*}; dir=${pre##* }
+        vthr[$ver]=$(( ${vthr[$ver]:-0} + P_THREADS[$p] ))
+        vproc[$ver]=$(( ${vproc[$ver]:-0} + 1 ))
+        [[ -z $sdir ]] && sdir="$dir/servers"
+    done
+    (( ${#vthr[@]} == 0 )) && return
+
+    # head of lru.json is the version VS Code currently prefers
+    if [[ -r "$sdir/lru.json" ]]; then
+        read -r line < "$sdir/lru.json" 2>/dev/null
+        tmp=${line#*\"}; SRV_CUR=${tmp%%\"*}
+    fi
+
+    for ver in "${!vthr[@]}"; do
+        SRV_VERS+=( "$ver|${vproc[$ver]}|${vthr[$ver]}" )
+        [[ $ver != "$SRV_CUR" ]] && (( SRV_DUP++ ))
+    done
+
+    # installed but not running -> reclaimable disk
+    for b in "$sdir"/Stable-*; do
+        [[ -d $b ]] || continue
+        b=${b##*/}
+        [[ -n ${vthr[$b]:-} ]] || SRV_UNUSED+=( "$b" )
+    done
+}
+
+# ----------------------------------------------------------------- report --
+detect_cgroup
+scan_procs
+protect_ancestors
+classify
+scan_server_versions
+
+pids_cur=$(cgval pids.current)
+pids_max=$(cgval pids.max)
+pids_evt=$(cgfield pids.events max)
+mem_cur=$(cgval memory.current)
+mem_max=$(cgval memory.max)
+oom_kill=$(cgfield memory.events oom_kill)
+cpu_max_raw=$(cgval cpu.max)
+nr_throttled=$(cgfield cpu.stat nr_throttled)
+
+# fall back to RLIMIT_NPROC when there is no cgroup pid controller
+if [[ -z $pids_cur ]]; then
+    mine=0
+    for p in "${PIDS[@]}"; do
+        [[ ${P_MINE[$p]} == 1 ]] && (( mine += P_THREADS[$p] ))
+    done
+    pids_cur=$mine
+    pids_max=$(ulimit -u 2>/dev/null || echo "")
+fi
+
+pct=0
+if [[ -n $pids_max && $pids_max != max && $pids_max -gt 0 ]]; then
+    pct=$(( pids_cur * 100 / pids_max ))
+fi
+
+status="healthy"; scolor=$G; rc=0
+if   (( pct >= CRIT_PCT )); then status="CRITICAL"; scolor=$R; rc=2
+elif (( pct >= WARN_PCT )); then status="warn";     scolor=$Y; rc=1
+fi
+if [[ -n ${pids_evt:-} && ${pids_evt:-0} -gt 0 && $rc -eq 0 ]]; then
+    status="warn"; scolor=$Y; rc=1
+fi
+
+nconf=${#CONFIDENT[@]}; nsusp=${#SUSPECT[@]}; nzomb=${#ZOMBIES[@]}
+
+if (( BRIEF )); then
+    printf '%s%s%s  pids %s/%s (%s%%)  stale:%d suspect:%d zombie:%d%s\n' \
+        "$scolor" "$status" "$N" "$pids_cur" "${pids_max:-?}" "$pct" "$nconf" "$nsusp" "$nzomb" \
+        "$( (( SRV_DUP > 0 )) && printf '  dup-vscode-server:%d' "$SRV_DUP" )"
+    exit $rc
+fi
+
+read -r host < /proc/sys/kernel/hostname 2>/dev/null || host="?"
+read -r l1 l5 l15 _ < /proc/loadavg 2>/dev/null
+
+ncpu=0
+while read -r k _; do [[ $k == processor ]] && (( ncpu++ )); done < /proc/cpuinfo 2>/dev/null
+
+# printf %(...)T is a bash builtin (4.2+) — `date` would fork.
+printf -v now '%(%Y-%m-%d %H:%M:%S)T' -1
+printf '%s\n' "${B}node-health${N}  ${host}  ${now}"
+hr
+
+# --- pid budget: the thing that actually bites ---
+printf '%sPID BUDGET%s  (the cap counts THREADS, not processes)\n' "$B" "$N"
+printf '  usage        %s/%s  (%d%%)  headroom %s\n' \
+    "$pids_cur" "${pids_max:-?}" "$pct" \
+    "$([[ -n $pids_max && $pids_max != max ]] && echo $(( pids_max - pids_cur )) || echo '-')"
+if [[ -n ${pids_evt:-} ]]; then
+    if (( pids_evt > 0 )); then
+        printf '  %scap hit %s time(s) on this node since the cgroup was created%s\n' "$Y" "$pids_evt" "$N"
+    else
+        printf '  cap never hit on this node\n'
+    fi
+fi
+printf '  cgroup       %s%s\n' "${CG:-<none found>}" "$([[ -n $CG_KIND ]] && echo " ($CG_KIND)")"
+
+# --- memory / cpu ---
+if [[ -n $mem_cur ]]; then
+    printf '\n%sMEMORY%s   %s MiB / %s\n' "$B" "$N" "$(( mem_cur / 1048576 ))" \
+        "$([[ $mem_max == max || -z $mem_max ]] && echo 'unlimited' || echo "$(( mem_max / 1048576 )) MiB")"
+    [[ -n ${oom_kill:-} ]] && printf '  oom_kill     %s\n' "$oom_kill"
+fi
+if [[ -n $cpu_max_raw ]]; then
+    q=${cpu_max_raw%% *}; per=${cpu_max_raw##* }
+    if [[ $q == max ]]; then cores="unlimited"; else cores=$(( q / per )); fi
+    printf '\n%sCPU%s      quota %s core(s) of %s on this node; throttled %s time(s)\n' \
+        "$B" "$N" "$cores" "$ncpu" "${nr_throttled:-?}"
+fi
+
+# --- node context: load is a red herring, measure D-state instead ---
+nD=0; nR=0
+for p in "${PIDS[@]}"; do
+    case ${P_STATE[$p]} in D) (( nD++ ));; R) (( nR++ ));; esac
+done
+printf '\n%sNODE%s     load %s (1m)  cores %s  |  running %s  uninterruptible(D) %s\n' \
+    "$B" "$N" "${l1:-?}" "$ncpu" "$nR" "$nD"
+if [[ -n ${l1:-} && $ncpu -gt 0 ]]; then
+    l1int=${l1%%.*}
+    if (( l1int > ncpu / 2 )) && (( nD > nR )); then
+        printf '  %snote%s high load is dominated by D-state I/O waiters, not CPU —\n' "$D" "$N"
+        printf '       usually other users on a shared login node. Not your problem\n'
+        printf '       unless your own processes are in D.\n'
+    fi
+fi
+
+# --- your top consumers ---
+printf '\n%sYOUR TOP PID CONSUMERS%s  (threads = pids consumed)\n' "$B" "$N"
+# Builtin top-N selection. `sort | head` would fork, and this section is most
+# interesting precisely when forking is broken.
+top_pids=(); top_thr=()
+for p in "${PIDS[@]}"; do
+    [[ ${P_MINE[$p]} == 1 ]] || continue
+    (( P_THREADS[$p] > 1 )) || continue
+    ins=${#top_pids[@]}
+    for (( i = 0; i < ${#top_pids[@]}; i++ )); do
+        if (( P_THREADS[$p] > top_thr[i] )); then ins=$i; break; fi
+    done
+    top_pids=( "${top_pids[@]:0:$ins}" "$p"              "${top_pids[@]:$ins}" )
+    top_thr=(  "${top_thr[@]:0:$ins}"  "${P_THREADS[$p]}" "${top_thr[@]:$ins}"  )
+    if (( ${#top_pids[@]} > 8 )); then
+        top_pids=( "${top_pids[@]:0:8}" ); top_thr=( "${top_thr[@]:0:8}" )
+    fi
+done
+mine_thr=0
+for p in "${PIDS[@]}"; do
+    [[ ${P_MINE[$p]} == 1 ]] && (( mine_thr += P_THREADS[$p] ))
+done
+for (( i = 0; i < ${#top_pids[@]}; i++ )); do
+    p=${top_pids[$i]}
+    printf '  %4d thr  %-8s %s\n' "${top_thr[$i]}" "$p" "${P_CMD[$p]:0:80}"
+done
+printf '  %s(%d threads across your processes)%s\n' "$D" "$mine_thr" "$N"
+
+# --- findings ---
+printf '\n%sSTALE — CONFIDENT%s (%d, reaped by --clean)\n' "$B" "$N" "$nconf"
+if (( nconf )); then
+    for i in "${!CONFIDENT[@]}"; do
+        printf '  %-8s %s\n' "${CONFIDENT[$i]}" "${CONFIDENT_WHY[$i]}"
+    done
+else
+    printf '  %snone%s\n' "$D" "$N"
+fi
+
+if (( nsusp )); then
+    printf '\n%sSTALE — SUSPECT%s (%d, only with --clean --aggressive)\n' "$B" "$N" "$nsusp"
+    for i in "${!SUSPECT[@]}"; do
+        printf '  %-8s %s\n' "${SUSPECT[$i]}" "${SUSPECT_WHY[$i]}"
+    done
+fi
+
+if (( nzomb )); then
+    printf '\n%sZOMBIES%s (%d) — cannot be killed; the parent must reap them.\n' "$B" "$N" "$nzomb"
+    printf '  %s\n' "${ZOMBIES[*]}"
+fi
+
+if (( ${#SRV_VERS[@]} )); then
+    printf '\n%sVS CODE SERVER STACKS%s (report only — each version backs live windows)\n' "$B" "$N"
+    dup_thr=0
+    for e in "${SRV_VERS[@]}"; do
+        v=${e%%|*}; rest=${e#*|}; np=${rest%%|*}; nt=${rest#*|}
+        if [[ $v == "$SRV_CUR" ]]; then tag="current"; c=""; else tag="OLD"; c=$Y; (( dup_thr += nt )); fi
+        printf '  %s%-14s %-8s %2d procs %3d thr%s\n' "$c" "${v:7:12}…" "$tag" "$np" "$nt" "$N"
+    done
+    if (( SRV_DUP > 0 )); then
+        printf '  %s-> %d stale version(s) still running, costing %d threads.%s\n' "$Y" "$SRV_DUP" "$dup_thr" "$N"
+        printf '     A VS Code update installs a new server; windows opened before it\n'
+        printf '     keep the old one alive. Close/reload those windows to reclaim.\n'
+    fi
+    if (( ${#SRV_UNUSED[@]} )); then
+        printf '  %s%d installed version(s) with nothing running (~700 MB each):%s\n' "$D" "${#SRV_UNUSED[@]}" "$N"
+        for v in "${SRV_UNUSED[@]}"; do printf '     %s\n' "${v:7:12}…"; done
+    fi
+fi
+
+if (( ${#NOTABLE[@]} )); then
+    printf '\n%sNOTABLE%s (never auto-killed)\n' "$B" "$N"
+    for n in "${NOTABLE[@]}"; do printf '  %-8s %s\n' "${n%%|*}" "${n#*|}"; done
+fi
+
+# ------------------------------------------------------------------ clean --
+if (( DO_CLEAN )); then
+    printf '\n%sREAPING%s\n' "$B" "$N"
+    # ${arr[@]+"${arr[@]}"} keeps this safe on bash < 4.4 under `set -u`
+    targets=( ${CONFIDENT[@]+"${CONFIDENT[@]}"} )
+    (( AGGRESSIVE )) && targets+=( ${SUSPECT[@]+"${SUSPECT[@]}"} )
+    if (( ${#targets[@]} == 0 )); then
+        printf '  nothing to do\n'
+    else
+        killed=0
+        for p in "${targets[@]}"; do
+            # re-verify at kill time: still alive, still mine, still childless
+            [[ -d /proc/$p ]]            || { printf '  gone     %s\n' "$p"; continue; }
+            [[ ${PROTECT[$p]:-0} == 1 ]] && { printf '  PROTECT  %s\n' "$p"; continue; }
+            [[ -O /proc/$p ]]            || { printf '  not-mine %s\n' "$p"; continue; }
+            nch=0
+            for q in /proc/[0-9]*; do
+                [[ -r "$q/stat" ]] || continue
+                read -r ln < "$q/stat" 2>/dev/null || continue
+                rst=${ln##*') '}; a=($rst)
+                [[ ${a[1]:-0} == "$p" ]] && (( nch++ ))
+            done
+            (( nch > 0 )) && { printf '  has-kids %s (skipped)\n' "$p"; continue; }
+            if kill -TERM "$p" 2>/dev/null; then   # kill is a bash builtin: no fork
+                printf '  TERM     %s\n' "$p"
+                (( killed++ ))
+            else
+                printf '  failed   %s\n' "$p"
+            fi
+        done
+        after=$(cgval pids.current)
+        printf '\n  signalled %d; pids %s -> %s\n' "$killed" "$pids_cur" "${after:-?}"
+    fi
+else
+    if (( nconf + nsusp > 0 )); then
+        printf '\n%s->%s report-only. Reap the confident set with: %snode-health --clean%s\n' \
+            "$D" "$N" "$B" "$N"
+    fi
+fi
+
+# ---------------------------------------------------------------- advice ---
+if (( rc >= 1 )); then
+    printf '\n%sGUIDANCE%s\n' "$B" "$N"
+    printf '  Cap the thread pools of anything you run on a login node — the\n'
+    printf '  cap counts threads and libraries size pools from the raw core\n'
+    printf '  count (%s here), not your quota:\n' "$ncpu"
+    printf '    export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8\n'
+    printf '    ffmpeg -threads 4 -filter_threads 2 -filter_complex_threads 2 ...\n'
+    [[ -e "$HOME/.hq/shim/nproc8.so" ]] && \
+    printf '    LD_PRELOAD=%s/.hq/shim/nproc8.so   # fakes 8 CPUs generically\n' "$HOME"
+    printf '  Better: run real work through the batch system, not here.\n'
+fi
+if (( rc == 2 )); then
+    printf '\n%sIf this node is already wedged%s (commands hang or crawl, ssh in\n' "$R" "$N"
+    printf '  produces no output at all), external commands cannot fork. From an\n'
+    printf '  ALREADY-OPEN shell, use builtins only — kill/read/[[ ]] are builtin:\n'
+    printf '    for d in /proc/[0-9]*; do\n'
+    printf '      [[ -O $d ]] || continue\n'
+    printf '      read -r c < "$d/comm" 2>/dev/null || continue\n'
+    printf '      [[ $c == sh ]] && kill "${d#/proc/}"\n'
+    printf '    done\n'
+    printf '  With no open shell there, the node will not self-heal (the pid\n'
+    printf '  holders are persistent) — open a ticket with support.\n'
+fi
+
+exit $rc
