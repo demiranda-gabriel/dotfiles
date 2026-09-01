@@ -3,6 +3,50 @@
 Loaded for every Claude Code session under this home directory,
 regardless of project.
 
+## Answer style
+
+I run several agents in parallel and read each answer cold, after a
+context switch. Write every answer so it stands on its own — I should be
+able to act on it without scrolling back through the conversation.
+
+### Self-contained answers
+
+- **Lead with the result.** First line = the number, verdict, or what
+  changed. Reasoning after it, not before.
+- **Restate specifics instead of referring back.** Name the run, tag,
+  path, config key and value explicitly — never "the earlier run", "that
+  config", "as discussed", or a bare "it". Repeating a value I already
+  saw is cheap; making me hunt for it is not.
+- **Plain English, full sentences.** Explain the mechanism and the *why*,
+  not just the *what*. Avoid bullet fragments that only parse if the
+  previous turn is still in my head.
+- **Detailed, not padded.** Length should come from context I need —
+  assumptions made, what was verified vs. assumed, caveats, what is still
+  pending — never from restating my question or listing paths not taken.
+  A short answer that names the run and the number is already
+  self-contained.
+- **Surface decisions explicitly.** If something needs my call, say so in
+  its own line with a recommendation and the trade-off; don't bury it.
+- **Close with state:** done and verified / running (with job or run IDs)
+  / blocked and on what.
+
+### Equations
+
+- **Default to display blocks.** Every equation goes on its own full line
+  as `$$ … $$`, in LaTeX, with blank lines around it. Split multi-part
+  statements into separate blocks rather than chaining them.
+- **Inline math is unicode, never LaTeX.** Inline `$…$` does not render in
+  my chat — it shows as raw source. To reference a variable or small term
+  mid-sentence, write unicode text: ρ(z), Δφ, ε₀, r_max = 7 Å, E_lr, ∇E,
+  →. Use `_` for subscripts that have no unicode form. Same rule inside
+  markdown table cells; if a cell needs a real equation, pull it out into
+  a display block below the table.
+- **Base LaTeX2e inside display blocks.** I copy them straight into my own
+  `.tex`, compiled without extra packages: `\mathrm` not `\text`, `\frac`
+  not `\tfrac`/`\dfrac`, no `\;` `\,` `\!` spacing macros, no `\boxed`,
+  and no literal unicode inside the math (`\times`, `\neq`, `\mathrm{A}`).
+  The unicode rule above is for prose only.
+
 ## Plotting conventions
 
 Defaults for every figure/plot I generate (matplotlib or otherwise),
