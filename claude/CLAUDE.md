@@ -16,6 +16,19 @@ unless a specific request says otherwise:
   relative to the figure, rather than small on a sprawling canvas. Err
   toward a tight figure and let the fonts read clearly.
 
+## Equations in chat
+
+My chat client renders **display** LaTeX but does **not** render inline LaTeX.
+
+- **Default: put every equation on its own line** as a display block
+  (`$$ ... $$`). Do this even for short expressions — prefer breaking the
+  sentence over inlining the math.
+- **Inline math only when unavoidable, and then code-style with text
+  symbols**: `erfc(alpha*r)/r`, `exp(-k^2 / 4 alpha^2)`, `O(N log N)`.
+  Never inline `$...$` — it shows up as raw markup.
+- Applies to prose, tables, and reports written into chat. Files that are
+  rendered elsewhere (notes, papers, md-view PDFs) keep normal LaTeX.
+
 ## Backup / cross-cluster data workflow
 
 Bulk data (datasets, raw artefacts, run outputs that are too large for
