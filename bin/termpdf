@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# termpdf wrapper — runs upstream termpdf.py under a pinned interpreter.
+#
+# Upstream ships as `#!/usr/bin/env python3`, which resolves to whatever
+# project venv is active; its deps live in one interpreter's user-site, so
+# termpdf died with "ModuleNotFoundError: No module named 'fitz'" whenever a
+# project venv was on PATH. This wrapper always uses ~/.local/share/pdfview/venv.
+#
+# termpdf also writes raw kitty graphics APC sequences with no tmux passthrough
+# wrapper, so inside tmux it draws no pages at all. Use `doc-view` there.
+set -euo pipefail
+
+SHARE="$HOME/.local/share/pdfview"
+PY="${TERMPDF_PYTHON:-$SHARE/venv/bin/python}"
+SCRIPT="$SHARE/termpdf.py"
+
+if [[ ! -x "$PY" || ! -s "$SCRIPT" ]]; then
+    echo "termpdf: not installed — run ~/dotfiles/install/install-pdfview.sh" >&2
+    exit 1
+fi
+
+if [[ -n "${TMUX:-}" && -z "${TERMPDF_FORCE_TMUX:-}" ]]; then
+    echo "termpdf: inside tmux it cannot draw (no passthrough support)." >&2
+    echo "         using doc-view instead; TERMPDF_FORCE_TMUX=1 to override." >&2
+    exec doc-view "$@"
+fi
+
+exec "$PY" "$SCRIPT" "$@"

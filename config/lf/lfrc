@@ -22,7 +22,7 @@ cmd open ${{
             md-view "$f"
             ;;
         *.pdf|*.epub|*.djvu|*.cbz|*.fb2|*.xps)
-            termpdf "$f"
+            doc-view "$f"
             ;;
         *.png|*.jpg|*.jpeg|*.gif|*.webp|*.tif|*.tiff|*.bmp)
             img-view "$f"
@@ -49,7 +49,7 @@ cmd md_huge ${{ MDVIEW_FONTSIZE=20pt md-view "$f" }}
 map B md_big
 map H md_huge
 
-# --- marp slides: build PDF, view in termpdf ---
+# --- marp slides: build PDF, view in doc-view ---
 # Detects a marp deck (frontmatter `marp: true`). If sibling package.json
 # defines `slides:pdf`, uses that (preserves theme/flags); else falls back
 # to a direct `marp` invocation, auto-passing any sibling `themes/*.css`
@@ -78,7 +78,7 @@ cmd marp_view ${{
         done
         marp "$f" -o "$out" "$@" --pdf --html --allow-local-files --no-stdin
     fi
-    termpdf "$out"
+    doc-view "$out"
 }}
 map M marp_view
 
@@ -87,7 +87,7 @@ map M marp_view
 # PID + log live in /tmp keyed by deck-path hash so deck dirs stay clean.
 # Auto-passes any sibling `themes/*.css` as --theme so per-project themes
 # apply without extra config. Pair with `M` (marp_view) which opens
-# slides.pdf in termpdf; press Ctrl-R inside termpdf to reload after each
+# slides.pdf in doc-view; press `r` inside it to reload after each
 # rebuild.
 cmd marp_watch &{{
     case "$f" in *.md|*.markdown) : ;; *)
@@ -124,10 +124,14 @@ cmd marp_watch &{{
 }}
 map W marp_watch
 
-# --- pdf single-page peek (kitten icat fallback) ---
+# --- pdf single-page peek ---
+# Renders page 1 and hands it to img-view. kitten's own --hold does not work
+# under tmux (it cannot read the keypress through the multiplexer), so the peek
+# goes through the same wait-for-key path as every other image.
 cmd pdf_peek ${{
-    pdftoppm -jpeg -r 150 -singlefile -- "$f" - \
-      | ~/.local/share/kitty-ssh-kitten/kitty/bin/kitten icat --hold --stdin=yes
+    tmp=$(mktemp -t lfpeek-XXXXXX)
+    trap 'rm -f "$tmp" "$tmp.jpg"' EXIT
+    pdftoppm -jpeg -r 150 -singlefile -- "$f" "$tmp" && img-view "$tmp.jpg"
 }}
 map P pdf_peek
 

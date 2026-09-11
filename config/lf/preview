@@ -1,26 +1,58 @@
 #!/usr/bin/env bash
-# lf previewer — text via bat/cat, images via kitten icat, pdf first-page render
+# lf previewer — text via bat/cat, images + first-page PDF via kitten icat.
 # Args: $1=file, $2=width, $3=height, $4=x, $5=y
+#
+# Transfer mode: `stream` is the only mode that works when the terminal is on
+# another machine (kitty's own docs: "if you use the file or memory transfer
+# modes and you are connecting over a remote session then image display will
+# not work"). This whole stack runs over SSH, so stream is the default; set
+# ICAT_TRANSFER_MODE=memory on a host where kitty is local.
 
 set -u
 f="$1"; w="$2"; h="$3"; x="$4"; y="$5"
 
 KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
+TMODE="${ICAT_TRANSFER_MODE:-stream}"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/lf-preview"
+
+icat() {
+    "$KITTEN" icat --silent --stdin=no --transfer-mode="$TMODE" \
+        --place="${w}x${h}@${x}x${y}" -- "$1" </dev/null
+}
+
+# Dispatch on extension first: `file` costs a fork on every cursor move, and
+# the previewer runs on every cursor move.
+case "${f,,}" in
+    *.png|*.jpg|*.jpeg|*.gif|*.webp|*.tif|*.tiff|*.bmp|*.ico|*.avif)
+        icat "$f"
+        exit 1 ;;   # exit 1 = lf will not cache the preview (re-renders on move)
+    *.pdf)
+        # Render once, reuse. Key on path + mtime + size so an edited file
+        # (marp watcher, md-view rebuild) re-renders.
+        mkdir -p "$CACHE"
+        key=$(printf '%s' "$f" | sha1sum | cut -c1-16)
+        stamp=$(stat -c '%Y-%s' -- "$f" 2>/dev/null || echo 0)
+        png="$CACHE/$key-$stamp.jpg"
+        if [[ ! -s "$png" ]]; then
+            rm -f "$CACHE/$key-"*.jpg 2>/dev/null
+            pdftoppm -jpeg -r 100 -singlefile -- "$f" "${png%.jpg}" 2>/dev/null
+        fi
+        [[ -s "$png" ]] && icat "$png"
+        exit 1 ;;
+esac
 
 mime="$(file --mime-type -Lb -- "$f" 2>/dev/null || echo unknown)"
 
 case "$mime" in
     image/*)
-        "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
-            --place="${w}x${h}@${x}x${y}" -- "$f" </dev/null
-        exit 1   # exit code 1 = lf will not cache preview (re-renders on move)
+        icat "$f"
+        exit 1
         ;;
     application/pdf)
         tmp="$(mktemp -t lfprev-XXXXXX.jpg)"
         trap 'rm -f "$tmp"' EXIT
         pdftoppm -jpeg -r 100 -singlefile -- "$f" "${tmp%.jpg}" 2>/dev/null \
-          && "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
-                --place="${w}x${h}@${x}x${y}" -- "$tmp" </dev/null
+          && icat "$tmp"
         exit 1
         ;;
     text/*|application/json|application/xml|application/javascript)

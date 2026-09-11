@@ -18,7 +18,7 @@ fi
 KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 
 # Clear any prior kitty graphics + text scrollback view.
-"$KITTEN" icat --clear --silent --transfer-mode=memory </dev/null 2>/dev/null || true
+"$KITTEN" icat --clear --silent --transfer-mode="${ICAT_TRANSFER_MODE:-stream}" </dev/null 2>/dev/null || true
 clear
 
 "$KITTEN" icat \
@@ -29,4 +29,4 @@ clear
 
 # Wait for any key; works under tmux unlike kitten's --hold.
 read -n 1 -s -r </dev/tty
-"$KITTEN" icat --clear --silent --transfer-mode=memory </dev/null 2>/dev/null || true
+"$KITTEN" icat --clear --silent --transfer-mode="${ICAT_TRANSFER_MODE:-stream}" </dev/null 2>/dev/null || true

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
-# lf cleaner — clears kitty graphics images when moving cursor.
+# lf cleaner — clears kitty graphics images when the cursor moves.
+# Transfer mode must match the previewer's (see config/lf/preview).
 KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
-"$KITTEN" icat --clear --silent --stdin=no --transfer-mode=memory </dev/null 2>/dev/null
+TMODE="${ICAT_TRANSFER_MODE:-stream}"
+"$KITTEN" icat --clear --silent --stdin=no --transfer-mode="$TMODE" </dev/null 2>/dev/null

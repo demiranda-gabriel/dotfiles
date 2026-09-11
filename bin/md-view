@@ -26,4 +26,4 @@ pandoc "$in" \
   "$@" \
   -o "$out"
 
-termpdf "$out"
+doc-view "$out"

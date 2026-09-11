@@ -23,7 +23,8 @@ for arg in "$@"; do
         -h|--help)
             cat <<EOF
 Usage: bootstrap.sh [--viewers]
-  --viewers   Also fetch the tool stack (lf, tmux, tectonic, pandoc, termpdf, gh,
+  --viewers   Also fetch the tool stack (lf, tmux, tectonic, pandoc, the PDF
+              viewers (doc-view venv + termpdf), gh,
               and the VS Code CLI for login-node tunnels) into ~/.local/bin
               (10s of MB downloaded — only run on a host where you want them)
 EOF
@@ -160,7 +161,7 @@ if [[ -d /n/netscratch ]]; then
     fi
 fi
 
-# 3d. Optional install stack (lf, tmux, tectonic, pandoc, termpdf)
+# 3d. Optional install stack (lf, tmux, tectonic, pandoc, pdf viewers)
 if (( INSTALL_VIEWERS )); then
     echo
     echo "=== Installing tool stack ==="
@@ -174,7 +175,7 @@ fi
 # 4. Toolchain probe
 echo
 echo "=== Toolchain ==="
-for tool in rclone pigz tar tmux lf tectonic pandoc termpdf pdftoppm code gh; do
+for tool in rclone pigz tar tmux lf tectonic pandoc doc-view termpdf pdftoppm code gh; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo "✓ $tool: $(command -v "$tool")"
     else

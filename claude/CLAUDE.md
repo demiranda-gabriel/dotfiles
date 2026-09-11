@@ -96,16 +96,31 @@ All wired up by `~/dotfiles/bootstrap.sh --viewers`.
 |------------|---------------------------------------------------------------|--------|
 | `tmux`     | Terminal multiplexer. Config at `~/.config/tmux/tmux.conf` (+ legacy `~/.tmux.conf` symlink for tmux <3.1) | `nelsonenzo/tmux-appimage`, extracted (no FUSE needed) |
 | `lf`       | File manager (replaces ranger). Config in `~/.config/lf/`     | binary, fetched |
-| `md-view`  | Markdown → PDF (pandoc + tectonic) → termpdf. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_ENGINE` (default `tectonic`) | `dotfiles/bin/` |
+| `md-view`  | Markdown → PDF (pandoc + tectonic) → doc-view. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_ENGINE` (default `tectonic`) | `dotfiles/bin/` |
 | `img-view` | `kitten icat` wrapper, fits image in terminal box, clears before display | `dotfiles/bin/` |
-| `termpdf`  | Multi-page PDF / epub / djvu viewer using kitty graphics      | upstream py, fetched |
+| `doc-view` | Multi-page PDF / epub / djvu / cbz viewer. PyMuPDF renders, `kitten icat` displays, so it works inside tmux. Keys: `j`/`k` page, `w` fit-width, `+`/`-` zoom, `<n>g` goto, `r` reload, `q` | `dotfiles/bin/` |
+| `termpdf`  | Upstream viewer, fallback outside tmux only — it emits raw kitty APC with no tmux passthrough, so inside tmux it draws nothing | upstream py, fetched |
 | `tectonic` | Modern XeTeX engine, bundles TeX, auto-fetches packages — bypasses incomplete cluster TeX | binary, fetched |
 | `pandoc`   | Newer (3.9.0.2) — system pandoc on RHEL/Rocky 8 is too old for tectonic | binary, fetched |
 
 **Inside `lf`:** `<enter>` dispatches by extension (md → md-view, pdf →
-termpdf, image → img-view). `B`/`H` for big/huge font markdown, `P` for
+doc-view, image → img-view). `B`/`H` for big/huge font markdown, `P` for
 first-page pdf peek, `yK` for kitty transfer download to local Mac, `R`
 to reload config. Quit drops parent shell into last-visited dir.
+
+**Kitty graphics over SSH — do not set `--transfer-mode` to `file` or
+`memory`.** Those modes send the terminal a *path* (a temp file, or a
+`/dev/shm` object) instead of the image bytes. The terminal is on the Mac and
+the path exists only on the cluster, so nothing renders — silently, with no
+error. Every icat call in this stack passes `--transfer-mode=stream`, and
+`ICAT_TRANSFER_MODE` overrides it on a host where kitty is local.
+
+**Python-dependent viewers get a pinned interpreter.** `doc-view` and `termpdf`
+need PyMuPDF. Under `#!/usr/bin/env python3` they broke with
+`ModuleNotFoundError: fitz` whenever any project venv was active. Both now run
+from `~/.local/share/pdfview/venv`, built by `install/install-pdfview.sh` and
+touched by nothing else. Don't "fix" a viewer by pip-installing into a project
+venv.
 
 **Cluster TeX caveat:** the system TeX install on FASRC (Rocky 8) is
 incomplete — `xelatex`/`lualatex` missing `ucharcat.sty`, xcolor broken.

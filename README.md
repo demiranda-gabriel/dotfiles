@@ -21,10 +21,11 @@ The bootstrap script is idempotent. It:
    `lf`, `tmux`). For `tmux` also creates `~/.tmux.conf` as a fallback
    for tmux <3.1 (which doesn't honor the XDG path).
 5. Probes for `rclone`, `pigz`, `tmux`, `lf`, `tectonic`, `pandoc`,
-   `termpdf`, `pdftoppm`, and a configured `mir-backup:` remote; reports missing.
+   `doc-view`, `termpdf`, `pdftoppm`, and a configured `mir-backup:` remote;
+   reports missing.
 
 Pass `--viewers` to also fetch the tool stack
-(`lf`, `tmux`, `tectonic`, `pandoc`, `termpdf.py` + Python deps) into
+(`lf`, `tmux`, `tectonic`, `pandoc`, and the PDF viewer venv) into
 `~/.local/bin/` and `~/software/`:
 
 ```bash
@@ -41,13 +42,14 @@ For reading documents over SSH+kitty without leaving the terminal.
 |-----------|---------------------------------------------------------------|
 | `tmux`    | Terminal multiplexer. Config in `config/tmux/tmux.conf`. Installed from `nelsonenzo/tmux-appimage` (extracted, no FUSE needed) |
 | `lf`      | Terminal file manager (replaces ranger). Config in `config/lf/` |
-| `md-view` | `pandoc → tectonic → PDF → termpdf` for markdown notes. Font size via `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, engine via `MDVIEW_ENGINE` |
+| `md-view` | `pandoc → tectonic → PDF → doc-view` for markdown notes. Font size via `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, engine via `MDVIEW_ENGINE` |
 | `img-view`| `kitten icat` wrapper, scales image to fit terminal box       |
-| `termpdf` | Multi-page PDF/epub/djvu viewer using kitty graphics protocol |
+| `doc-view`| Multi-page PDF/epub/djvu viewer: PyMuPDF renders, `kitten icat` displays. Works inside tmux |
+| `termpdf` | Upstream viewer, kept as a fallback outside tmux (it has no tmux passthrough) |
 | `tectonic`| Modern XeTeX engine. Bundles its own TeX, auto-fetches packages — bypasses incomplete cluster TeX installs |
 
 Inside `lf`: `<enter>` dispatches by extension (md → md-view, pdf →
-termpdf, image → img-view). `B` / `H` for big/huge font markdown, `P`
+doc-view, image → img-view). `B` / `H` for big/huge font markdown, `P`
 for first-page PDF peek, `yK` for kitty transfer download to local Mac.
 `R` reloads the lf config.
 
@@ -135,7 +137,8 @@ muscle memory keeps working.
 dotfiles/
 ├── bin/                                 ← scripts symlinked into ~/.local/bin
 │   ├── gdrive-{push,pull,archive}
-│   ├── md-view                          ← markdown → pandoc/tectonic → termpdf
+│   ├── md-view                          ← markdown → pandoc/tectonic → doc-view
+│   ├── doc-view                         ← PDF/epub viewer (PyMuPDF + kitten icat)
 │   ├── img-view                         ← image filling terminal via kitten icat
 │   ├── tmux-merge                       ← gather/restore windows as panes (prefix g/G)
 │   ├── tmux-window-fzf                  ← fzf window chooser popup (M-j; needs fzf)
@@ -150,7 +153,7 @@ dotfiles/
 │   ├── install-tmux.sh
 │   ├── install-tectonic.sh
 │   ├── install-pandoc.sh
-│   ├── install-termpdf.sh
+│   ├── install-pdfview.sh
 │   └── install-vscode-cli.sh            ← VS Code CLI (`code`) for login-node tunnels
 ├── shell/                               ← sourced from ~/.bashrc by bootstrap
 │   ├── 00-path.sh                       ← prepends ~/.local/bin to $PATH
