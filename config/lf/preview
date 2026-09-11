@@ -2,11 +2,28 @@
 # lf previewer — text via bat/cat, images + first-page PDF via kitten icat.
 # Args: $1=file, $2=width, $3=height, $4=x, $5=y
 #
-# Transfer mode: `stream` is the only mode that works when the terminal is on
-# another machine (kitty's own docs: "if you use the file or memory transfer
-# modes and you are connecting over a remote session then image display will
-# not work"). This whole stack runs over SSH, so stream is the default; set
-# ICAT_TRANSFER_MODE=memory on a host where kitty is local.
+# Two things have to be true for an image to appear here.
+#
+# 1. Transfer mode. `stream` is the only mode that works when the terminal is
+#    on another machine (kitty's own docs: "if you use the file or memory
+#    transfer modes and you are connecting over a remote session then image
+#    display will not work"). This stack runs over SSH, so stream is the
+#    default; set ICAT_TRANSFER_MODE=memory on a host where kitty is local.
+#
+# 2. `tee /dev/tty`. lf does not pass the previewer's output through verbatim:
+#    it parses it for colouring and drops APC and DCS sequences, which is
+#    exactly where kitty's image data lives. Inside tmux, icat sends the pixels
+#    as an APC (wrapped in a tmux DCS) and then writes Unicode placeholder
+#    cells that tell kitty where to paint them. lf keeps the placeholders and
+#    the 24-bit foreground colour that names the image, but eats the pixels, so
+#    the terminal is asked to draw an image it was never given.
+#
+#    So the output goes to both sinks. The tty copy carries the pixels straight
+#    to kitty, bypassing lf's filter; the stdout copy becomes the pane's text,
+#    so lf redraws the placeholders itself and the image survives every repaint.
+#    Outside tmux the same call works for the other reason: the tty copy places
+#    the image directly, and kitty keeps images on their own layer, so lf
+#    drawing text over those cells does not erase it.
 
 set -u
 f="$1"; w="$2"; h="$3"; x="$4"; y="$5"
@@ -15,9 +32,24 @@ KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 TMODE="${ICAT_TRANSFER_MODE:-stream}"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/lf-preview"
 
+# Pin the image id to 24 bits. Left to itself icat picks a random 32-bit id,
+# and a placeholder cell can only name 24 of them (the foreground colour); the
+# most significant byte would have to travel as an underline colour, which icat
+# does not emit. Anything above 2^24 therefore leaves the pane referring to an
+# id the terminal does not have. lf exports $id, so one image slot per lf
+# instance is enough — only one preview is on screen at a time, and reusing the
+# slot keeps the terminal from accumulating an image per file visited.
+img_id=$(( (${id:-4242} % 16000000) + 1 ))
+
+# Degrade to stdout alone if there is no controlling terminal, rather than
+# failing the whole pipeline.
+TTY=/dev/tty
+[[ -w "$TTY" ]] || TTY=/dev/null
+
 icat() {
     "$KITTEN" icat --silent --stdin=no --transfer-mode="$TMODE" \
-        --place="${w}x${h}@${x}x${y}" -- "$1" </dev/null
+        --image-id="$img_id" \
+        --place="${w}x${h}@${x}x${y}" -- "$1" </dev/null | tee "$TTY"
 }
 
 # Dispatch on extension first: `file` costs a fork on every cursor move, and

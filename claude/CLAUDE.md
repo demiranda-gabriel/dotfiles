@@ -115,6 +115,18 @@ the path exists only on the cluster, so nothing renders — silently, with no
 error. Every icat call in this stack passes `--transfer-mode=stream`, and
 `ICAT_TRANSFER_MODE` overrides it on a host where kitty is local.
 
+**lf previews: the image data must bypass lf.** lf parses a previewer's stdout
+for colouring and drops APC and DCS sequences — precisely where kitty's pixels
+travel. It keeps the Unicode placeholder cells and the 24-bit foreground colour
+naming the image, so the terminal is told to paint an image it was never sent
+and the pane stays blank. `config/lf/preview` therefore pipes icat through
+`tee /dev/tty`: the tty copy carries the pixels past lf's filter, the stdout
+copy becomes the pane text so lf repaints the placeholders itself. It also pins
+`--image-id` below 2^24 — icat otherwise picks a random 32-bit id whose top byte
+has nowhere to travel, leaving the placeholder naming an id the terminal lacks.
+The cleaner writes to `/dev/tty` for the same reason. Don't "simplify" either
+back to plain stdout.
+
 **Python-dependent viewers get a pinned interpreter.** `doc-view` and `termpdf`
 need PyMuPDF. Under `#!/usr/bin/env python3` they broke with
 `ModuleNotFoundError: fitz` whenever any project venv was active. Both now run

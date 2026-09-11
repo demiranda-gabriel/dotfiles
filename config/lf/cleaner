@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # lf cleaner — clears kitty graphics images when the cursor moves.
-# Transfer mode must match the previewer's (see config/lf/preview).
+#
+# Writes to /dev/tty for the same reason the previewer does: lf strips APC and
+# DCS sequences from a helper's stdout, so a delete command sent that way never
+# reaches the terminal and old images accumulate.
 KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 TMODE="${ICAT_TRANSFER_MODE:-stream}"
-"$KITTEN" icat --clear --silent --stdin=no --transfer-mode="$TMODE" </dev/null 2>/dev/null
+"$KITTEN" icat --clear --silent --stdin=no --transfer-mode="$TMODE" \
+    </dev/null >/dev/tty 2>/dev/null
