@@ -1,29 +1,180 @@
 #!/usr/bin/env bash
-# md-view: render markdown to PDF via pandoc, view in terminal (kitty graphics).
-# Font size tunable via $MDVIEW_FONTSIZE (default 14pt). Uses extarticle class
-# to allow >12pt sizes.
+# md-view: render a markdown note and read it in the terminal (kitty graphics).
+#
+# Default engine is typst, which compiles the same note about 30x faster than
+# the TeX path (0.3s vs 9.5s on a 2700-word note) with equally good maths. The
+# page is sized to the aspect ratio of this terminal rather than to paper, so
+# one page is one screenful in doc-view and `j` reads like scrolling.
+#
+# env
+#   MDVIEW_ENGINE    typst (default) | tectonic
+#   MDVIEW_FONTSIZE  apparent text size, 10|11|12|14|17|20 (default 14pt).
+#                    Under typst this sets the measure: bigger text, fewer
+#                    characters per line. Passed through as-is to tectonic.
+#   MDVIEW_THEME     light (default) | dark
+#   MDVIEW_COLUMNS   1 (default) | 2. Two columns fit far more on a wide
+#                    window, but a long line of code cannot wrap and will
+#                    overflow a narrow column.
+#   MDVIEW_JUSTIFY   1 (default) | 0. Notes dense with inline code justify
+#                    badly, because a code span cannot hyphenate; 0 gives
+#                    ragged right and even word spacing.
+#   MDVIEW_ASPECT    override the width:height ratio of the page, e.g. 1.6
+#   MDVIEW_KEEP      keep the generated PDF and print its path
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: md-view FILE.md [pandoc-args...]" >&2
-  echo "env:   MDVIEW_FONTSIZE=14pt  (10|11|12|14|17|20)" >&2
-  exit 1
+    cat >&2 <<'MSG'
+usage: md-view FILE.md [pandoc-args...]
+env:   MDVIEW_ENGINE=typst|tectonic  MDVIEW_FONTSIZE=14pt
+       MDVIEW_THEME=light|dark  MDVIEW_COLUMNS=1|2  MDVIEW_ASPECT=1.6
+MSG
+    exit 1
 fi
 
 in="$1"; shift
+[[ -f "$in" ]] || { echo "md-view: no such file: $in" >&2; exit 1; }
+
 out="$(mktemp -t mdview-XXXXXX.pdf)"
-trap 'rm -f "$out"' EXIT
+typ=""
+cleanup() {
+    rm -f "$typ" "$typ.err"
+    [[ -z "${MDVIEW_KEEP:-}" ]] && rm -f "$out"
+    return 0
+}
+trap cleanup EXIT
 
 fontsize="${MDVIEW_FONTSIZE:-14pt}"
+engine="${MDVIEW_ENGINE:-typst}"
 
-engine="${MDVIEW_ENGINE:-tectonic}"
+# Notes are not papers: "@270 epochs" is an epoch count, not a citation key,
+# and pandoc's citation extension turns it into one, which then fails to
+# compile for want of a bibliography.
+from="${MDVIEW_FROM:-markdown-citations}"
+
+render_tectonic() {
+    pandoc "$in" \
+        -f "$from" \
+        --pdf-engine=tectonic \
+        -V documentclass=extarticle \
+        -V fontsize="$fontsize" \
+        -V geometry:margin=0.6in \
+        "$@" \
+        -o "$out"
+}
+
+if [[ "$engine" == tectonic ]]; then
+    render_tectonic "$@"
+    [[ -n "${MDVIEW_KEEP:-}" ]] && echo "$out" >&2
+    exec doc-view "$out"
+fi
+
+# ---------------------------------------------------------------- geometry ---
+# A terminal cell is about twice as tall as it is wide, so the window's aspect
+# ratio in pixels is cols / (2 * rows). Matching the page to it means doc-view
+# scales the page to fill the pane exactly, with no letterboxing.
+cols=$(tput cols 2>/dev/null || echo 100)
+rows=$(tput lines 2>/dev/null || echo 30)
+aspect="${MDVIEW_ASPECT:-}"
+if [[ -z "$aspect" ]]; then
+    aspect=$(awk -v c="$cols" -v r="$rows" 'BEGIN{a=c/(2*r); if(a<0.6)a=0.6; if(a>3.2)a=3.2; printf "%.4f", a}')
+fi
+
+# The page is 1000pt wide by definition; only ratios reach the screen, since
+# doc-view rescales whatever it is given. Everything else follows from that.
+page_w=1000
+page_h=$(awk -v a="$aspect" 'BEGIN{printf "%d", 1000/a}')
+margin_x=44
+margin_y=$(awk -v h="$page_h" 'BEGIN{m=h*0.045; if(m<20)m=20; printf "%d", m}')
+columns="${MDVIEW_COLUMNS:-1}"
+justify=true
+[[ "${MDVIEW_JUSTIFY:-1}" == 0 ]] && justify=false
+
+# Apparent size: MDVIEW_FONTSIZE is a familiar knob from the TeX path, so keep
+# it, and convert it to a measure. 14pt -> 115 characters per line, 17 -> 95,
+# 20 -> 80; larger text simply means fewer characters across.
+size_num="${fontsize%pt}"
+measure=$(awk -v s="$size_num" 'BEGIN{m=1610/s; if(m<50)m=50; if(m>200)m=200; printf "%d", m}')
+text_w=$(awk -v w="$page_w" -v m="$margin_x" -v c="$columns" \
+    'BEGIN{t=w-2*m; if(c>1) t=(t-18*(c-1))/c; printf "%.2f", t}')
+# Calibrated against rendered output: an average glyph in Libertinus at these
+# sizes measures 0.43 of its point size, so the size that actually delivers
+# `measure` characters across the text block is width / (0.43 * measure).
+# Measured back with pdftotext, a request for 115 lands within a character or
+# two of 115.
+font_pt=$(awk -v t="$text_w" -v m="$measure" 'BEGIN{printf "%.2f", t/(0.43*m)}')
+
+# ------------------------------------------------------------------ colours --
+case "${MDVIEW_THEME:-light}" in
+    dark)
+        bg=1b1d1e; fg=e6e3dd; fg2=b9b5ac; accent=8fb8d8
+        codebg=26292b; border=3a3e40; link=8fb8d8; rule=4a4e50 ;;
+    *)
+        bg=fdfcf9; fg=1b1b1b; fg2=4a4a4a; accent=2c5f8a
+        codebg=f1efe8; border=ddd9cf; link=2c5f8a; rule=c9c4b8 ;;
+esac
+
+TEMPLATE="${MDVIEW_TEMPLATE:-$HOME/.config/mdview/mdview.typ}"
+[[ -f "$TEMPLATE" ]] || { echo "md-view: template missing: $TEMPLATE" >&2; exit 1; }
+
+typ="$(mktemp -t mdview-XXXXXX.typ)"
 
 pandoc "$in" \
-  --pdf-engine="$engine" \
-  -V documentclass=extarticle \
-  -V fontsize="$fontsize" \
-  -V geometry:margin=0.6in \
-  "$@" \
-  -o "$out"
+    -f "$from" \
+    -t typst \
+    --standalone \
+    --template="$TEMPLATE" \
+    -V pagewidth="$page_w" \
+    -V pageheight="$page_h" \
+    -V marginx="$margin_x" \
+    -V marginy="$margin_y" \
+    -V columns="$columns" \
+    -V justify="$justify" \
+    -V fontsize="$font_pt" \
+    -V bg="$bg" -V fg="$fg" -V fg2="$fg2" -V accent="$accent" \
+    -V codebg="$codebg" -V border="$border" -V link="$link" -V rule="$rule" \
+    "$@" \
+    -o "$typ"
 
-doc-view "$out"
+# Three repairs to what pandoc's typst writer emits, all seen on real notes:
+#
+#   ∥x∥_F^2   bare norm bars, so the script attaches to the closing bar
+#             instead of to the whole norm. lr() restores the grouping and
+#             makes the bars stretch.
+#   sqrt()    from a literal \sqrt{} in the source; typst rejects an empty
+#             radicand.
+#   ^l med    a one-character script followed by a spacing macro is emitted
+#             with no separator, so typst reads the identifier "lmed".
+#
+# The norm bar is written \x{2225} rather than literally: -CSD decodes the
+# file being edited but not the literals in the program text, so a pasted ∥
+# would be compared as raw bytes against a decoded character and never match.
+perl -CSD -i -pe '
+    s/\x{2225}([^\x{2225}\n]*)\x{2225}/lr(\x{2225}$1\x{2225})/g;
+    s/\bsqrt\(\)/sqrt(" ")/g;
+    s/([_^])([A-Za-z0-9])(med|thin|thick|quad)\b/$1$2 $3/g;
+' "$typ"
+
+# Relative image paths in the generated source would resolve against the
+# temporary file's directory, not the note's, so a note that embeds a figure
+# compiles to "file not found". Rewrite them to absolute paths; --root /
+# below is what makes those loadable.
+srcdir=$(cd "$(dirname "$in")" && pwd)
+perl -CSD -i -pe '
+    BEGIN { $d = shift @ARGV }
+    s{(image\(\s*")([^"/][^"]*)(")}{$1 . $d . "/" . $2 . $3}ge;
+' "$srcdir" "$typ"
+
+# A viewer should never simply refuse to show a note. If typst trips over
+# something in the generated source, say so and fall back to the slow path
+# rather than leaving the reader with nothing.
+if ! typst compile --root / "$typ" "$out" 2>"$typ.err"; then
+    sed 's/^/typst: /' "$typ.err" >&2
+    rm -f "$typ.err"
+    echo "md-view: typst failed on this note; falling back to tectonic" >&2
+    render_tectonic "$@"
+else
+    rm -f "$typ.err"
+fi
+
+[[ -n "${MDVIEW_KEEP:-}" ]] && echo "$out" >&2
+exec doc-view "$out"
