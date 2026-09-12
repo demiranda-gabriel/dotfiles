@@ -27,6 +27,13 @@
 #   -t WALL   walltime        (default 08:00:00)
 #   -C CON    --constraint    (default a100; pass -C '' to drop)
 #   -J NAME   job name        (default hq-worker)
+#   -b WHEN   --begin=WHEN, deferring the allocation until then (default: now).
+#             Use it to queue a SUCCESSOR lane that takes over as a running one
+#             expires, without both holding GPUs at once:
+#               hq-fleet up -g 2 -R lane/a100x2,lane/safe -b 2026-09-12T22:38:10
+#             NB a deferred job accrues no age priority until WHEN, so it can
+#             start later than WHEN -- leave an hour of lead, and treat the
+#             handover as best-effort rather than seamless.
 #   -R TAGS   lane tags, comma-separated (default none). Each becomes an HQ
 #             marker resource on this allocation's worker(s), so tasks can be
 #             steered to a specific lane instead of landing on whichever worker
@@ -59,13 +66,13 @@ ssh_srv() {  # run an hq client command on the server node via the ssh bridge
 }
 
 cmd_up() {
-    local PART=gpu_requeue N=1 G=1 C=16 MEM=64G WALL=08:00:00 CON=a100 JN="$WORKER_JOBNAME" LANES=""
+    local PART=gpu_requeue N=1 G=1 C=16 MEM=64G WALL=08:00:00 CON=a100 JN="$WORKER_JOBNAME" LANES="" BEGIN=""
     local OPTIND opt
-    while getopts "p:N:g:c:m:t:C:J:R:" opt; do
+    while getopts "p:N:g:c:m:t:C:J:R:b:" opt; do
         case $opt in
             p) PART=$OPTARG;;  N) N=$OPTARG;;  g) G=$OPTARG;;  c) C=$OPTARG;;
             m) MEM=$OPTARG;;   t) WALL=$OPTARG;; C) CON=$OPTARG;; J) JN=$OPTARG;;
-            R) LANES=$OPTARG;;
+            R) LANES=$OPTARG;; b) BEGIN=$OPTARG;;
             *) echo "hq-fleet up: bad option" >&2; return 1;;
         esac
     done
@@ -95,12 +102,13 @@ cmd_up() {
     fi
     export HQ_LANE_RESOURCES
 
-    local con_flag=()
+    local con_flag=() begin_flag=()
     [[ -n "$CON" ]] && con_flag=(--constraint="$CON")
-    echo "submitting worker allocation: part=$PART nodes=$N gpus/node=$G cpus=$C mem=$MEM wall=$WALL constraint=${CON:-none} lanes=${LANES:-none}"
+    [[ -n "$BEGIN" ]] && begin_flag=(--begin="$BEGIN")
+    echo "submitting worker allocation: part=$PART nodes=$N gpus/node=$G cpus=$C mem=$MEM wall=$WALL constraint=${CON:-none} lanes=${LANES:-none} begin=${BEGIN:-now}"
     local jid
     jid=$(sbatch --parsable --export=ALL -J "$JN" -p "$PART" -N "$N" --gres=gpu:"$G" \
-            -c "$C" --mem="$MEM" -t "$WALL" "${con_flag[@]}" "$WORKER_SBATCH") \
+            -c "$C" --mem="$MEM" -t "$WALL" "${con_flag[@]}" "${begin_flag[@]}" "$WORKER_SBATCH") \
         || { echo "ERROR: sbatch failed" >&2; return 1; }
     echo "submitted worker job $jid (watch: squeue -j $jid; workers attach once it starts)"
     if [[ -n "$LANES" ]]; then
@@ -142,5 +150,5 @@ case "${1:-}" in
     up)     shift; cmd_up "$@";;
     status) cmd_status;;
     down)   shift; cmd_down "$@";;
-    *) echo "usage: hq-fleet {up [-p part -N n -g gpus -c cpus -m mem -t wall -C constraint -J name -R lanetags] | status | down [--all]}"; exit 1;;
+    *) echo "usage: hq-fleet {up [-p part -N n -g gpus -c cpus -m mem -t wall -C constraint -J name -R lanetags -b begintime] | status | down [--all]}"; exit 1;;
 esac

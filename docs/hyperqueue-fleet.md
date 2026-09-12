@@ -360,6 +360,29 @@ hq submit --resource lane/a100x1=1 --resource gpus/nvidia=1 -- python eval.py
 - Untagged tasks still float onto any worker, tagged lanes included. Reserving a
   wide lane only works if every task carries a tag.
 
+### Rolling a lane over (`-b`)
+
+A lane dies at its walltime and its GPUs go back to the pool. To keep coverage
+without two lanes holding GPUs at once, queue the successor deferred to shortly
+before the incumbent expires:
+
+```bash
+end=$(squeue -h -j 46121189 -o %e)                     # 2026-09-12T23:38:10
+begin=$(date -d "@$(( $(date -d "${end/T/ }" +%s) - 3600 ))" +%Y-%m-%dT%H:%M:%S)
+hq-fleet up -p gpu,seas_gpu -g 2 -c 24 -m 192G -t 1-00:00:00 \
+           -R lane/a100x2,lane/safe -b "$begin"
+```
+
+- A deferred job shows `(BeginTime)` in squeue and **accrues no age priority
+  until then**, so it can start well after the begin time. Treat the handover as
+  best-effort: leave an hour of lead, and accept that a late successor means HQ
+  tasks wait for a worker rather than migrating seamlessly.
+- Give the successor the **same `-R` tags** as the lane it replaces, or tasks
+  pinned to those tags will not follow it.
+- `date -d "2026-09-12T23:38:10 -1 hour"` does **not** subtract an hour — after
+  an ISO timestamp, `-1` parses as a UTC offset. Convert to epoch, subtract,
+  convert back (as above).
+
 ### Partition map (FASRC)
 
 | Lane | Partition | Notes |
