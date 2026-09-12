@@ -74,6 +74,7 @@ if [[ "$HQ_SCHED" == slurm ]]; then
 
     link_script "$DIR/slurm/hq-server-up" hq-server-up
     link_script "$DIR/slurm/hq-fleet"     hq-fleet
+    link_script "$DIR/slurm/hq-gpus"      hq-gpus
 
     render_slurm() {  # render_slurm <template> <dest>
         sed -e "s|__SRV_PART__|$HQ_SRV_PART|g" \
@@ -103,7 +104,7 @@ if [[ "$HQ_SCHED" == slurm ]]; then
        hq-fleet up -p gpu_requeue  -N 2 -g 4              # +2 preemptable nodes
   5. Submit work (ssh-bridged to the server node automatically):
        hq submit --resource gpus/nvidia=1 -- python train.py
-       hq job list ; hq-fleet status
+       hq job list ; hq-fleet status ; hq-gpus
   6. Tear down when done:
        hq-fleet down            # stop workers
        hq-fleet down --all      # stop workers + server

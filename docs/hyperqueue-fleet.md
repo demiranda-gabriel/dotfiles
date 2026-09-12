@@ -292,9 +292,38 @@ hq-fleet up -p kozinsky_gpu -g 4 -t 1-00:00:00  # a whole lab A100 node, guarant
 hq-fleet up -p gpu_requeue  -N 2 -g 4           # +2 preemptable nodes (stacks)
 hq submit --resource gpus/nvidia=1 -- python train.py
 hq job list ; hq-fleet status
+hq-gpus                  # what every attached GPU is doing (see below)
 hq-fleet down            # stop workers
 hq-fleet down --all      # stop workers + server
 ```
+
+### `hq-gpus` — what the GPUs are doing
+
+`hq-fleet status` answers "which allocations exist"; `hq-gpus` answers "is
+anything actually using them". One row per attached worker:
+
+```
+HQ lanes — server holy8a30101  (job 45484533, 2-15:26:48 left)
+
+  WORKER  LANE         SLURM     PARTITION  NODE            GPU  STATUS               ALLOC LEFT
+  ------  -----------  --------  ---------  --------------  ---  -------------------  ----------
+  8       a100x1,safe  46121187  gpu        holygpu8a22604  1/1  probe-a1 (#7.0, 1m)  23:29:30
+  9       a100x2,safe  46121189  gpu        holygpu8a22604  0/2  idle (up 30m)        23:29:30
+
+  4 worker(s) · 9 GPU(s) · 5 busy / 4 idle
+  queued lanes: 8 (2x gpu_h200,seas_gpu, 5x gpu_requeue, 1x kozinsky_gpu)
+  waiting tasks: 1  (no attached worker satisfies them)
+```
+
+`GPU` is busy/total on that worker, `STATUS` names the HQ job holding them
+(`name (#job.task, age)`) or how long the lane has sat idle, and `ALLOC LEFT` is
+the SLURM walltime remaining — idle GPUs with hours left are wasted allocation.
+The **waiting tasks** line is the one to watch after using `-R`: a task tagged
+for a lane that has not started yet waits forever rather than running elsewhere.
+
+`-w [SECONDS]` refreshes in place (default 15); `--json` emits the joined model.
+It joins `hq worker list`/`job list`/`job info` in a single ssh round trip with
+local `squeue`, so a snapshot costs ~3s and one ssh.
 
 `hq-fleet up` auto-starts the server (idempotent — reused across calls) and
 **stacks**: call it repeatedly to mix lanes (e.g. one guaranteed

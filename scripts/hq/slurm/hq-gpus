@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""hq-gpus — what every GPU in the HyperQueue lanes is doing right now.
+
+One row per attached worker (one SLURM allocation = one lane): how many of its
+GPUs are busy, which HQ job holds them, and how long the allocation has left.
+Queued lanes and tasks that no worker can satisfy are summarised underneath.
+
+FASRC topology: the HQ server lives on a compute node and the client is an ssh
+bridge (see shell/42-fasrc-hq.sh), so this reads ~/.hq/server-node and runs the
+three `hq` queries in a single ssh round trip. squeue is read locally.
+
+Usage:
+  hq-gpus                 one snapshot
+  hq-gpus -w [SECONDS]    refresh every SECONDS (default 15) until Ctrl-C
+  hq-gpus --json          the joined model, for scripting
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HQDIR = os.path.expanduser("~/.hq")
+WORKER_JOBNAME = "hq-worker"
+SERVER_JOBNAME = "hq-server"
+UNIT = 10000  # HQ stores resource amounts as fixed point: 1 unit == 10000
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def server_node() -> str:
+    try:
+        with open(os.path.join(HQDIR, "server-node")) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def hq_snapshot(node: str):
+    """Fetch worker list, job list and job info in ONE ssh round trip."""
+    remote = (
+        'PATH=$HOME/.local/bin:$PATH\n'
+        'echo "@@WORKERS"; hq --output-mode=json worker list\n'
+        'echo "@@JOBS";    hq --output-mode=json job list --all\n'
+        'ids=$(hq --output-mode=json job list --all | python3 -c '
+        '"import json,sys; print(\\",\\".join(str(j[\'id\']) for j in json.load(sys.stdin)))")\n'
+        'echo "@@INFO"; [ -n "$ids" ] && hq --output-mode=json job info "$ids" || echo "[]"\n'
+    )
+    p = run(["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=10", node, remote], timeout=60)
+    if p.returncode != 0:
+        raise RuntimeError(f"ssh to {node} failed: {p.stderr.strip() or p.stdout.strip()}")
+    out = {}
+    key = None
+    buf: list[str] = []
+    for line in p.stdout.splitlines():
+        if line.startswith("@@"):
+            if key:
+                out[key] = "\n".join(buf)
+            key, buf = line[2:], []
+        elif key:
+            buf.append(line)
+    if key:
+        out[key] = "\n".join(buf)
+
+    def parse(k):
+        try:
+            return json.loads(out.get(k, "") or "[]")
+        except json.JSONDecodeError:
+            return []
+
+    return parse("WORKERS"), parse("JOBS"), parse("INFO")
+
+
+def squeue_lanes():
+    """SLURM view of the lane allocations, keyed by job id."""
+    p = run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-n", WORKER_JOBNAME,
+             "-o", "%i|%P|%T|%L|%N|%b"])
+    lanes = {}
+    for line in p.stdout.splitlines():
+        f = line.split("|")
+        if len(f) >= 6:
+            lanes[f[0]] = dict(jobid=f[0], partition=f[1], state=f[2],
+                               left=f[3], node=f[4], gres=f[5])
+    return lanes
+
+
+def server_alloc():
+    p = run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-n", SERVER_JOBNAME,
+             "-t", "R", "-o", "%i|%L|%N"])
+    line = p.stdout.strip().splitlines()
+    if not line:
+        return None
+    jid, left, node = line[0].split("|")[:3]
+    return dict(jobid=jid, left=left, node=node)
+
+
+def res_amount(res_list, name):
+    """GPU/lane amount a worker provides for `name` (0 if absent)."""
+    for r in res_list:
+        if r.get("name") != name:
+            continue
+        if r.get("kind") == "list":
+            return len(r.get("values", []))
+        if r.get("kind") == "sum":
+            return r.get("size", 0) // UNIT
+        if r.get("kind") == "groups":
+            return sum(len(g) for g in r.get("groups", []))
+    return 0
+
+
+def req_amount(entry):
+    """GPUs a job asks for per task, from its submit spec."""
+    for variant in entry.get("submits", [{}])[0].get("array", {}).get("resources", []):
+        for r in variant.get("resources", []):
+            if r.get("resource") == "gpus/nvidia":
+                req = r.get("request")
+                if isinstance(req, dict):
+                    for v in req.values():
+                        if isinstance(v, (int, float)):
+                            return int(v) // UNIT
+                    return 1  # {"All": null}
+    return 0
+
+
+def age(iso: str) -> str:
+    if not iso:
+        return ""
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    s = int((datetime.now(timezone.utc) - t).total_seconds())
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d{(s % 86400) // 3600:02d}h"
+
+
+def build():
+    node = server_node()
+    if not node:
+        raise RuntimeError("no HQ server recorded (~/.hq/server-node is empty).\n"
+                           "Start one first:  hq-fleet up")
+    workers, jobs, infos = hq_snapshot(node)
+    lanes = squeue_lanes()
+
+    jobname = {j["id"]: j["name"] for j in jobs}
+    jobgpus = {e["info"]["id"]: req_amount(e) for e in infos}
+    waiting = sum(j.get("task_stats", {}).get("waiting", 0) for j in jobs)
+
+    # worker id -> running tasks, from each job's task list
+    running: dict[int, list] = {}
+    for entry in infos:
+        jid = entry["info"]["id"]
+        for t in entry.get("tasks", []):
+            if t.get("state") == "running" and t.get("worker") is not None:
+                running.setdefault(t["worker"], []).append(
+                    dict(job=jid, name=jobname.get(jid, "?"), task=t.get("id", 0),
+                         since=t.get("started_at", "")))
+
+    rows = []
+    for w in workers:
+        if w.get("ended"):
+            continue
+        cfg = w.get("configuration", {})
+        res = cfg.get("resources", {}).get("resources", [])
+        alloc = str(w.get("allocation", {}).get("id", "") or "")
+        lanetags = [r["name"] for r in res if r.get("name", "").startswith("lane/")]
+        gpus = res_amount(res, "gpus/nvidia")
+        tasks = running.get(w["id"], [])
+        used = sum(jobgpus.get(t["job"], 0) for t in tasks)
+        sq = lanes.get(alloc, {})
+        rows.append(dict(
+            worker=w["id"], alloc=alloc, lanes=lanetags, gpus=gpus, used=min(used, gpus),
+            node=cfg.get("hostname", "").split(".")[0],
+            partition=sq.get("partition", "?"), left=sq.get("left", "?"),
+            up=age(w.get("started", "")), tasks=tasks,
+        ))
+    rows.sort(key=lambda r: r["worker"])
+
+    queued = [l for l in lanes.values() if l["state"] != "RUNNING"]
+    return dict(server=dict(node=node, alloc=server_alloc()), workers=rows,
+                queued=queued, waiting_tasks=waiting)
+
+
+def render(m) -> str:
+    out = []
+    srv = m["server"]["alloc"]
+    out.append("HQ lanes — server {}{}".format(
+        m["server"]["node"],
+        f"  (job {srv['jobid']}, {srv['left']} left)" if srv else "  (allocation not found)"))
+    out.append("")
+
+    rows = m["workers"]
+    if not rows:
+        out.append("  no workers attached")
+    else:
+        hdr = ("WORKER", "LANE", "SLURM", "PARTITION", "NODE", "GPU", "STATUS", "ALLOC LEFT")
+        table = [hdr]
+        for r in rows:
+            if r["tasks"]:
+                st = ", ".join("{} (#{}.{}, {})".format(t["name"], t["job"], t["task"], age(t["since"]))
+                               for t in r["tasks"])
+            else:
+                st = f"idle (up {r['up']})"
+            lane = ",".join(n.split("/", 1)[1] for n in r["lanes"]) or "-"
+            table.append((str(r["worker"]), lane, r["alloc"], r["partition"], r["node"],
+                          f"{r['used']}/{r['gpus']}", st, r["left"]))
+        w = [max(len(row[i]) for row in table) for i in range(len(hdr))]
+        for i, row in enumerate(table):
+            out.append("  " + "  ".join(c.ljust(w[j]) for j, c in enumerate(row)).rstrip())
+            if i == 0:
+                out.append("  " + "  ".join("-" * w[j] for j in range(len(hdr))))
+
+    tot = sum(r["gpus"] for r in rows)
+    busy = sum(r["used"] for r in rows)
+    out.append("")
+    out.append(f"  {len(rows)} worker(s) · {tot} GPU(s) · {busy} busy / {tot - busy} idle")
+    if m["queued"]:
+        by = {}
+        for q in m["queued"]:
+            by[q["partition"]] = by.get(q["partition"], 0) + 1
+        out.append("  queued lanes: {} ({})".format(
+            len(m["queued"]), ", ".join(f"{n}x {p}" for p, n in sorted(by.items()))))
+    if m["waiting_tasks"]:
+        out.append(f"  waiting tasks: {m['waiting_tasks']}  (no attached worker satisfies them)")
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="What every GPU in the HyperQueue lanes is doing.")
+    ap.add_argument("-w", "--watch", nargs="?", const=15, type=int, metavar="SECONDS",
+                    help="refresh every SECONDS (default 15) until Ctrl-C")
+    ap.add_argument("--json", action="store_true", help="emit the joined model as JSON")
+    a = ap.parse_args()
+
+    while True:
+        try:
+            model = build()
+            text = json.dumps(model, indent=2) if a.json else render(model)
+        except Exception as exc:              # noqa: BLE001 - surface, don't trace
+            if not a.watch:
+                print(f"hq-gpus: {exc}", file=sys.stderr)
+                return 1
+            text = f"hq-gpus: {exc}"
+        if a.watch:
+            print("\033[2J\033[H" + text + f"\n\n  refreshed {time.strftime('%H:%M:%S')}"
+                  f" — every {a.watch}s, Ctrl-C to stop", flush=True)
+            try:
+                time.sleep(a.watch)
+            except KeyboardInterrupt:
+                print()
+                return 0
+        else:
+            print(text)
+            return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
