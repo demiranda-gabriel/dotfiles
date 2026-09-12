@@ -26,13 +26,25 @@
 # possibly-updated access file). `hq-fleet down` scancels the job to stop it.
 export PATH=$HOME/.local/bin:$PATH
 
+# Per-host knobs; never overwritten by install.sh. HQ_WORKER_RESOURCES holds
+# extra `hq worker start` args applied to EVERY worker (accelerators HQ cannot
+# auto-detect, say). Tokens are word-split, so no spaces within a single value.
+[[ -f __HQDIR__/fleet.env ]] && . __HQDIR__/fleet.env
+
+# HQ_LANE_RESOURCES is per-ALLOCATION, exported by `hq-fleet up -R` (see that
+# script). It tags this worker with marker resources such as
+# `--resource lane/a100x4=sum(1000)`, so `hq submit --resource lane/a100x4=1`
+# can steer a task to this lane instead of landing on whichever worker is idle.
+
 GPN="${SLURM_GPUS_ON_NODE:-0}"
 [[ "$GPN" -gt 0 ]] && SRUN_GRES="--gres=gpu:$GPN" || SRUN_GRES=""
 echo "[hq-worker] job=${SLURM_JOB_ID:-?} nodes=${SLURM_NNODES:-1} gpus/node=$GPN nodelist=${SLURM_JOB_NODELIST:-?}"
+echo "[hq-worker] lane resources:${HQ_LANE_RESOURCES:- none}${HQ_WORKER_RESOURCES:+ (+global: $HQ_WORKER_RESOURCES)}"
 
 while true; do
     srun --ntasks="${SLURM_NNODES:-1}" --ntasks-per-node=1 $SRUN_GRES \
-        hq worker start --on-server-lost finish-running --manager slurm
+        hq worker start --on-server-lost finish-running --manager slurm \
+            ${HQ_WORKER_RESOURCES:-} ${HQ_LANE_RESOURCES:-}
     echo "$(date): worker(s) exited; retry in 30s (server move/restart?)"
     sleep 30
 done

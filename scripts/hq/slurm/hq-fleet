@@ -27,6 +27,21 @@
 #   -t WALL   walltime        (default 08:00:00)
 #   -C CON    --constraint    (default a100; pass -C '' to drop)
 #   -J NAME   job name        (default hq-worker)
+#   -R TAGS   lane tags, comma-separated (default none). Each becomes an HQ
+#             marker resource on this allocation's worker(s), so tasks can be
+#             steered to a specific lane instead of landing on whichever worker
+#             happens to be idle — HQ has no size affinity, so without tags a
+#             1-GPU task can occupy a 4-GPU worker and starve a 4-GPU task.
+#               hq-fleet up -g 4 -R lane/a100x4
+#               hq submit --resource lane/a100x4=1 --resource gpus/nvidia=4 -- ...
+#             A bare tag expands to TAG=sum(1000) (a shared marker, so the tag
+#             never limits concurrency — GPUs do). A tag containing '=' is
+#             passed to `hq worker start --resource` verbatim, so the full HQ
+#             descriptor syntax is available: -R 'lane/big=sum(200)'.
+#             HQ resource names accept ONLY letters, digits and '/' — an
+#             underscore or hyphen makes `hq worker start` refuse to boot, and
+#             the allocation would fail days later when it finally starts, so
+#             the names are validated here at submit time instead.
 set -uo pipefail
 
 HQDIR="$HOME/.hq"
@@ -44,12 +59,13 @@ ssh_srv() {  # run an hq client command on the server node via the ssh bridge
 }
 
 cmd_up() {
-    local PART=gpu_requeue N=1 G=1 C=16 MEM=64G WALL=08:00:00 CON=a100 JN="$WORKER_JOBNAME"
+    local PART=gpu_requeue N=1 G=1 C=16 MEM=64G WALL=08:00:00 CON=a100 JN="$WORKER_JOBNAME" LANES=""
     local OPTIND opt
-    while getopts "p:N:g:c:m:t:C:J:" opt; do
+    while getopts "p:N:g:c:m:t:C:J:R:" opt; do
         case $opt in
             p) PART=$OPTARG;;  N) N=$OPTARG;;  g) G=$OPTARG;;  c) C=$OPTARG;;
             m) MEM=$OPTARG;;   t) WALL=$OPTARG;; C) CON=$OPTARG;; J) JN=$OPTARG;;
+            R) LANES=$OPTARG;;
             *) echo "hq-fleet up: bad option" >&2; return 1;;
         esac
     done
@@ -59,15 +75,41 @@ cmd_up() {
     echo "ensuring HQ server is up ..."
     hq-server-up || { echo "ERROR: could not bring up the server" >&2; return 1; }
 
+    # Lane tags -> `hq worker start --resource` args, handed to the worker job
+    # through the environment (sbatch --export=ALL). worker.sbatch appends
+    # $HQ_LANE_RESOURCES to its `hq worker start` line.
+    local HQ_LANE_RESOURCES="" tag name
+    if [[ -n "$LANES" ]]; then
+        local -a tags; IFS=, read -r -a tags <<< "$LANES"
+        for tag in "${tags[@]}"; do
+            [[ -z "$tag" ]] && continue
+            [[ "$tag" == *=* ]] || tag="$tag=sum(1000)"
+            name=${tag%%=*}
+            if [[ ! "$name" =~ ^[A-Za-z0-9/]+$ ]]; then
+                echo "ERROR: lane tag '$name' is not a valid HQ resource name." >&2
+                echo "       Only letters, digits and '/' are accepted (e.g. lane/a100x4)." >&2
+                return 1
+            fi
+            HQ_LANE_RESOURCES+=" --resource $tag"
+        done
+    fi
+    export HQ_LANE_RESOURCES
+
     local con_flag=()
     [[ -n "$CON" ]] && con_flag=(--constraint="$CON")
-    echo "submitting worker allocation: part=$PART nodes=$N gpus/node=$G cpus=$C mem=$MEM wall=$WALL constraint=${CON:-none}"
+    echo "submitting worker allocation: part=$PART nodes=$N gpus/node=$G cpus=$C mem=$MEM wall=$WALL constraint=${CON:-none} lanes=${LANES:-none}"
     local jid
-    jid=$(sbatch --parsable -J "$JN" -p "$PART" -N "$N" --gres=gpu:"$G" \
+    jid=$(sbatch --parsable --export=ALL -J "$JN" -p "$PART" -N "$N" --gres=gpu:"$G" \
             -c "$C" --mem="$MEM" -t "$WALL" "${con_flag[@]}" "$WORKER_SBATCH") \
         || { echo "ERROR: sbatch failed" >&2; return 1; }
     echo "submitted worker job $jid (watch: squeue -j $jid; workers attach once it starts)"
-    echo "then submit tasks, e.g.:  hq submit --resource gpus/nvidia=1 -- python train.py"
+    if [[ -n "$LANES" ]]; then
+        echo "lane resources:$HQ_LANE_RESOURCES"
+        local first=${LANES%%,*}; first=${first%%=*}
+        echo "target this lane:  hq submit --resource $first=1 --resource gpus/nvidia=$G -- python train.py"
+    else
+        echo "then submit tasks, e.g.:  hq submit --resource gpus/nvidia=1 -- python train.py"
+    fi
 }
 
 cmd_status() {
@@ -100,5 +142,5 @@ case "${1:-}" in
     up)     shift; cmd_up "$@";;
     status) cmd_status;;
     down)   shift; cmd_down "$@";;
-    *) echo "usage: hq-fleet {up [-p part -N n -g gpus -c cpus -m mem -t wall -C constraint -J name] | status | down [--all]}"; exit 1;;
+    *) echo "usage: hq-fleet {up [-p part -N n -g gpus -c cpus -m mem -t wall -C constraint -J name -R lanetags] | status | down [--all]}"; exit 1;;
 esac

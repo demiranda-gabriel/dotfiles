@@ -301,19 +301,60 @@ hq-fleet down --all      # stop workers + server
 `kozinsky_gpu` node + several preemptable `gpu_requeue` nodes), all attached to
 the same server.
 
+### Steering tasks to a lane (`-R`)
+
+HQ places a task on any worker whose resources satisfy the request, with **no
+size affinity**. With mixed allocations attached, a 1-GPU task can therefore
+occupy a 4-GPU worker and starve a task that needs all four. `-R` fixes this by
+tagging an allocation's workers with marker resources:
+
+```bash
+hq-fleet up -p gpu_requeue -g 4 -c 48 -m 384G -R lane/a100x4
+hq-fleet up -p gpu_requeue -g 1 -c 12 -m 96G  -R lane/a100x1
+
+hq submit --resource lane/a100x4=1 --resource gpus/nvidia=4 -- python train.py
+hq submit --resource lane/a100x1=1 --resource gpus/nvidia=1 -- python eval.py
+```
+
+- A bare tag expands to `TAG=sum(1000)`, a shared marker — it never limits
+  concurrency, the GPUs do. A tag containing `=` is passed to
+  `hq worker start --resource` verbatim, so the full HQ descriptor syntax is
+  available (`-R 'lane/big=sum(200)'`). Several tags: `-R lane/a100x4,lane/fast`.
+- **HQ resource names accept only letters, digits and `/`.** An underscore or
+  hyphen makes `hq worker start` refuse to boot — which would surface days
+  later, when the allocation finally starts. `hq-fleet` validates the names at
+  submit time and refuses instead.
+- Tags travel to the job as `HQ_LANE_RESOURCES` (`sbatch --export=ALL`);
+  `worker.sbatch` appends them, together with the global `HQ_WORKER_RESOURCES`
+  from `fleet.env`, to `hq worker start`. `hq worker list` shows them in the
+  Resources column.
+- Untagged tasks still float onto any worker, tagged lanes included. Reserving a
+  wide lane only works if every task carries a tag.
+
 ### Partition map (FASRC)
 
 | Lane | Partition | Notes |
 |---|---|---|
 | server | `sapphire` (3-day) | tiny CPU alloc; **self-chains** — queues a dependent successor at startup, so it's effectively immortal despite the 3-day cap. sapphire is the only instant, non-preempting CPU partition (kozinsky/intermediate jam, unrestricted preempts). `HQ_SRV_*` knobs switch it |
 | guaranteed GPUs | `kozinsky_gpu` (7-day) | lab-owned, only 2× (4×A100-80GB) nodes — don't monopolize |
-| preemptable GPUs | `gpu_requeue` (3-day) | plentiful A100 pool; preempted tasks rerun (`--crash-limit`) |
-| quick test | `gpu_test` (12h) | stricter: needs `-c <8` and `-m <64000M` per GPU |
+| guaranteed GPUs | `gpu` (3-day), `seas_gpu` (**2-day**) | 36× (4×A100-80GB) and 61 mixed A100-80GB/H200 nodes; pass a comma list so the job takes whichever frees first |
+| H200 | `gpu_h200` (3-day) | 22× (4×H200), 112 CPU / 1031 GB per node; `seas_gpu` also holds H200 nodes (`-C h200`) |
+| preemptable GPUs | `gpu_requeue` (3-day) | plentiful pool, every GPU type; preempted tasks rerun (`--crash-limit`) |
+| quick test | `gpu_test` (12h) | MIG `a100_3g.20gb` slices; stricter: needs `-c <8` and `-m <64000M` per GPU |
 
 ### FASRC gotchas
 
 - **No constraint directive** in `worker.sbatch`: `hq-fleet` passes
   `--constraint` (default `a100`) on the CLI so `-C ''` can actually drop it.
+- **Don't mix scavenger and guaranteed partitions in one job.** SLURM plans a
+  multi-partition job into the highest priority tier it can reach, so listing
+  `gpu_requeue` alongside `gpu`/`seas_gpu` loses the scavenger's early start:
+  probed 2026-09-11, `-p gpu_requeue` alone estimated a start 16 days sooner
+  than the same request with the guaranteed partitions appended. Submit the
+  scavenger lane as its own allocation.
+- **`sbatch --test-only` is the cheap way to compare lanes** — it reports a
+  planned start time without submitting. Treat it as worst case: it assumes
+  every running job burns its full walltime.
 - **`hq` only works through the wrapper** (ssh to the server node). A bare
   `hq` with no server recorded prints how to start one.
 - **No login-node shim/taskset** needed (FASRC's pid cap is effectively
