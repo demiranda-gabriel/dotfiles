@@ -42,7 +42,7 @@ For reading documents over SSH+kitty without leaving the terminal.
 |-----------|---------------------------------------------------------------|
 | `tmux`    | Terminal multiplexer. Config in `config/tmux/tmux.conf`. Installed from `nelsonenzo/tmux-appimage` (extracted, no FUSE needed) |
 | `lf`      | Terminal file manager (replaces ranger). Config in `config/lf/` |
-| `md-view` | `pandoc → typst → PDF → doc-view` for markdown notes; ~30x faster than the TeX path. Page is sized to the terminal's aspect ratio. `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, `MDVIEW_THEME=light\|dark`, `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE=typst\|tectonic` |
+| `md-view` | `pandoc → typst → PDF → doc-view` for markdown notes; ~30x faster than the TeX path. Page is sized to the terminal's aspect ratio. `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, `MDVIEW_FONT=sans\|serif\|<family>`, `MDVIEW_MATHFONT`, `MDVIEW_THEME=light\|dark`, `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE=typst\|tectonic` |
 | `img-view`| `kitten icat` wrapper, scales image to fit terminal box       |
 | `doc-view`| Multi-page PDF/epub/djvu viewer: PyMuPDF renders, `kitten icat` displays. Works inside tmux |
 | `termpdf` | Upstream viewer, kept as a fallback outside tmux (it has no tmux passthrough) |

@@ -20,14 +20,14 @@ $highlighting-definitions$
 )
 
 #set text(
-  font: ("Libertinus Serif", "Nimbus Roman"),
+  font: ($mainfont$),
   size: $fontsize$pt,
   fill: rgb("$fg$"),
   // Hyphenation earns its keep only when justifying; with a ragged right
   // edge it just litters the text with breaks it did not need.
   hyphenate: $justify$,
 )
-#show math.equation: set text(font: ("New Computer Modern Math", "Libertinus Serif"))
+#show math.equation: set text(font: ($mathfont$))
 #show raw: set text(font: ("DejaVu Sans Mono", "Liberation Mono"), size: 0.85em)
 
 #set par(justify: $justify$, leading: 0.62em, spacing: 1.05em)

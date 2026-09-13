@@ -96,7 +96,7 @@ All wired up by `~/dotfiles/bootstrap.sh --viewers`.
 |------------|---------------------------------------------------------------|--------|
 | `tmux`     | Terminal multiplexer. Config at `~/.config/tmux/tmux.conf` (+ legacy `~/.tmux.conf` symlink for tmux <3.1) | `nelsonenzo/tmux-appimage`, extracted (no FUSE needed) |
 | `lf`       | File manager (replaces ranger). Config in `~/.config/lf/`     | binary, fetched |
-| `md-view`  | Markdown → PDF (pandoc + **typst**) → doc-view. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_THEME` (`light`/`dark`), `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE` (default `typst`) | `dotfiles/bin/` + `config/mdview/mdview.typ` |
+| `md-view`  | Markdown → PDF (pandoc + **typst**) → doc-view. Body face Cantarell, maths New Computer Modern Math. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_FONT` (default `sans`), `MDVIEW_MATHFONT`, `MDVIEW_THEME` (`light`/`dark`), `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE` (default `typst`) | `dotfiles/bin/` + `config/mdview/mdview.typ` |
 | `img-view` | `kitten icat` wrapper, fits image in terminal box, clears before display | `dotfiles/bin/` |
 | `doc-view` | Multi-page PDF / epub / djvu / cbz viewer. PyMuPDF renders, `kitten icat` displays, so it works inside tmux. Keys: `j`/`k` page, `w` fit-width, `+`/`-` zoom, `<n>g` goto, `r` reload, `q` | `dotfiles/bin/` |
 | `termpdf`  | Upstream viewer, fallback outside tmux only — it emits raw kitty APC with no tmux passthrough, so inside tmux it draws nothing | upstream py, fetched |
@@ -138,7 +138,12 @@ venv.
 with maths that survives the trip: pandoc's typst writer handles fractions,
 sums, matrices, integrals, `\mathcal`, `\mathbf` and `aligned`. The page is
 sized to the terminal's aspect ratio rather than to paper, so one page is one
-screenful in doc-view. Three defects in what pandoc emits are patched in
+screenful in doc-view. That aspect comes from TIOCGWINSZ, which reports the
+window in pixels as well as in cells, and is computed against the box doc-view
+actually draws into — not the whole window, since doc-view keeps the bottom row
+for its status line and shaves a column under tmux. Guessing the cell shape
+instead ("about twice as tall as wide"; real cells run nearer 1:2.2) left a
+band of terminal background under every page. Three defects in what pandoc emits are patched in
 `md-view` before compiling (bare `∥…∥` norms, empty `sqrt()`, and a one-letter
 script glued to a spacing macro), citations are disabled so "@270 epochs" stays
 prose, and relative image paths are made absolute. If typst still fails on a

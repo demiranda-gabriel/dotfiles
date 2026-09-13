@@ -11,6 +11,9 @@
 #   MDVIEW_FONTSIZE  apparent text size, 10|11|12|14|17|20 (default 14pt).
 #                    Under typst this sets the measure: bigger text, fewer
 #                    characters per line. Passed through as-is to tectonic.
+#   MDVIEW_FONT      sans (default, Cantarell) | droid | helvetica | serif,
+#                    or any family name typst can see (`typst fonts`)
+#   MDVIEW_MATHFONT  serif by default; "sans" for TeX Gyre DejaVu Math
 #   MDVIEW_THEME     light (default) | dark
 #   MDVIEW_COLUMNS   1 (default) | 2. Two columns fit far more on a wide
 #                    window, but a long line of code cannot wrap and will
@@ -69,15 +72,43 @@ if [[ "$engine" == tectonic ]]; then
 fi
 
 # ---------------------------------------------------------------- geometry ---
-# A terminal cell is about twice as tall as it is wide, so the window's aspect
-# ratio in pixels is cols / (2 * rows). Matching the page to it means doc-view
-# scales the page to fill the pane exactly, with no letterboxing.
-cols=$(tput cols 2>/dev/null || echo 100)
-rows=$(tput lines 2>/dev/null || echo 30)
+# The page has to match the box doc-view will actually draw into, or the image
+# is letterboxed and a band of terminal background shows above and below it.
+# That box is not the whole window: doc-view keeps the bottom row for its status
+# line, and shaves a column under tmux to stop a Unicode placeholder in the last
+# column from triggering autowrap.
+#
+# TIOCGWINSZ carries the window's size in pixels as well as in cells, which
+# gives the true cell shape. Guessing it (a cell is "about twice as tall as it
+# is wide") is what put a band of background under every page: real terminal
+# cells run nearer 1:2.2, so the guessed page came out too wide.
+# The 2>/dev/null wraps the whole compound, so bash's own complaint about a
+# missing /dev/tty is swallowed too, not just perl's.
+geom=$( { perl -e 'ioctl(STDIN, 0x5413, $w) or exit 1;
+                   print join(" ", unpack("S4", $w)), "\n";' </dev/tty; } 2>/dev/null ) || geom=""
+read -r rows cols xpix ypix <<<"$geom"
+[[ -n "${cols:-}" && "$cols" -gt 0 ]] || { cols=$(tput cols 2>/dev/null || echo 100); }
+[[ -n "${rows:-}" && "$rows" -gt 0 ]] || { rows=$(tput lines 2>/dev/null || echo 30); }
+
+box_cols=$cols
+[[ -n "${TMUX:-}" ]] && box_cols=$((cols - 1))
+box_rows=$((rows - 1))
+(( box_cols > 0 )) || box_cols=1
+(( box_rows > 0 )) || box_rows=1
+
 aspect="${MDVIEW_ASPECT:-}"
 if [[ -z "$aspect" ]]; then
-    aspect=$(awk -v c="$cols" -v r="$rows" 'BEGIN{a=c/(2*r); if(a<0.6)a=0.6; if(a>3.2)a=3.2; printf "%.4f", a}')
+    aspect=$(awk -v bc="$box_cols" -v br="$box_rows" -v c="$cols" -v r="$rows" \
+                 -v xp="${xpix:-0}" -v yp="${ypix:-0}" 'BEGIN{
+        if (xp > 0 && yp > 0) { cw = xp/c; ch = yp/r; }
+        else                  { cw = 1;    ch = 2.15; }   # fallback cell shape
+        a = (bc*cw)/(br*ch);
+        if (a < 0.4) a = 0.4; if (a > 4.0) a = 4.0;
+        printf "%.4f", a
+    }')
 fi
+[[ -n "${MDVIEW_DEBUG:-}" ]] && \
+    echo "md-view: ${cols}x${rows} cells, ${xpix:-?}x${ypix:-?} px, box ${box_cols}x${box_rows}, aspect $aspect" >&2
 
 # The page is 1000pt wide by definition; only ratios reach the screen, since
 # doc-view rescales whatever it is given. Everything else follows from that.
@@ -88,6 +119,19 @@ margin_y=$(awk -v h="$page_h" 'BEGIN{m=h*0.045; if(m<20)m=20; printf "%d", m}')
 columns="${MDVIEW_COLUMNS:-1}"
 justify=true
 [[ "${MDVIEW_JUSTIFY:-1}" == 0 ]] && justify=false
+
+# Body face. Each entry carries its own width constant: the point size that
+# delivers a given number of characters per line depends on the face, so the
+# measure knob would mean something different for each one otherwise. The
+# constant is the mean glyph width as a fraction of the point size, measured
+# from rendered output.
+case "${MDVIEW_FONT:-sans}" in
+    sans|cantarell) mainfont='"Cantarell", "Droid Sans", "Nimbus Sans"'; glyph_w=0.48 ;;
+    droid)          mainfont='"Droid Sans", "Nimbus Sans"';              glyph_w=0.50 ;;
+    helvetica|nimbus) mainfont='"Nimbus Sans", "Droid Sans"';            glyph_w=0.49 ;;
+    serif|libertinus) mainfont='"Libertinus Serif", "Nimbus Roman"';     glyph_w=0.43 ;;
+    *)              mainfont="\"${MDVIEW_FONT}\""; glyph_w="${MDVIEW_GLYPH_WIDTH:-0.48}" ;;
+esac
 
 # Apparent size: MDVIEW_FONTSIZE is a familiar knob from the TeX path, so keep
 # it, and convert it to a measure. 14pt -> 115 characters per line, 17 -> 95,
@@ -101,7 +145,7 @@ text_w=$(awk -v w="$page_w" -v m="$margin_x" -v c="$columns" \
 # `measure` characters across the text block is width / (0.43 * measure).
 # Measured back with pdftotext, a request for 115 lands within a character or
 # two of 115.
-font_pt=$(awk -v t="$text_w" -v m="$measure" 'BEGIN{printf "%.2f", t/(0.43*m)}')
+font_pt=$(awk -v t="$text_w" -v m="$measure" -v g="$glyph_w" 'BEGIN{printf "%.2f", t/(g*m)}')
 
 # ------------------------------------------------------------------ colours --
 case "${MDVIEW_THEME:-light}" in
@@ -112,6 +156,22 @@ case "${MDVIEW_THEME:-light}" in
         bg=fdfcf9; fg=1b1b1b; fg2=4a4a4a; accent=2c5f8a
         codebg=f1efe8; border=ddd9cf; link=2c5f8a; rule=c9c4b8 ;;
 esac
+
+# Maths keeps a serif face by default. A sans body with serif equations is
+# normal typesetting practice, and the alternative here is worse: the only sans
+# maths font on this machine, TeX Gyre DejaVu Math, draws a squat integral sign.
+# Setting a text font without a MATH table is not an option at all — big
+# operators collapse to inline size. MDVIEW_MATHFONT switches it anyway.
+case "${MDVIEW_MATHFONT:-}" in
+    "")        mathfont='"New Computer Modern Math"' ;;
+    sans|dejavu) mathfont='"TeX Gyre DejaVu Math"' ;;
+    *)         mathfont="\"${MDVIEW_MATHFONT}\"" ;;
+esac
+
+# TinyTeX ships the TeX Gyre maths families; let typst see them.
+TEXGYRE="$HOME/.TinyTeX/texmf-dist/fonts/opentype/public/tex-gyre-math"
+font_path_arg=()
+[[ -d "$TEXGYRE" ]] && font_path_arg=(--font-path "$TEXGYRE")
 
 TEMPLATE="${MDVIEW_TEMPLATE:-$HOME/.config/mdview/mdview.typ}"
 [[ -f "$TEMPLATE" ]] || { echo "md-view: template missing: $TEMPLATE" >&2; exit 1; }
@@ -130,6 +190,8 @@ pandoc "$in" \
     -V columns="$columns" \
     -V justify="$justify" \
     -V fontsize="$font_pt" \
+    -V mainfont="$mainfont" \
+    -V mathfont="$mathfont" \
     -V bg="$bg" -V fg="$fg" -V fg2="$fg2" -V accent="$accent" \
     -V codebg="$codebg" -V border="$border" -V link="$link" -V rule="$rule" \
     "$@" \
@@ -167,7 +229,7 @@ perl -CSD -i -pe '
 # A viewer should never simply refuse to show a note. If typst trips over
 # something in the generated source, say so and fall back to the slow path
 # rather than leaving the reader with nothing.
-if ! typst compile --root / "$typ" "$out" 2>"$typ.err"; then
+if ! typst compile "${font_path_arg[@]}" --root / "$typ" "$out" 2>"$typ.err"; then
     sed 's/^/typst: /' "$typ.err" >&2
     rm -f "$typ.err"
     echo "md-view: typst failed on this note; falling back to tectonic" >&2
