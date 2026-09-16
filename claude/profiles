@@ -1,0 +1,9 @@
+# Extra Claude Code config homes, one name per line.
+#
+# Each name <n> becomes ~/.claude-<n> on every cluster bootstrap.sh runs on,
+# with CLAUDE.md, skills and settings.json linked back to the shared copies,
+# and a `claude-<n>` shell alias. The primary account keeps the default
+# ~/.claude and is not listed here.
+#
+# Add one with: claude-profile-init <n>   (it appends here for you)
+harvard

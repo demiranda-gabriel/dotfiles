@@ -101,6 +101,21 @@ if [[ -f "$CLAUDE_MD_SRC" ]]; then
     fi
 fi
 
+# 3b.1. Extra Claude config homes (second account), one name per line in
+# claude/profiles. Each becomes ~/.claude-<name> with CLAUDE.md, skills and
+# settings.json linked back to the shared copies; shell/30-claude.sh then
+# derives a `claude-<name>` alias from the directory.
+CLAUDE_PROFILES_FILE="$DOTFILES/claude/profiles"
+if [[ -f "$CLAUDE_PROFILES_FILE" ]]; then
+    while read -r profile; do
+        profile="${profile%%#*}"
+        profile="$(echo "$profile" | tr -d '[:space:]')"
+        [[ -n "$profile" ]] || continue
+        "$DOTFILES/bin/claude-profile-init" "$profile" \
+            || echo "⚠ claude-profile-init $profile reported an issue (see above)"
+    done < "$CLAUDE_PROFILES_FILE"
+fi
+
 # 3c. Symlink ~/.config/<app>/* contents from dotfiles/config/<app>/
 # Per-file symlinks (not whole-dir) so other config files in the same app dir
 # aren't shadowed.

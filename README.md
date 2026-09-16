@@ -17,10 +17,12 @@ The bootstrap script is idempotent. It:
 2. Appends a `source ~/dotfiles/shell/*.sh` line to `~/.bashrc` (only if
    absent).
 3. Symlinks `claude/skills/*` into `~/.claude/skills/`.
-4. Per-file symlinks `config/<app>/*` into `~/.config/<app>/` (currently
+4. Creates an extra Claude config home `~/.claude-<name>` for every name in
+   `claude/profiles` (see "Claude Code profiles" below).
+5. Per-file symlinks `config/<app>/*` into `~/.config/<app>/` (currently
    `lf`, `tmux`). For `tmux` also creates `~/.tmux.conf` as a fallback
    for tmux <3.1 (which doesn't honor the XDG path).
-5. Probes for `rclone`, `pigz`, `tmux`, `lf`, `tectonic`, `pandoc`,
+6. Probes for `rclone`, `pigz`, `tmux`, `lf`, `tectonic`, `pandoc`,
    `doc-view`, `termpdf`, `pdftoppm`, and a configured `mir-backup:` remote;
    reports missing.
 
@@ -131,6 +133,32 @@ The shell snippet `shell/50-backup.sh` provides legacy aliases
 `backup` / `restore` / `cloudsave` over the new scripts, so existing
 muscle memory keeps working.
 
+## Claude Code profiles (two accounts)
+
+Claude Code keeps everything for one account under `$CLAUDE_CONFIG_DIR`, so a
+second account is just a second config home:
+
+```bash
+claude-profile-init harvard   # creates ~/.claude-harvard, records the name
+source ~/.bashrc              # picks up the claude-harvard alias
+claude-harvard                # then /login with the second account
+```
+
+The primary account keeps the default `~/.claude` and plain `claude`. Each
+extra profile gets a `claude-<name>` alias, derived from the directory name by
+`shell/30-claude.sh` — no edit needed when adding one.
+
+Separate per profile: credentials, `.claude.json` (project trust, MCP servers,
+history), transcripts, `--resume`, and auto-memory. Shared by symlink:
+`CLAUDE.md`, `claude/skills/*`, and `settings.json` (the primary's file, which
+both profiles read *and write*).
+
+Names live in `claude/profiles`; `bootstrap.sh` recreates each one, so
+committing that file is what replicates a profile to the next cluster. Full
+notes — what is shared and why, and the two traps (`CLAUDE_CONFIG_DIR` must be
+absolute and set in the shell; `command claude` drops the base alias's flags) —
+in [docs/claude-profiles.md](docs/claude-profiles.md).
+
 ## Layout
 
 ```
@@ -144,7 +172,8 @@ dotfiles/
 │   ├── tmux-window-fzf                  ← fzf window chooser popup (M-j; needs fzf)
 │   ├── vscode-login-tunnel.sh           ← `code tunnel` on an ALCF login node (cgroup-pinned)
 │   ├── vscode-tunnel                    ← tmux up/attach/status/down for the tunnel
-│   └── claude-tmux-{state,watch,set,extwait}  ← Claude-state tab glyph (see "tmux config")
+│   ├── claude-tmux-{state,watch,set,extwait}  ← Claude-state tab glyph (see "tmux config")
+│   └── claude-profile-init              ← extra Claude config home for a 2nd account
 ├── config/                              ← per-file symlinks into ~/.config/<app>
 │   ├── lf/{lfrc,preview,cleaner}
 │   ├── mdview/mdview.typ                ← typst template md-view renders through
@@ -158,6 +187,7 @@ dotfiles/
 │   └── install-vscode-cli.sh            ← VS Code CLI (`code`) for login-node tunnels
 ├── shell/                               ← sourced from ~/.bashrc by bootstrap
 │   ├── 00-path.sh                       ← prepends ~/.local/bin to $PATH
+│   ├── 30-claude.sh                     ← claude alias + one claude-<name> alias per profile
 │   ├── 40-fasrc.sh                      ← FASRC SLURM alloc helpers + vscode aliases (no-op off FASRC)
 │   ├── 41-polaris.sh                    ← Polaris login helpers + HQ fleet auto-up (no-op off ALCF)
 │   ├── 42-fasrc-hq.sh                   ← FASRC `hq` ssh-bridge wrapper (no-op off FASRC)
@@ -168,11 +198,13 @@ dotfiles/
 │   └── hq/                              ← HyperQueue: PBS 24/7 fleet + slurm/ on-demand allocator (install.sh is scheduler-aware)
 ├── docs/                                ← long-form guides (read with md-view)
 │   ├── alcf-vscode-tunnel.md            ← VS Code remote tunnel on Polaris/Aurora login nodes
-│   └── hyperqueue-fleet.md              ← HyperQueue fleet setup + mirroring to another cluster
+│   ├── hyperqueue-fleet.md              ← HyperQueue fleet setup + mirroring to another cluster
+│   └── claude-profiles.md               ← two Claude accounts on one host (CLAUDE_CONFIG_DIR)
 ├── claude/                              ← Claude Code config
 │   ├── skills/                          ← symlinked into ~/.claude/skills
 │   │   └── backup-to-gdrive/SKILL.md
 │   ├── CLAUDE.md                        ← symlinked into ~/.claude/CLAUDE.md
+│   ├── profiles                         ← extra config homes to create (one name per line)
 │   └── settings.hooks.json              ← hooks for the tmux glyph (merge by hand)
 ├── rclone/rclone.conf.example           ← template; real config is per-cluster
 └── bootstrap.sh
@@ -182,7 +214,10 @@ dotfiles/
 
 1. Install `rclone` and (optionally) `pigz` via the cluster's package
    manager or modules.
-2. `git clone … ~/dotfiles && ~/dotfiles/bootstrap.sh`.
+2. `git clone … ~/dotfiles && ~/dotfiles/bootstrap.sh`. This also recreates
+   every Claude profile listed in `claude/profiles`; each needs its own
+   `/login` on the new cluster. If the primary account has never run there,
+   re-run `claude-profile-init <name>` once it has, to pick up `settings.json`.
 3. `rclone config` and create a remote named `mir-backup` of type
    `drive`, scoped to the **MIR-backup shared drive**: set
    `team_drive = 0ABLkzStq5DREUk9PVA` (or pick it from the team-drive

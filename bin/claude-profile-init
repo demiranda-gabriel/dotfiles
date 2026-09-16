@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# claude-profile-init <name> [-n] [-h]
+#
+# Create (or repair) an additional Claude Code config home at ~/.claude-<name>,
+# so a second Claude account can be used on this cluster alongside the primary
+# account in ~/.claude.
+#
+# Claude Code keeps EVERYTHING for one account under $CLAUDE_CONFIG_DIR:
+# credentials, .claude.json (project trust, MCP servers, prompt history),
+# transcripts and auto-memory. This creates that home and links back the
+# pieces that should stay shared between accounts on one host:
+#
+#   CLAUDE.md      → dotfiles/claude/CLAUDE.md    same global instructions
+#   skills/*       → dotfiles/claude/skills/*     same skills
+#   settings.json  → ~/.claude/settings.json      one settings file, both profiles
+#
+# The name is recorded in dotfiles/claude/profiles, so bootstrap.sh recreates
+# the profile on every other cluster. Commit that file after adding one.
+#
+# Run the profile with the alias shell/30-claude.sh derives from the directory
+# name:  claude-<name>
+#
+# Flags:
+#   -n   dry-run: print what would happen, change nothing
+#   -h   help
+#
+# Idempotent.
+
+set -euo pipefail
+
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-0}"; }
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DOTFILES="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+DRY=0
+NAME=""
+
+while (( $# )); do
+    case "$1" in
+        -n) DRY=1; shift ;;
+        -h|--help) usage 0 ;;
+        -*) echo "unknown flag: $1" >&2; usage 1 ;;
+        *)
+            [[ -z "$NAME" ]] || { echo "only one profile name, got '$NAME' and '$1'" >&2; usage 1; }
+            NAME="$1"; shift ;;
+    esac
+done
+
+[[ -n "$NAME" ]] || usage 1
+
+# The name becomes a directory suffix and an alias suffix — keep it boring.
+if [[ ! "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "✗ invalid profile name '$NAME' (allowed: letters, digits, . _ -)" >&2
+    exit 1
+fi
+
+PRIMARY="$HOME/.claude"
+PROFILE="$HOME/.claude-$NAME"
+PROFILES_FILE="$DOTFILES/claude/profiles"
+RC=0
+
+run() { (( DRY )) && { echo "  would: $*"; return 0; }; "$@"; }
+say() { (( DRY )) || echo "$@"; }
+
+# link <src> <target> — idempotent symlink, never clobbers someone else's file
+link() {
+    local src="$1" target="$2" label="${3:-$2}"
+    if [[ ! -e "$src" ]]; then
+        echo "⚠ $src missing — skipping $label"
+        RC=1
+        return 0
+    fi
+    if [[ -L "$target" || -e "$target" ]]; then
+        if [[ "$(readlink -f "$target" 2>/dev/null)" == "$(readlink -f "$src")" ]]; then
+            echo "✓ $label already linked"
+            return 0
+        fi
+        echo "⚠ $target exists and points elsewhere — skipping"
+        RC=1
+        return 0
+    fi
+    run ln -s "$src" "$target"
+    say "✓ linked $label → $src"
+}
+
+echo "=== Claude profile '$NAME' → $PROFILE ==="
+(( DRY )) && echo "(dry run)"
+
+run mkdir -p "$PROFILE/skills"
+
+# 1. Global instructions — the same file the primary profile reads.
+link "$DOTFILES/claude/CLAUDE.md" "$PROFILE/CLAUDE.md" "$PROFILE/CLAUDE.md"
+
+# 2. Skills, from the tracked source rather than from the primary profile.
+for src in "$DOTFILES"/claude/skills/*; do
+    [[ -d "$src" ]] || continue
+    link "$src" "$PROFILE/skills/$(basename "$src")" "skill $(basename "$src")"
+done
+
+# 3. Settings, shared with the primary profile. Claude Code writes settings in
+#    place rather than by atomic rename, so the symlink survives a write from
+#    either profile and both stay on one file.
+if [[ -e "$PRIMARY/settings.json" ]]; then
+    link "$PRIMARY/settings.json" "$PROFILE/settings.json" "$PROFILE/settings.json"
+else
+    echo "⚠ $PRIMARY/settings.json does not exist yet — settings not shared."
+    echo "  Launch Claude once in the primary profile, then re-run: claude-profile-init $NAME"
+    RC=1
+fi
+
+# 4. Record the profile so bootstrap.sh recreates it on the next cluster.
+if [[ -f "$PROFILES_FILE" ]] && grep -qxF "$NAME" "$PROFILES_FILE"; then
+    echo "✓ '$NAME' already listed in claude/profiles"
+elif (( DRY )); then
+    echo "  would: record '$NAME' in $PROFILES_FILE"
+else
+    printf '%s\n' "$NAME" >> "$PROFILES_FILE"
+    echo "✓ recorded '$NAME' in claude/profiles — commit it to replicate"
+fi
+
+cat <<EOF
+
+Next:
+  1. source ~/.bashrc   (picks up the claude-$NAME alias)
+  2. claude-$NAME
+  3. /login, with the second account
+
+Per-profile (not shared): credentials, MCP OAuth grants, transcripts,
+--resume history, and auto-memory under projects/<hash>/memory/.
+EOF
+
+exit "$RC"
