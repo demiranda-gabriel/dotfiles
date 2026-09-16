@@ -269,6 +269,25 @@ hq-fleet down [--all]                           # workers (+ server with --all)
   shim/taskset needed here (no ALCF pid cap).
 - `gpu_test` is stricter: `-c <8` and `-m <64000M` per GPU.
 
+## Claude Code profiles (two accounts)
+
+Two Claude accounts run side by side on every cluster. The primary uses the
+default config home (`~/.claude`) and plain `claude`; each extra account lives
+in `~/.claude-<name>` and runs as `claude-<name>` — currently `claude-harvard`.
+`CLAUDE_CONFIG_DIR` picks the home: it must be absolute and set in the shell,
+never in `settings.json`.
+
+Separate per account: credentials, `.claude.json` (project trust, MCP servers,
+prompt history), transcripts, `--resume`, and auto-memory. Shared by symlink:
+this file, `dotfiles/claude/skills/*`, and `settings.json` — so a `/model`
+change or plugin toggle in one profile also changes the other.
+
+Add one with `claude-profile-init <name>`, then commit
+`dotfiles/claude/profiles`; `bootstrap.sh` recreates it on every other cluster
+(each needs its own `/login`). Detail — what is shared and why, and the two
+traps — lives in `~/dotfiles/docs/claude-profiles.md`. That file is the
+authoritative source; this section is just a pointer.
+
 ## New-cluster recipe
 
 ```bash
@@ -278,11 +297,12 @@ source ~/.bashrc
 ```
 
 That installs gdrive scripts, lf+viewer stack, shell snippets, Claude
-skills, and symlinks this CLAUDE.md into `~/.claude/`. After that the
-canonical references are:
+skills, every extra Claude profile in `claude/profiles`, and symlinks this
+CLAUDE.md into `~/.claude/`. After that the canonical references are:
 
 - `~/dotfiles/README.md` — full repo doc
 - `~/dotfiles/claude/skills/backup-to-gdrive/SKILL.md` — backup policy
+- `~/dotfiles/docs/claude-profiles.md` — second-account profiles
 - This file — global Claude instructions
 
 Auto-memory at `~/.claude/projects/<dir-hash>/memory/` is **per-host and
