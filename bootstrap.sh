@@ -103,8 +103,8 @@ fi
 
 # 3b.1. Extra Claude config homes (second account), one name per line in
 # claude/profiles. Each becomes ~/.claude-<name> with CLAUDE.md, skills and
-# settings.json linked back to the shared copies; shell/30-claude.sh then
-# derives a `claude-<name>` alias from the directory.
+# settings.json linked back to the shared copies; shell/30-claude.sh reads the
+# same file to define a `claude-<name>` alias for each.
 CLAUDE_PROFILES_FILE="$DOTFILES/claude/profiles"
 if [[ -f "$CLAUDE_PROFILES_FILE" ]]; then
     while read -r profile; do

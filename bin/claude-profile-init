@@ -17,7 +17,7 @@
 # The name is recorded in dotfiles/claude/profiles, so bootstrap.sh recreates
 # the profile on every other cluster. Commit that file after adding one.
 #
-# Run the profile with the alias shell/30-claude.sh derives from the directory
+# Run the profile with the alias shell/30-claude.sh defines for each recorded
 # name:  claude-<name>
 #
 # Flags:

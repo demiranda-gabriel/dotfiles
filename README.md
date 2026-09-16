@@ -145,7 +145,7 @@ claude-harvard                # then /login with the second account
 ```
 
 The primary account keeps the default `~/.claude` and plain `claude`. Each
-extra profile gets a `claude-<name>` alias, derived from the directory name by
+extra profile gets a `claude-<name>` alias, read from `claude/profiles` by
 `shell/30-claude.sh` — no edit needed when adding one.
 
 Separate per profile: credentials, `.claude.json` (project trust, MCP servers,

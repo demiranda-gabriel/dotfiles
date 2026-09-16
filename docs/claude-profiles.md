@@ -64,9 +64,11 @@ alias re-expands and the flag appears twice.
 
 ## Adding or removing a profile
 
-Adding: `claude-profile-init <name>`, then commit `claude/profiles`. The alias
-is derived from the directory name by `shell/30-claude.sh`, so nothing else
-needs editing.
+Adding: `claude-profile-init <name>`, then commit `claude/profiles`.
+`shell/30-claude.sh` reads that same file for the alias list, so nothing else
+needs editing. It reads the file rather than globbing `~/.claude-*` on purpose:
+unrelated tools keep directories there too (`~/.claude-code-ui`), and those must
+not become aliases that launch Claude against another tool's data.
 
 Removing: delete the line from `claude/profiles`, then `rm -rf
 ~/.claude-<name>` on each cluster. Nothing else references it.
