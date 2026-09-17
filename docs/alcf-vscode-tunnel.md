@@ -114,7 +114,9 @@ source ~/.bashrc
 
 `--viewers` runs every `install/install-*.sh`, which now includes
 **`install-vscode-cli.sh`** — it fetches the alpine-static VS Code CLI to
-`~/software/vscode-cli/code` and symlinks `~/.local/bin/code`. The alpine
+`~/software/vscode-cli/code` and symlinks `~/.local/bin/code-tunnel-cli`
+(`~/.local/bin/code` is the `bin/code` dispatch wrapper — see
+[Opening files with `code`](#opening-files-with-code)). The alpine
 static build has no glibc coupling, so the same binary works on Polaris
 (Rocky 8) and Aurora (SLES). `bootstrap.sh` also symlinks
 `vscode-login-tunnel.sh` and `vscode-tunnel` from `bin/` into `~/.local/bin`.
@@ -242,6 +244,40 @@ server dies on connect:
 
 ---
 
+## Opening files with `code`
+
+Two different binaries are both called `code`, and only one of them can put a
+file in your window:
+
+| | what it is | what `code <file>` does |
+|---|---|---|
+| `~/.local/bin/code-tunnel-cli` | the standalone CLI we download for `code tunnel` | looks for a **desktop** VS Code, fails with *No installation of Visual Studio Code stable was found* |
+| `<server>/bin/remote-cli/code` | shipped inside the server the tunnel started, at `~/.vscode/cli-<host>/servers/Stable-<commit>/server/bin/remote-cli/code` | sends the path over `$VSCODE_IPC_HOOK_CLI` to the attached window |
+
+VS Code prepends the `remote-cli` dir to PATH in its integrated terminal, but
+`shell/00-path.sh` prepends `~/.local/bin` *after* that and shadows it, and a
+tmux pane inherits neither that PATH nor `$VSCODE_IPC_HOOK_CLI`. So
+`~/.local/bin/code` is **`bin/code`**, a wrapper that
+
+1. forwards `tunnel`, `serve-web`, `version`, `ext`, `status`, `update` to the
+   standalone CLI;
+2. otherwise re-discovers the newest live `vscode-ipc-*.sock` of yours in
+   `$XDG_RUNTIME_DIR`, `/tmp/xdg-$UID`, `/run/user/$UID`, `/tmp` (the inherited
+   value is routinely stale or empty, and logind deletes `/run/user/$UID`);
+3. execs the `remote-cli/code` of the server commit actually running on this
+   node (read off its own command line, else the newest installed).
+
+**The socket is node-local.** A shell on `polaris-login-02` cannot reach a
+window attached to `polaris-login-01` — the wrapper says so explicitly instead
+of the misleading desktop-install message. Run `code` on the node the window is
+on, or start a tunnel there.
+
+Note that `lf`'s `<enter>` binding tests `$VSCODE_IPC_HOOK_CLI` itself before
+calling `code`, so inside a tmux-hosted `lf` it still falls back to the
+terminal viewers; the wrapper only fixes direct `code` calls.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -250,6 +286,7 @@ server dies on connect:
 | Device-code URL never appears | You're past the cached-login branch — `code tunnel user show` already has a credential. That's fine; the tunnel registers directly. To force a re-login: `code tunnel user logout`. |
 | Machine missing from VS Code Tunnels list | Laptop VS Code is signed into a *different* account than the device-code step. Sign into the same GitHub account. |
 | `fork: Resource temporarily unavailable`, server dies on connect | 256-pid cgroup cap — see [the cgroup section](#the-login-node-cgroup-read-this). Trim remote extensions; check `pids.current`. |
+| `No installation of Visual Studio Code stable was found` from `code <file>` | You reached the standalone tunnel CLI, which only knows how to launch a *desktop* VS Code. `~/.local/bin/code` must be the `bin/code` wrapper (`ls -l ~/.local/bin/code`); the wrapper finds the server's `remote-cli/code` instead. If the wrapper itself says *no live VS Code IPC socket on \<host\>*, your window is attached to a different login node — IPC sockets are node-local. |
 | `'code' not found` from `vscode-login-tunnel.sh` | CLI not installed — run `~/dotfiles/install/install-vscode-cli.sh` (or re-run `bootstrap.sh --viewers`). |
 | Tunnel gone after a few days | Login node rebooted and killed the tmux session. `vscode-tunnel` again; remove the stale machine entry if the node number changed. |
 | `git clone` fails on Aurora | No GitHub auth in Aurora's (separate) home — see [GitHub auth](#1-authenticate-to-github-from-aurora). |
@@ -263,6 +300,7 @@ server dies on connect:
 | `vscode-login-tunnel.sh` | `bin/` → `~/.local/bin/` | runs `code tunnel` cgroup-pinned; derives the machine name |
 | `vscode-tunnel` | `bin/` → `~/.local/bin/` | tmux up/attach/status/down wrapper |
 | `install-vscode-cli.sh` | `install/` | fetches the alpine-static `code` CLI (run by `--viewers`) |
-| `code` CLI | `~/software/vscode-cli/code` → `~/.local/bin/code` | the standalone tunnel client |
+| `code` wrapper | `bin/code` → `~/.local/bin/code` | dispatches file opens to the running server's remote-cli; forwards subcommands to the standalone CLI |
+| standalone CLI | `~/software/vscode-cli/code` → `~/.local/bin/code-tunnel-cli` | the tunnel/serve client (`code tunnel`); cannot open files in a window |
 | credential cache | `~/.vscode-cli/` | device-code login token (persists) |
 | tunnel identity | `~/.vscode/cli/code_tunnel.json` | registered machine name/id |

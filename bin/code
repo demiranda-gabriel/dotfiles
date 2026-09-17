@@ -1,0 +1,85 @@
+#!/usr/bin/env sh
+# `code <path>` on a cluster login node: hand the path to the VS Code window
+# that is attached to THIS node, instead of hunting for a desktop install.
+#
+# Why this wrapper exists
+# -----------------------
+# ~/.local/bin/code used to BE the standalone tunnel CLI (the binary that runs
+# `code tunnel` / `code serve-web`; now parked at ~/.local/bin/code-tunnel-cli).
+# That binary cannot open a file in a remote window: in file-open mode it only
+# looks for a *desktop* VS Code and dies with
+#
+#     No installation of Visual Studio Code stable was found.
+#
+# The tool that can talk to the window is the server's own remote-cli script,
+#     ~/.vscode/cli-<host>/servers/Stable-<commit>/server/bin/remote-cli/code
+# which VS Code prepends to PATH inside its integrated terminal -- except
+# shell/00-path.sh then prepends ~/.local/bin and shadows it again, and tmux
+# panes never inherit that PATH (nor $VSCODE_IPC_HOOK_CLI) in the first place.
+#
+# So: subcommands go to the standalone CLI; paths go to the remote-cli of the
+# server actually running on this node, with the IPC socket re-discovered on
+# every call because the inherited value is routinely stale or empty. The
+# socket lives in $XDG_RUNTIME_DIR, which logind tears down under us -- see
+# bin/vscode-login-tunnel.sh for the /tmp/xdg-$UID workaround.
+set -u
+
+STANDALONE="${VSCODE_STANDALONE_CLI:-$HOME/.local/bin/code-tunnel-cli}"
+
+# CLI subcommands: the standalone binary is the right tool.
+case "${1:-}" in
+    tunnel|serve-web|version|ext|extensions|status|update|command-shell|-h|--help|--version)
+        if [ ! -x "$STANDALONE" ]; then
+            echo "code: standalone CLI not found at $STANDALONE" >&2
+            exit 127
+        fi
+        exec "$STANDALONE" "$@"
+        ;;
+esac
+
+uid=$(id -u)
+host=$(hostname -s)
+
+# 1. A live CLI socket on this node.
+if [ ! -S "${VSCODE_IPC_HOOK_CLI:-}" ]; then
+    for d in "${XDG_RUNTIME_DIR:-}" "/tmp/xdg-$uid" "/run/user/$uid" "${TMPDIR:-/tmp}"; do
+        [ -n "$d" ] && [ -d "$d" ] || continue
+        sock=$(find "$d" -maxdepth 1 -name 'vscode-ipc-*.sock' -uid "$uid" \
+                    -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+        if [ -n "${sock:-}" ] && [ -S "$sock" ]; then
+            VSCODE_IPC_HOOK_CLI="$sock"; export VSCODE_IPC_HOOK_CLI
+            # Publish it so panes/lf started later see it too.
+            [ -n "${TMUX:-}" ] && tmux setenv -g VSCODE_IPC_HOOK_CLI "$sock" 2>/dev/null
+            break
+        fi
+    done
+fi
+if [ ! -S "${VSCODE_IPC_HOOK_CLI:-}" ]; then
+    echo "code: no live VS Code IPC socket on $host." >&2
+    echo "      IPC sockets are node-local -- is your window attached to $host?" >&2
+    echo "      (vscode-tunnel status, and check which login node the window is on)" >&2
+    exit 1
+fi
+
+# 2. The remote-cli of the server serving this node. Prefer the one whose
+#    commit is actually running (read off its own command line), else newest.
+data_dir="${VSCODE_CLI_DATA_DIR:-$HOME/.vscode/cli-$host}"
+running=$(ps -o args= -u "$uid" 2>/dev/null \
+          | sed -n 's|.*/\(servers/Stable-[0-9a-f]\{40\}\)/.*|\1|p' | head -1)
+rcli=
+for c in \
+    ${running:+"$data_dir/$running/server/bin/remote-cli/code"} \
+    ${running:+"$HOME/.vscode/cli/$running/server/bin/remote-cli/code"} \
+    $(ls -dt "$data_dir"/servers/Stable-*/server/bin/remote-cli/code \
+             "$HOME/.vscode/cli"/servers/Stable-*/server/bin/remote-cli/code \
+             "$HOME/.vscode-server/cli/servers"/Stable-*/server/bin/remote-cli/code \
+             2>/dev/null)
+do
+    if [ -x "$c" ]; then rcli="$c"; break; fi
+done
+if [ -z "$rcli" ]; then
+    echo "code: no VS Code server remote-cli found under $data_dir" >&2
+    exit 1
+fi
+
+exec "$rcli" "$@"
