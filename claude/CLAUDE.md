@@ -47,6 +47,31 @@ able to act on it without scrolling back through the conversation.
   and no literal unicode inside the math (`\times`, `\neq`, `\mathrm{A}`).
   The unicode rule above is for prose only.
 
+## Subagents and parallel tasks
+
+**Hard cap: never run more than 3 parallel subagents / background tasks
+without my express consent.** Set 2026-09-05 after a research session spawned
+9 agents across three rounds and burned ~2.5M tokens, pushing me into my usage
+limit mid-task.
+
+- Subagent tokens bill against my limits and I cannot see them accumulating
+  while the agents run. A fan-out that is free to you is expensive to me.
+- Sequential rounds count cumulatively: three rounds of three is nine, not
+  three.
+- Above the cap, say in chat what you want to spawn and roughly what it costs,
+  then wait for an explicit OK.
+- Default to doing the work inline. Web research, file reading and citation
+  checking are usually cheaper done directly than delegated.
+- Prefer one broad agent over several narrow ones; resume an existing agent
+  (SendMessage) rather than spawning a fresh one.
+- Scope agent prompts tightly — open-ended "find and verify 8-14 sources"
+  briefs are what make them expensive.
+- **Nested agents are the hidden multiplier.** A general-purpose subagent can
+  spawn its own subagents, and stopping a parent does NOT stop its children.
+  After any stop, run `ListAgents` and kill every remaining running entry, then
+  confirm with a second `ListAgents`. Prefer read-only agent types that cannot
+  fan out, and tell general-purpose agents not to spawn subagents.
+
 ## Plotting conventions
 
 Defaults for every figure/plot I generate (matplotlib or otherwise),
