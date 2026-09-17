@@ -24,7 +24,7 @@ The bootstrap script is idempotent. It:
    `termpdf`, `pdftoppm`, and a configured `mir-backup:` remote; reports missing.
 
 Pass `--viewers` to also fetch the tool stack
-(`lf`, `tmux`, `tectonic`, `pandoc`, `termpdf.py` + Python deps) into
+(`lf`, `nvim`, `tmux`, `tectonic`, `pandoc`, `termpdf.py` + Python deps) into
 `~/.local/bin/` and `~/software/`:
 
 ```bash
@@ -41,6 +41,7 @@ For reading documents over SSH+kitty without leaving the terminal.
 |-----------|---------------------------------------------------------------|
 | `tmux`    | Terminal multiplexer. Config in `config/tmux/tmux.conf`. Installed from `nelsonenzo/tmux-appimage` (extracted, no FUSE needed) |
 | `lf`      | Terminal file manager (replaces ranger). Config in `config/lf/` |
+| `nvim`    | Editor — `$EDITOR`/`$VISUAL` when present (`shell/60-lf.sh`), else system vim. Upstream static tarball, not the AppImage, so it needs no FUSE on compute nodes |
 | `md-view` | `pandoc → tectonic → PDF → termpdf` for markdown notes. Font size via `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, engine via `MDVIEW_ENGINE` |
 | `img-view`| `kitten icat` wrapper, scales image to fit terminal box. In a VS Code terminal it `exec`s `iip-view` instead |
 | `iip-view`| iTerm2 inline-image protocol (OSC 1337) emitter — the VS Code lane, since xterm.js has no kitty-protocol support and kitty has no iTerm2 support. Needs `terminal.integrated.enableImages` on. `--place=WxH@XxY` mirrors `kitten icat` |
