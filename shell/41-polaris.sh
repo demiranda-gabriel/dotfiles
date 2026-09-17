@@ -15,6 +15,29 @@ if [[ -d /lus/eagle ]]; then
     hq-fleet up >/dev/null 2>&1
   fi
 
+  # Same idea for the VS Code login-node tunnel, which the fleet's self-heal
+  # does NOT cover: a login-node reboot kills the `code tunnel` process and
+  # nothing brings it back, so the machine silently drops out of the Remote-
+  # Tunnels list until noticed by hand. `vscode-tunnel up` early-returns on a
+  # live tmux session, so the steady-state cost is one `tmux has-session`.
+  #
+  # login-01 only: a tunnel registers ONE machine per CLI data dir, and
+  # vscode-login-tunnel.sh gives each node its own dir (see its header) — so
+  # re-upping on every node would litter the VS Code machine list with a
+  # polaris-0N entry per login node and burn ~17 pids of the 256-pid cgroup on
+  # each. login-01 is where the main tmux + Claude agents live, matching `tl`.
+  #
+  # Interactive-only, unlike the fleet block: ~/.bashrc has no `$-` guard, and
+  # spawning a tunnel from an `ssh host cmd`/scp/rsync shell is pure surprise.
+  # The token check keeps a credential-less node from parking a device-code
+  # prompt in a detached pane forever (the script's first-run login path).
+  if [[ $- == *i* ]] \
+      && [[ "$(hostname -s)" == polaris-login-01 ]] \
+      && [[ -f "$HOME/.vscode/cli-polaris-login-01/token.json" ]] \
+      && command -v vscode-tunnel >/dev/null 2>&1; then
+    vscode-tunnel up >/dev/null 2>&1
+  fi
+
   # Keep HQ task logs in-tree under runs/ (workflow convention: logs next to
   # the run) instead of dropping job-*/ dirs into the cwd. By default they land
   # in <git-root>/runs/_hq_logs/job-<id>/; set HQ_LOG_DIR=runs/<N>-<exp>/logs to
