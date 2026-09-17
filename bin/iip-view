@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# iip-view — display an image with the iTerm2 inline-image protocol (OSC 1337
+# File=), which VS Code's integrated terminal renders through the xterm.js
+# image addon once `terminal.integrated.enableImages` is true.
+#
+# This is the VS Code counterpart of img-view: xterm.js does not implement the
+# kitty graphics protocol and kitty does not implement this one, so the two
+# lanes cannot be merged. img-view stays on `kitten icat` and hands off here
+# when it sees TERM_PROGRAM=vscode.
+#
+#   iip-view FILE                    clear the screen, fill it, wait for a key
+#   iip-view --place=WxH@XxY FILE    draw into a cell box at (X,Y), return now
+#
+# W/H/X/Y are character cells with a 0-based origin, matching
+# `kitten icat --place`, so the two lanes read alike at the call sites. The
+# escape always goes to /dev/tty, so a caller whose stdout is captured (the lf
+# previewer) still reaches the terminal.
+set -euo pipefail
+
+place=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --place=*) place="${1#--place=}"; shift ;;
+        --)        shift; break ;;
+        -*)        printf 'iip-view: unknown option: %s\n' "$1" >&2; exit 2 ;;
+        *)         break ;;
+    esac
+done
+
+f="${1:?usage: iip-view [--place=WxH@XxY] FILE}"
+[ -r "$f" ] || { printf 'iip-view: cannot read: %s\n' "$f" >&2; exit 1; }
+
+if [ -n "$place" ]; then
+    box="${place%@*}"; org="${place#*@}"
+    w="${box%x*}"; h="${box#*x}"
+    x="${org%x*}"; y="${org#*x}"
+else
+    w=$(tput cols)
+    h=$(( $(tput lines) - 1 ))
+    x=0; y=0
+fi
+
+esc=$'\033'; bel=$'\007'
+b64=$(base64 -w0 -- "$f")
+name=$(printf '%s' "${f##*/}" | base64 -w0)
+img="${esc}]1337;File=name=${name};size=$(stat -c%s -- "$f");inline=1"
+img="${img};preserveAspectRatio=1;width=${w};height=${h}:${b64}${bel}"
+
+# tmux forwards an unknown sequence only inside a DCS passthrough, with every
+# inner ESC doubled, and only with `set -g allow-passthrough on` (already set
+# in config/tmux/tmux.conf). Caveat: tmux does not know the image is there, so
+# any pane redraw wipes it — unlike kitty, this protocol has no placeholder
+# mechanism. Inline images are a no-tmux workflow.
+if [ -n "${TMUX:-}" ]; then
+    img="${esc}Ptmux;${esc}${img}${esc}\\"
+fi
+
+if [ -n "$place" ]; then
+    # DECSC / absolute move / DECRC: the previewer must leave the cursor where
+    # lf put it. CSI H is 1-based, lf's x/y are 0-based.
+    printf '%s' "${esc}7${esc}[$((y + 1));$((x + 1))H${img}${esc}8" > /dev/tty
+else
+    clear
+    printf '%s' "$img" > /dev/tty
+    # Wait for any key, like img-view does (kitten's --hold is tmux-hostile).
+    read -n 1 -s -r < /dev/tty
+    clear
+fi

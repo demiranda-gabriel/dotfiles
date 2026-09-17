@@ -42,14 +42,21 @@ For reading documents over SSH+kitty without leaving the terminal.
 | `tmux`    | Terminal multiplexer. Config in `config/tmux/tmux.conf`. Installed from `nelsonenzo/tmux-appimage` (extracted, no FUSE needed) |
 | `lf`      | Terminal file manager (replaces ranger). Config in `config/lf/` |
 | `md-view` | `pandoc → tectonic → PDF → termpdf` for markdown notes. Font size via `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, engine via `MDVIEW_ENGINE` |
-| `img-view`| `kitten icat` wrapper, scales image to fit terminal box       |
+| `img-view`| `kitten icat` wrapper, scales image to fit terminal box. In a VS Code terminal it `exec`s `iip-view` instead |
+| `iip-view`| iTerm2 inline-image protocol (OSC 1337) emitter — the VS Code lane, since xterm.js has no kitty-protocol support and kitty has no iTerm2 support. Needs `terminal.integrated.enableImages` on. `--place=WxH@XxY` mirrors `kitten icat` |
 | `termpdf` | Multi-page PDF/epub/djvu viewer using kitty graphics protocol |
 | `tectonic`| Modern XeTeX engine. Bundles its own TeX, auto-fetches packages — bypasses incomplete cluster TeX installs |
 
-Inside `lf`: `<enter>` dispatches by extension (md → md-view, pdf →
-termpdf, image → img-view). `B` / `H` for big/huge font markdown, `P`
-for first-page PDF peek, `yK` for kitty transfer download to local Mac.
-`R` reloads the lf config.
+Inside `lf`: `<enter>` opens **every** file type in VS Code (`code -r`,
+via the integrated terminal's `$VSCODE_IPC_HOOK_CLI`; the whole selection
+opens in one call). Outside VS Code — plain ssh/tmux, or a socket that no
+longer exists — it falls back to the extension dispatch below, and `O`
+forces that terminal-viewer lane on demand (md → md-view, pdf → termpdf,
+image → img-view). `B` / `H` for big/huge font markdown, `P` for
+first-page PDF peek, `yK` for kitty transfer download to local Mac.
+`R` reloads the lf config. Image and PDF previews render inline in both
+lanes: kitty graphics under kitty, OSC 1337 in a VS Code terminal (no
+tmux — tmux forwards the escape but wipes the image on any redraw).
 
 ## tmux config
 

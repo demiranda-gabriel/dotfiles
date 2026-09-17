@@ -9,18 +9,35 @@ KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 
 mime="$(file --mime-type -Lb -- "$f" 2>/dev/null || echo unknown)"
 
+# kitty always sets KITTY_WINDOW_ID; VS Code's xterm.js speaks the iTerm2
+# inline-image protocol instead of kitty's, so hand those terminals to
+# iip-view (which explains the split in full).
+iip=0
+if [ -z "${KITTY_WINDOW_ID:-}" ] && [ "${TERM_PROGRAM:-}" = vscode ]; then
+    iip=1
+fi
+
 case "$mime" in
     image/*)
-        "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
-            --place="${w}x${h}@${x}x${y}" -- "$f" </dev/null
+        if [ "$iip" = 1 ]; then
+            iip-view --place="${w}x${h}@${x}x${y}" -- "$f"
+        else
+            "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
+                --place="${w}x${h}@${x}x${y}" -- "$f" </dev/null
+        fi
         exit 1   # exit code 1 = lf will not cache preview (re-renders on move)
         ;;
     application/pdf)
         tmp="$(mktemp -t lfprev-XXXXXX.jpg)"
         trap 'rm -f "$tmp"' EXIT
-        pdftoppm -jpeg -r 100 -singlefile -- "$f" "${tmp%.jpg}" 2>/dev/null \
-          && "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
-                --place="${w}x${h}@${x}x${y}" -- "$tmp" </dev/null
+        if pdftoppm -jpeg -r 100 -singlefile -- "$f" "${tmp%.jpg}" 2>/dev/null; then
+            if [ "$iip" = 1 ]; then
+                iip-view --place="${w}x${h}@${x}x${y}" -- "$tmp"
+            else
+                "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
+                    --place="${w}x${h}@${x}x${y}" -- "$tmp" </dev/null
+            fi
+        fi
         exit 1
         ;;
     text/*|application/json|application/xml|application/javascript)

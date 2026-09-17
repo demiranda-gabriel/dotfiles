@@ -128,15 +128,23 @@ All wired up by `~/dotfiles/bootstrap.sh --viewers`.
 | `tmux`     | Terminal multiplexer. Config at `~/.config/tmux/tmux.conf` (+ legacy `~/.tmux.conf` symlink for tmux <3.1) | `nelsonenzo/tmux-appimage`, extracted (no FUSE needed) |
 | `lf`       | File manager (replaces ranger). Config in `~/.config/lf/`     | binary, fetched |
 | `md-view`  | Markdown → PDF (pandoc + tectonic) → termpdf. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_ENGINE` (default `tectonic`) | `dotfiles/bin/` |
-| `img-view` | `kitten icat` wrapper, fits image in terminal box, clears before display | `dotfiles/bin/` |
+| `img-view` | `kitten icat` wrapper, fits image in terminal box, clears before display. `exec`s `iip-view` when `TERM_PROGRAM=vscode` | `dotfiles/bin/` |
+| `iip-view` | iTerm2 inline-image protocol (OSC 1337) emitter — the VS Code lane (xterm.js speaks sixel + iTerm2, never the kitty protocol). Requires `terminal.integrated.enableImages`; `--place=WxH@XxY` as in `kitten icat`; no-tmux workflow | `dotfiles/bin/` |
 | `termpdf`  | Multi-page PDF / epub / djvu viewer using kitty graphics      | upstream py, fetched |
 | `tectonic` | Modern XeTeX engine, bundles TeX, auto-fetches packages — bypasses incomplete cluster TeX | binary, fetched |
 | `pandoc`   | Newer (3.9.0.2) — system pandoc on RHEL/Rocky 8 is too old for tectonic | binary, fetched |
 
-**Inside `lf`:** `<enter>` dispatches by extension (md → md-view, pdf →
-termpdf, image → img-view). `B`/`H` for big/huge font markdown, `P` for
-first-page pdf peek, `yK` for kitty transfer download to local Mac, `R`
-to reload config. Quit drops parent shell into last-visited dir.
+**Inside `lf`:** `<enter>` opens **any** file type in VS Code (`code -r`
+over the integrated terminal's `$VSCODE_IPC_HOOK_CLI`; multi-selection
+opens in one call). With no reachable VS Code socket it falls back to the
+old extension dispatch, which `O` also invokes on demand (md → md-view,
+pdf → termpdf, image → img-view) — use `O` or `P` for pdf/epub/djvu,
+which VS Code cannot render without an extension. `B`/`H` for big/huge
+font markdown, `P` for first-page pdf peek, `yK` for kitty transfer
+download to local Mac, `R` to reload config. Quit drops parent shell into
+last-visited dir. The preview pane renders images/PDFs inline in either
+protocol — `config/lf/preview` and `config/lf/cleaner` both branch on
+`TERM_PROGRAM=vscode`.
 
 **Cluster TeX caveat:** the system TeX install on FASRC (Rocky 8) is
 incomplete — `xelatex`/`lualatex` missing `ucharcat.sty`, xcolor broken.

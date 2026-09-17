@@ -1,4 +1,35 @@
 #!/usr/bin/env bash
-# lf cleaner — clears kitty graphics images when moving cursor.
+# lf cleaner — erase the previous preview's inline image.
+# Called with the same arguments as the previewer: $1=file $2=w $3=h $4=x $5=y.
+#
+# kitty has a clear-graphics command; the iTerm2 protocol used in VS Code (see
+# bin/iip-view) does not — xterm.js drops an image the moment the cells it
+# occupies are overwritten, so there the fix is to blank the preview box. That
+# matters when moving from an image to a shorter text preview, which would
+# otherwise leave the bottom of the image on screen.
+set -u
+
+if [ -z "${KITTY_WINDOW_ID:-}" ] && [ "${TERM_PROGRAM:-}" = vscode ]; then
+    w=${2:-0}; h=${3:-0}; x=${4:-0}; y=${5:-0}
+    case "$w$h" in *[!0-9]*|'') exit 0 ;; esac
+    [ "$w" -gt 0 ] && [ "$h" -gt 0 ] || exit 0
+    esc=$(printf '\033')
+    out="${esc}7"
+    r=0
+    while [ "$r" -lt "$h" ]; do
+        # Move to the row, then ECH (CSI <n> X) to erase w cells in place. Use
+        # a real *erase* rather than writing w spaces: erasing is the operation
+        # xterm.js's image addon hooks to drop the image tiles bound to those
+        # cells, and it leaves the cursor and SGR state alone. lf's own pane
+        # redraw cannot be relied on for this — it only paints the lines the
+        # new preview actually produced, so a 3-line text preview leaves the
+        # rest of a 23-row image on screen.
+        out="${out}${esc}[$((y + r + 1));$((x + 1))H${esc}[${w}X"
+        r=$((r + 1))
+    done
+    printf '%s' "${out}${esc}8" > /dev/tty
+    exit 0
+fi
+
 KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
 "$KITTEN" icat --clear --silent --stdin=no --transfer-mode=memory </dev/null 2>/dev/null

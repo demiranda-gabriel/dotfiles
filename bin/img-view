@@ -2,6 +2,13 @@
 # img-view: clear screen + display image filling terminal box (fits W and H).
 set -euo pipefail
 
+# kitty always sets KITTY_WINDOW_ID; VS Code's xterm.js speaks the iTerm2
+# inline-image protocol instead of kitty's, so hand those terminals to
+# iip-view (which explains the split in full).
+if [ -z "${KITTY_WINDOW_ID:-}" ] && [ "${TERM_PROGRAM:-}" = vscode ]; then
+    exec iip-view -- "$@"
+fi
+
 cols=$(tput cols)
 rows=$(tput lines)
 h=$((rows - 1))

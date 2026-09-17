@@ -1,5 +1,6 @@
 # =====================================================================
-# lf config — mirrors ranger setup (md/pdf/png viewers, kitty download)
+# lf config — VS Code is the default opener; terminal viewers on `t` (md-view,
+# termpdf, img-view), marp on M/W, kitty download on yK.
 # NOTE: do NOT nest ${VAR:-${OTHER}} inside ${{ ... }} — the inner `}}`
 # terminates the lf block early. Use single-level expansion only.
 # =====================================================================
@@ -16,7 +17,42 @@ set previewer ~/.config/lf/preview
 set cleaner  ~/.config/lf/cleaner
 
 # --- open dispatch (default action on Enter / `l`) ---
-cmd open ${{
+# VS Code is the default opener for EVERY file type. lf normally runs inside a
+# VS Code integrated terminal, where `code` hands the path to the editor window
+# over the socket named by $VSCODE_IPC_HOOK_CLI. Async (`&`) so lf never gives
+# up the tty: `code` needs no terminal and returns as soon as the window has
+# the file, leaving lf exactly where it was.
+#
+# Outside VS Code (plain ssh/tmux) there is no window to hand the file to, so
+# we bounce back into lf via `-remote send` and run the terminal viewers
+# instead. The `-S` test is what makes that robust: on ALCF login nodes the
+# variable often survives while the socket underneath it does not (systemd
+# reaps /run/user/$UID — see the XDG_RUNTIME_DIR block in
+# bin/vscode-login-tunnel.sh), and an unreachable socket must degrade to the
+# viewers rather than swallow the keypress. A non-zero exit from `code` falls
+# back the same way.
+#
+# Directories are unaffected: lf's builtin `open` (mapped to <enter>/l) enters
+# a directory and only reaches this command for regular files.
+#
+# `O` forces the terminal-viewer lane even inside VS Code — use it for pdf /
+# epub / djvu, which VS Code cannot render without an extension. (Not `t`:
+# that is lf's built-in tag-toggle.)
+cmd open &{{
+    if [ -n "$VSCODE_IPC_HOOK_CLI" ] && [ -S "$VSCODE_IPC_HOOK_CLI" ]; then
+        # $fx is newline-separated (all of the selection, or the file under the
+        # cursor when nothing is selected); NUL-delimit it so paths containing
+        # spaces survive, and open the whole batch in one `code` call. Paths
+        # from lf are absolute, so none can be mistaken for an option.
+        if printf '%s\n' "$fx" | tr '\n' '\0' | xargs -0 -r code -r 2>/dev/null; then
+            exit 0
+        fi
+    fi
+    lf -remote "send $id open-terminal"
+}}
+
+# --- terminal viewers (the pre-VS-Code dispatch; `O`, and the fallback) ---
+cmd open-terminal ${{
     case "$f" in
         *.md|*.markdown)
             md-view "$f"
@@ -42,6 +78,7 @@ cmd open ${{
             ;;
     esac
 }}
+map O open-terminal
 
 # --- markdown font-size variants ---
 cmd md_big  ${{ MDVIEW_FONTSIZE=17pt md-view "$f" }}
