@@ -30,27 +30,90 @@ SERVER_JOBNAME = "hq-server"
 UNIT = 10000  # HQ stores resource amounts as fixed point: 1 unit == 10000
 
 
-def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+class _Failed:
+    """Stand-in for a command that timed out: empty output, non-zero status."""
+    returncode, stdout, stderr = 124, "", "timed out"
+
+
+def run(cmd, timeout=20, **kw):
+    """Run a command, never hanging on it.
+
+    squeue/sinfo block indefinitely when slurmctld is down (observed
+    2026-09-14, `scontrol ping` -> "Slurmctld(primary) is DOWN"). Without a
+    timeout every caller hangs; worse, treating an empty result as fact makes
+    a controller outage look like "all your jobs ended".
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+    except (subprocess.TimeoutExpired, OSError):
+        return _Failed()
 
 
 def server_node() -> str:
+    """A host we can ssh to that can reach the HQ server.
+
+    ~/.hq/server-node names the server's node, but FASRC's pam_slurm_adopt only
+    lets us ssh where we hold a running job. If the server's job has ended (the
+    process can outlive it) that pointer is unusable from a login node, and
+    every bridged query fails silently -- looking exactly like "all workers
+    gone". So fall back to any node we DO hold: the client there finds the
+    server through ~/.hq-server/, not through this name. Observed 2026-09-12.
+    """
     try:
         with open(os.path.join(HQDIR, "server-node")) as fh:
-            return fh.read().strip()
+            node = fh.read().strip()
     except OSError:
-        return ""
+        node = ""
+    if node and node in held_nodes():
+        return node
+    for alt in held_nodes():          # any node we hold reaches the server
+        return alt
+    return node                      # nothing held; let the caller fail loudly
+
+
+_HELD = None  # memoised: one squeue per invocation, not one per lookup
+
+
+def held_nodes() -> list:
+    """Nodes where we currently hold a running job, so ssh is permitted.
+
+    Raises if slurmctld is unreachable, rather than returning [] -- an empty
+    list would be read as "you hold nothing" and send us on to an ssh that
+    cannot succeed either (pam_slurm_adopt needs the controller too).
+    """
+    global _HELD
+    if _HELD is not None:
+        return _HELD
+    p = run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-t", "R", "-o", "%N"])
+    if p.returncode != 0:
+        raise RuntimeError("SLURM is not answering (squeue timed out). Check:  scontrol ping\n"
+                           "Running jobs and the HQ server are unaffected by a controller\n"
+                           "outage -- this is a visibility failure, not a lost fleet.")
+    out = []
+    for line in p.stdout.split():
+        if line and "[" not in line and line not in out:
+            out.append(line)
+    _HELD = out
+    return out
 
 
 def hq_snapshot(node: str):
-    """Fetch worker list, job list and job info in ONE ssh round trip."""
+    """Fetch worker list, job list and job info in ONE ssh round trip.
+
+    The remote hq is invoked by ABSOLUTE PATH, never as bare `hq`: a
+    non-interactive ssh sources ~/.bashrc, which defines the ssh-bridge `hq`
+    FUNCTION from shell/42-fasrc-hq.sh, and that would ssh onwards to
+    ~/.hq/server-node -- a needless extra hop, and a loop back to this same
+    host whenever the bridge points at it. (The wrapper itself is safe: its
+    `exec hq` skips functions.) Observed 2026-09-12.
+    """
     remote = (
-        'PATH=$HOME/.local/bin:$PATH\n'
-        'echo "@@WORKERS"; hq --output-mode=json worker list\n'
-        'echo "@@JOBS";    hq --output-mode=json job list --all\n'
-        'ids=$(hq --output-mode=json job list --all | python3 -c '
+        'HQ=$HOME/.local/bin/hq\n'
+        'echo "@@WORKERS"; "$HQ" --output-mode=json worker list\n'
+        'echo "@@JOBS";    "$HQ" --output-mode=json job list --all\n'
+        'ids=$("$HQ" --output-mode=json job list --all | python3 -c '
         '"import json,sys; print(\\",\\".join(str(j[\'id\']) for j in json.load(sys.stdin)))")\n'
-        'echo "@@INFO"; [ -n "$ids" ] && hq --output-mode=json job info "$ids" || echo "[]"\n'
+        'echo "@@INFO"; [ -n "$ids" ] && "$HQ" --output-mode=json job info "$ids" || echo "[]"\n'
     )
     p = run(["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
              "-o", "ConnectTimeout=10", node, remote], timeout=60)
@@ -79,7 +142,13 @@ def hq_snapshot(node: str):
 
 
 def squeue_lanes():
-    """SLURM view of the lane allocations, keyed by job id."""
+    """SLURM view of the lane allocations, keyed by job id.
+
+    Returns {} both when there are no lanes and when squeue failed; the caller
+    only uses it to decorate workers HQ already reported, so a controller
+    outage degrades to missing partition/walltime columns rather than to a
+    false claim that nothing is running.
+    """
     p = run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-n", WORKER_JOBNAME,
              "-o", "%i|%P|%T|%L|%N|%b"])
     lanes = {}
@@ -149,8 +218,11 @@ def age(iso: str) -> str:
 def build():
     node = server_node()
     if not node:
-        raise RuntimeError("no HQ server recorded (~/.hq/server-node is empty).\n"
-                           "Start one first:  hq-fleet up")
+        raise RuntimeError("no reachable host: ~/.hq/server-node is empty and you\n"
+                           "hold no running job to bridge through. Start a lane:  hq-fleet up")
+    if node not in held_nodes():
+        raise RuntimeError(f"cannot ssh to {node}: you hold no running job there, and no\n"
+                           "other allocation is available to bridge through. Start a lane:  hq-fleet up")
     workers, jobs, infos = hq_snapshot(node)
     lanes = squeue_lanes()
 
@@ -196,9 +268,12 @@ def build():
 def render(m) -> str:
     out = []
     srv = m["server"]["alloc"]
-    out.append("HQ lanes — server {}{}".format(
-        m["server"]["node"],
-        f"  (job {srv['jobid']}, {srv['left']} left)" if srv else "  (allocation not found)"))
+    bridge = m["server"]["node"]
+    if srv and srv["node"] == bridge:
+        where = f"server {bridge}  (job {srv['jobid']}, {srv['left']} left)"
+    else:
+        where = f"bridge {bridge}  (no hq-server job running -- server is unmanaged)"
+    out.append("HQ lanes — " + where)
     out.append("")
 
     rows = m["workers"]
