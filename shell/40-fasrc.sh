@@ -3,6 +3,17 @@
 # scratch mount exists, so FASRC-only partitions never leak onto other clusters.
 if [[ -d /n/netscratch ]]; then
 
+# Undo /etc/profile.d/linger.sh, which aliases tmux and screen to
+#   systemd-run --scope --user <cmd>
+# Its companion `loginctl enable-linger` fails on the login nodes ("Could not
+# enable linger: No such device or address"), so there is no systemd-logind user
+# session: XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are unset and the alias
+# dies with "Failed to create bus connection" before tmux is ever exec'd.
+# Pointing XDG_RUNTIME_DIR at the bus socket that does exist under /run/user/$UID
+# does not help either -- the scope itself then fails to start. Drop the wrapper.
+# /etc/profile.d runs before ~/.bashrc sources this file, so the unalias wins.
+unalias tmux screen 2>/dev/null
+
 # Interactive session allocation function
 interactive_session() {
     local device="cpu"
