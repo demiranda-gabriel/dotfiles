@@ -58,7 +58,7 @@ cmd open-terminal ${{
             md-view "$f"
             ;;
         *.pdf|*.epub|*.djvu|*.cbz|*.fb2|*.xps)
-            termpdf "$f"
+            doc-view "$f"
             ;;
         *.png|*.jpg|*.jpeg|*.gif|*.webp|*.tif|*.tiff|*.bmp)
             img-view "$f"

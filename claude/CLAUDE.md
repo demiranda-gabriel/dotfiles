@@ -153,10 +153,11 @@ All wired up by `~/dotfiles/bootstrap.sh --viewers`.
 | `tmux`     | Terminal multiplexer. Config at `~/.config/tmux/tmux.conf` (+ legacy `~/.tmux.conf` symlink for tmux <3.1) | `nelsonenzo/tmux-appimage`, extracted (no FUSE needed) |
 | `lf`       | File manager (replaces ranger). Config in `~/.config/lf/`     | binary, fetched |
 | `nvim`     | Editor. `$EDITOR`/`$VISUAL` when installed (`shell/60-lf.sh`), else system vim | static tarball, fetched |
-| `md-view`  | Markdown → PDF (pandoc + tectonic) → termpdf. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_ENGINE` (default `tectonic`) | `dotfiles/bin/` |
+| `md-view`  | Markdown → PDF (pandoc + **typst**) → doc-view. Body face Cantarell, maths New Computer Modern Math. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_FONT` (default `sans`), `MDVIEW_MATHFONT`, `MDVIEW_THEME` (`light`/`dark`), `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE` (default `typst`) | `dotfiles/bin/` + `config/mdview/mdview.typ` |
 | `img-view` | `kitten icat` wrapper, fits image in terminal box, clears before display. `exec`s `iip-view` when `TERM_PROGRAM=vscode` | `dotfiles/bin/` |
 | `iip-view` | iTerm2 inline-image protocol (OSC 1337) emitter — the VS Code lane (xterm.js speaks sixel + iTerm2, never the kitty protocol). Requires `terminal.integrated.enableImages`; `--place=WxH@XxY` as in `kitten icat`; no-tmux workflow | `dotfiles/bin/` |
-| `termpdf`  | Multi-page PDF / epub / djvu viewer using kitty graphics      | upstream py, fetched |
+| `doc-view` | Multi-page PDF / epub / djvu / cbz viewer. PyMuPDF renders, `kitten icat` displays, so it works inside tmux. Keys: `j`/`k` page, `w` fit-width, `+`/`-` zoom, `<n>g` goto, `r` reload, `q` | `dotfiles/bin/` |
+| `termpdf`  | Upstream viewer, fallback outside tmux only — it emits raw kitty APC with no tmux passthrough, so inside tmux it draws nothing | upstream py, fetched |
 | `tectonic` | Modern XeTeX engine, bundles TeX, auto-fetches packages — bypasses incomplete cluster TeX | binary, fetched |
 | `pandoc`   | Newer (3.9.0.2) — system pandoc on RHEL/Rocky 8 is too old for tectonic | binary, fetched |
 

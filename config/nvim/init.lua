@@ -10,6 +10,7 @@
 --   ruff          lint + format, also served over LSP
 --   tree-sitter   parser compiler for nvim-treesitter (gcc shim on old glibc)
 --   rg, fzf       fuzzy finder backends for fzf-lua
+--   latex2text    render-markdown's LaTeX-to-unicode converter
 
 -- A dead $XDG_RUNTIME_DIR (logind deletes /run/user/$UID on ALCF login nodes;
 -- see shell/05-xdg-runtime.sh) breaks serverstart(), which fzf-lua needs.
@@ -55,13 +56,19 @@ vim.pack.add({
   'https://github.com/neovim/nvim-lspconfig',
   { src = 'https://github.com/saghen/blink.cmp', version = vim.version.range('1.*') },
   'https://github.com/ibhagwan/fzf-lua',
+  'https://github.com/projekt0n/github-nvim-theme',
+  'https://github.com/MeanderingProgrammer/render-markdown.nvim',
 }, { confirm = false }) -- the list above is the approval; no install prompt
+
+require('github-theme').setup({})
+vim.cmd.colorscheme('github_dark_dimmed')
 
 -- -------------------------------------------------------------- treesitter --
 -- Parsers compile once, asynchronously, on first start (a few seconds each).
 local ts_langs = {
   'python', 'lua', 'bash', 'json', 'yaml', 'toml', 'markdown',
   'markdown_inline', 'vim', 'vimdoc', 'query', 'regex', 'rst',
+  'latex', -- needs `tree-sitter generate`; see install/tree-sitter-shim
 }
 require('nvim-treesitter').install(ts_langs)
 
@@ -158,6 +165,26 @@ require('blink.cmp').setup({
   -- would break on older clusters (the same reason tree-sitter needs a shim).
   fuzzy = { implementation = 'lua' },
 })
+
+-- -------------------------------------------------------- markdown view --
+-- In-buffer markdown rendering, ported from the FASRC setup (main, ad5f0da).
+-- Headings, tables, code blocks and checkboxes render in place; the raw text
+-- comes back on the cursor line. Equations: markdown_inline injects `latex`
+-- into every $...$ block, and render-markdown converts that tree to unicode
+-- with latex2text (install-nvim-python.sh). Single-line formulas render in
+-- place, multi-line blocks as virtual lines above. <leader>m toggles.
+require('render-markdown').setup({
+  completions = { lsp = { enabled = true } },
+  html = { enabled = false }, -- optional parsers nvim lacks; keeps :checkhealth clean
+  latex = { enabled = true },
+  yaml = { enabled = false },
+  -- Nerd Font glyphs are the default. If headings, bullets or checkboxes show
+  -- as empty boxes, the terminal font lacks them: use the ASCII fallback.
+  -- heading = { icons = { '# ', '## ', '### ', '#### ', '##### ', '###### ' } },
+  -- bullet  = { icons = { '-', '*', '+' } },
+  -- checkbox = { unchecked = { icon = '[ ]' }, checked = { icon = '[x]' } },
+})
+vim.keymap.set('n', '<leader>m', '<cmd>RenderMarkdown toggle<cr>', { desc = 'Toggle markdown rendering' })
 
 -- ---------------------------------------------------------------- fuzzy ----
 local fzf = require('fzf-lua')

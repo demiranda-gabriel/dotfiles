@@ -42,10 +42,11 @@ For reading documents over SSH+kitty without leaving the terminal.
 | `tmux`    | Terminal multiplexer. Config in `config/tmux/tmux.conf`. Installed from `nelsonenzo/tmux-appimage` (extracted, no FUSE needed) |
 | `lf`      | Terminal file manager (replaces ranger). Config in `config/lf/` |
 | `nvim`    | Editor — `$EDITOR`/`$VISUAL` when present (`shell/60-lf.sh`), else system vim. Upstream static tarball, not the AppImage, so it needs no FUSE on compute nodes |
-| `md-view` | `pandoc → tectonic → PDF → termpdf` for markdown notes. Font size via `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, engine via `MDVIEW_ENGINE` |
+| `md-view` | `pandoc → typst → PDF → doc-view` for markdown notes; ~30x faster than the TeX path. Page is sized to the terminal's aspect ratio. `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, `MDVIEW_FONT=sans\|serif\|<family>`, `MDVIEW_MATHFONT`, `MDVIEW_THEME=light\|dark`, `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE=typst\|tectonic` |
 | `img-view`| `kitten icat` wrapper, scales image to fit terminal box. In a VS Code terminal it `exec`s `iip-view` instead |
 | `iip-view`| iTerm2 inline-image protocol (OSC 1337) emitter — the VS Code lane, since xterm.js has no kitty-protocol support and kitty has no iTerm2 support. Needs `terminal.integrated.enableImages` on. `--place=WxH@XxY` mirrors `kitten icat` |
-| `termpdf` | Multi-page PDF/epub/djvu viewer using kitty graphics protocol |
+| `doc-view`| Multi-page PDF/epub/djvu viewer: PyMuPDF renders, `kitten icat` displays. Works inside tmux |
+| `termpdf` | Upstream viewer, kept as a fallback outside tmux (it has no tmux passthrough) |
 | `tectonic`| Modern XeTeX engine. Bundles its own TeX, auto-fetches packages — bypasses incomplete cluster TeX installs |
 
 Inside `lf`: `<enter>` opens **every** file type in VS Code (`code -r`,

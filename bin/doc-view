@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# doc-view — page through a PDF (or epub/djvu/cbz/xps/fb2) in a kitty terminal.
+#
+# Why this exists instead of termpdf: termpdf writes raw kitty graphics APC
+# sequences (\033_G...) with no tmux passthrough wrapper, so inside tmux the
+# pages are silently swallowed and nothing is ever drawn. doc-view renders with
+# PyMuPDF and displays through `kitten icat`, which detects tmux and switches to
+# passthrough + Unicode placeholders on its own. It also streams the image data
+# (the only transfer mode that works when the terminal is on another machine).
+#
+# Keys:  j/n/space next   k/p prev   g first   G last   <n>g goto page
+#        w toggle fit-page / fit-width   +/- zoom   0 reset   r reload   q quit
+#
+# Env:   DOCVIEW_PYTHON   interpreter to use (must import pymupdf)
+#        DOCVIEW_CELL_PX  fallback cell height in px when the terminal does not
+#                         report pixel dimensions (default 24)
+#        KITTEN           path to the kitten binary
+#        ICAT_TRANSFER_MODE  default stream; set memory when kitty is local
+
+set -euo pipefail
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/doc-view"
+PY_CACHE="$CACHE_DIR/python"
+
+has_fitz() { [[ -x "$1" ]] && "$1" -c 'import pymupdf' >/dev/null 2>&1; }
+
+resolve_python() {
+    # An explicit choice always wins.
+    if [[ -n "${DOCVIEW_PYTHON:-}" ]]; then
+        has_fitz "$DOCVIEW_PYTHON" && { printf '%s' "$DOCVIEW_PYTHON"; return 0; }
+        echo "doc-view: DOCVIEW_PYTHON=$DOCVIEW_PYTHON cannot import pymupdf" >&2
+        return 1
+    fi
+    # A previously resolved interpreter, if it still works.
+    if [[ -r "$PY_CACHE" ]]; then
+        local cached; cached="$(cat "$PY_CACHE")"
+        has_fitz "$cached" && { printf '%s' "$cached"; return 0; }
+    fi
+    # The dedicated venv first: it is immune to whatever project venv is active.
+    local cand
+    for cand in "$HOME/.local/share/pdfview/venv/bin/python" \
+                "$(command -v python3 2>/dev/null || true)" \
+                /usr/bin/python3; do
+        [[ -n "$cand" ]] || continue
+        if has_fitz "$cand"; then
+            mkdir -p "$CACHE_DIR" && printf '%s' "$cand" > "$PY_CACHE"
+            printf '%s' "$cand"; return 0
+        fi
+    done
+    return 1
+}
+
+if ! PY="$(resolve_python)"; then
+    cat >&2 <<'MSG'
+doc-view: no Python with PyMuPDF found.
+
+Install the dedicated viewer venv (independent of any project venv):
+    ~/dotfiles/install/install-pdfview.sh
+MSG
+    exit 1
+fi
+
+exec "$PY" - "$@" <<'PYEOF'
+import atexit
+import fcntl
+import os
+import re
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import tty
+from tempfile import TemporaryDirectory
+from threading import Thread
+
+# `import fitz` still works but emits a deprecation warning straight to the
+# terminal, which would corrupt the drawn page.
+try:
+    import pymupdf as fitz
+except ImportError:  # PyMuPDF < 1.24
+    import fitz
+
+KITTEN = os.environ.get(
+    "KITTEN", os.path.expanduser("~/.local/share/kitty-ssh-kitten/kitty/bin/kitten")
+)
+TMODE = os.environ.get("ICAT_TRANSFER_MODE", "stream")
+FALLBACK_CELL_PX = int(os.environ.get("DOCVIEW_CELL_PX", "24"))
+IN_TMUX = bool(os.environ.get("TMUX"))
+
+USAGE = """\
+usage: doc-view [-p PAGE] FILE
+
+keys
+  j n space Down PgDn   next page (or scroll down in fit-width)
+  k p Up PgUp           previous page (or scroll up in fit-width)
+  g                     first page      G  last page
+  <digits> g|G          go to page
+  w                     toggle fit-page / fit-width
+  + =                   zoom in         -  zoom out       0  reset zoom
+  r                     reload the file from disk
+  q Esc                 quit
+"""
+
+
+def die(msg, code=1):
+    sys.stderr.write("doc-view: %s\n" % msg)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- terminal ---
+
+class Term:
+    def __init__(self):
+        try:
+            self.fd = os.open("/dev/tty", os.O_RDWR)
+        except OSError:
+            die("no controlling terminal")
+        self.tty = os.fdopen(self.fd, "rb+", buffering=0)
+        self._saved = termios.tcgetattr(self.fd)
+
+    def size(self):
+        """(rows, cols, cell_w_px, cell_h_px).
+
+        TIOCGWINSZ carries pixel dimensions when the terminal reports them;
+        kitty does, and tmux forwards its pane geometry. When they come back
+        zero we fall back to a plausible cell height and a 1:2 cell aspect.
+        """
+        try:
+            packed = fcntl.ioctl(self.fd, termios.TIOCGWINSZ, b"\0" * 8)
+            rows, cols, xpix, ypix = struct.unpack("HHHH", packed)
+        except OSError:
+            rows, cols, xpix, ypix = 24, 80, 0, 0
+        rows = rows or 24
+        cols = cols or 80
+        if xpix and ypix:
+            return rows, cols, xpix / cols, ypix / rows
+        return rows, cols, FALLBACK_CELL_PX / 2, FALLBACK_CELL_PX
+
+    def raw(self):
+        tty.setraw(self.fd)
+
+    def restore(self):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
+
+    def write(self, s):
+        self.tty.write(s.encode())
+        self.tty.flush()
+
+    def read_key(self):
+        """One keypress, with the common escape sequences decoded."""
+        b = self.tty.read(1)
+        if not b:
+            return "q"
+        if b != b"\x1b":
+            return b.decode("utf-8", "replace")
+        # Escape: could be a bare Esc or the start of a CSI sequence. Peek
+        # without blocking so a lone Esc still quits immediately.
+        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        try:
+            rest = self.tty.read(8) or b""
+        except (BlockingIOError, TypeError):
+            rest = b""
+        finally:
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, flags)
+        seq = rest.decode("latin-1")
+        return {
+            "[A": "k", "[B": "j", "[C": "j", "[D": "k",
+            "[5~": "k", "[6~": "j",
+            "[H": "g", "[F": "G",
+        }.get(seq, "\x1b")
+
+
+# ------------------------------------------------------------------ viewer ---
+
+class Viewer:
+    def __init__(self, path, term, page=0):
+        self.path = os.path.abspath(path)
+        self.term = term
+        self.tmp = TemporaryDirectory(prefix="doc-view-")
+        self.cache = {}          # render key -> png path on disk
+        self.zoom = 1.0
+        self.fit = "page"        # or "width"
+        self.yoff = 0            # scroll offset in px, fit-width only
+        self.msg = ""
+        self.pending = ""        # digit prefix for <n>g
+        self.open_doc()
+        self.page = max(0, min(page, self.npages - 1))
+
+    def open_doc(self):
+        try:
+            self.doc = fitz.open(self.path)
+        except Exception as exc:                       # noqa: BLE001
+            die("cannot open %s: %s" % (self.path, exc))
+        if self.doc.needs_pass:
+            die("%s is password protected" % self.path)
+        self.npages = self.doc.page_count
+        if self.npages == 0:
+            die("%s has no pages" % self.path)
+        self.cache.clear()
+
+    # -- geometry ----------------------------------------------------------
+    def box(self):
+        """Display rectangle in (cols, rows, px_w, px_h).
+
+        One row is reserved for the status line. Under tmux one column is
+        shaved: a Unicode placeholder written to the final column triggers
+        autowrap and drags the rightmost cells onto the next row.
+        """
+        rows, cols, cw, ch = self.term.size()
+        bcols = max(1, cols - (1 if IN_TMUX else 0))
+        brows = max(1, rows - 1)
+        return bcols, brows, int(bcols * cw), int(brows * ch)
+
+    # -- rendering ---------------------------------------------------------
+    def render(self, pno, yoff=0):
+        bcols, brows, bw, bh = self.box()
+        page = self.doc[pno]
+        pw, ph = page.rect.width, page.rect.height
+        if self.fit == "width":
+            scale = (bw / pw) * self.zoom
+            clip = fitz.Rect(0, yoff / scale, pw, (yoff + bh) / scale)
+            clip = clip & page.rect
+        else:
+            scale = min(bw / pw, bh / ph) * self.zoom
+            clip = None
+        key = "%d-%s-%.3f-%d-%dx%d" % (pno, self.fit, self.zoom, yoff, bw, bh)
+        hit = self.cache.get(key)
+        if hit and os.path.exists(hit):
+            return hit
+        out = os.path.join(self.tmp.name, key.replace("/", "_") + ".png")
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
+                              alpha=False)
+        pix.save(out)
+        self.cache[key] = out
+        return out
+
+    def page_px_height(self, pno):
+        bcols, brows, bw, bh = self.box()
+        page = self.doc[pno]
+        return page.rect.height * (bw / page.rect.width) * self.zoom
+
+    def prefetch(self, pno):
+        if 0 <= pno < self.npages:
+            Thread(target=self._prefetch_quiet, args=(pno,), daemon=True).start()
+
+    def _prefetch_quiet(self, pno):
+        try:
+            self.render(pno, 0)
+        except Exception:                              # noqa: BLE001
+            pass
+
+    # -- drawing -----------------------------------------------------------
+    def icat_clear(self):
+        subprocess.run(
+            [KITTEN, "icat", "--clear", "--silent", "--stdin=no",
+             "--transfer-mode", TMODE],
+            stdin=subprocess.DEVNULL, stdout=self.term.tty,
+            stderr=subprocess.DEVNULL, check=False,
+        )
+
+    def draw(self):
+        bcols, brows, bw, bh = self.box()
+        try:
+            png = self.render(self.page, self.yoff)
+        except Exception as exc:                       # noqa: BLE001
+            self.msg = "render failed: %s" % exc
+            png = None
+        self.icat_clear()
+        self.term.write("\x1b[H\x1b[2J")               # drop stale placeholders
+        if png:
+            subprocess.run(
+                [KITTEN, "icat", "--silent", "--stdin=no",
+                 "--transfer-mode", TMODE, "--scale-up", "--align=center",
+                 "--place", "%dx%d@0x0" % (bcols, brows), "--", png],
+                stdin=subprocess.DEVNULL, stdout=self.term.tty,
+                stderr=subprocess.DEVNULL, check=False,
+            )
+        self.status()
+        self.prefetch(self.page + 1)
+
+    def status(self):
+        rows, cols, _, _ = self.term.size()
+        name = os.path.basename(self.path)
+        left = "%s  %d/%d" % (name, self.page + 1, self.npages)
+        right = "%s%s%s" % (
+            self.fit,
+            "" if abs(self.zoom - 1.0) < 1e-3 else "  %.0f%%" % (self.zoom * 100),
+            "  " + self.msg if self.msg else "",
+        )
+        pad = max(1, cols - len(left) - len(right) - 1)
+        line = (left + " " * pad + right)[: cols - 1]
+        self.term.write("\x1b[%d;1H\x1b[2K\x1b[7m %s \x1b[0m" % (rows, line))
+
+    # -- navigation --------------------------------------------------------
+    def goto(self, pno):
+        pno = max(0, min(pno, self.npages - 1))
+        if pno != self.page:
+            self.page = pno
+            self.yoff = 0
+            return True
+        return False
+
+    def scroll(self, direction):
+        """Down/up by half a screen in fit-width; page turn at the edges."""
+        if self.fit != "width":
+            return self.goto(self.page + direction)
+        _, _, _, bh = self.box()
+        total = self.page_px_height(self.page)
+        step = max(1, bh // 2)
+        new = self.yoff + direction * step
+        if new < 0:
+            if self.page == 0:
+                self.yoff = 0
+                return True
+            self.page -= 1
+            self.yoff = max(0, int(self.page_px_height(self.page)) - bh)
+            return True
+        if new + bh > total:
+            if total <= bh or new >= total - bh:
+                if self.page >= self.npages - 1:
+                    self.yoff = max(0, int(total) - bh)
+                    return True
+                self.page += 1
+                self.yoff = 0
+                return True
+        self.yoff = new
+        return True
+
+    # -- loop --------------------------------------------------------------
+    def run(self):
+        self.draw()
+        while True:
+            k = self.term.read_key()
+            self.msg = ""
+            if k.isdigit():
+                self.pending += k
+                self.status()
+                continue
+            count = int(self.pending) if self.pending else None
+            self.pending = ""
+
+            if k in ("q", "\x1b", "\x03"):
+                return
+            elif k in ("j", "n", " ", "\r"):
+                self.scroll(+1)
+            elif k in ("k", "p"):
+                self.scroll(-1)
+            elif k == "g":
+                self.goto((count - 1) if count else 0)
+            elif k == "G":
+                self.goto((count - 1) if count else self.npages - 1)
+            elif k == "w":
+                self.fit = "width" if self.fit == "page" else "page"
+                self.yoff = 0
+            elif k in ("+", "="):
+                self.zoom = min(6.0, self.zoom * 1.25)
+            elif k == "-":
+                self.zoom = max(0.2, self.zoom / 1.25)
+            elif k == "0":
+                self.zoom, self.yoff = 1.0, 0
+            elif k == "r":
+                keep = self.page
+                self.open_doc()
+                self.page = min(keep, self.npages - 1)
+                self.msg = "reloaded"
+            elif k == "?":
+                self.msg = "j/k page  w fit  +/- zoom  r reload  q quit"
+                self.status()
+                continue
+            else:
+                self.status()
+                continue
+            self.draw()
+
+
+def main():
+    args = sys.argv[1:]
+    page = 0
+    path = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            return 0
+        if a in ("-p", "--page-number", "--page"):
+            i += 1
+            if i >= len(args) or not args[i].lstrip("+-").isdigit():
+                die("-p needs a page number")
+            page = int(args[i]) - 1
+        elif re.fullmatch(r"-p\d+", a):
+            page = int(a[2:]) - 1
+        elif a == "--":
+            i += 1
+            if i < len(args):
+                path = args[i]
+        elif path is None:
+            path = a
+        i += 1
+
+    if path is None:
+        sys.stderr.write(USAGE)
+        return 2
+    if not os.path.isfile(path):
+        die("no such file: %s" % path)
+
+    term = Term()
+    viewer = Viewer(path, term, page)
+
+    def cleanup():
+        try:
+            viewer.icat_clear()
+            term.write("\x1b[H\x1b[2J")
+        finally:
+            term.restore()
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGWINCH, lambda *_: viewer.draw())
+    term.raw()
+    try:
+        viewer.run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
