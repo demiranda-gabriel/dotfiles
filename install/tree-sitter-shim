@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Minimal stand-in for the tree-sitter CLI, for hosts whose glibc is too old
+# for the upstream prebuilt binary (every release from 0.26.1 on needs glibc
+# 2.39; Polaris has 2.38, FASRC Rocky 8 has 2.28).
+#
+# nvim-treesitter (main branch) calls the CLI for exactly two things:
+#   tree-sitter build -o parser.so   compile src/parser.c (+ scanner.c)
+#   tree-sitter generate ...         regenerate parser.c from grammar.js
+# `build` is just a C compile, done here with gcc. `generate` is only needed by
+# the few grammars that ship without a generated parser.c; it fails loudly.
+# The version string satisfies :checkhealth's minimum-version test.
+set -euo pipefail
+
+case "${1:-}" in
+    --version|-V)
+        echo "tree-sitter 0.26.1 (gcc shim: install/tree-sitter-shim in dotfiles)"
+        ;;
+    build)
+        shift
+        out=parser.so
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -o|--output) out="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        [[ -f src/parser.c ]] || { echo "tree-sitter shim: no src/parser.c in $PWD" >&2; exit 1; }
+        srcs=(src/parser.c)
+        [[ -f src/scanner.c ]] && srcs+=(src/scanner.c)
+        if [[ -f src/scanner.cc ]]; then
+            echo "tree-sitter shim: C++ scanners are not supported" >&2; exit 1
+        fi
+        # Plain gcc, not $CC or `cc`: on Polaris `cc` is the Cray PE wrapper.
+        "${TS_SHIM_CC:-gcc}" -shared -fPIC -O2 -std=c11 -I src "${srcs[@]}" -o "$out"
+        ;;
+    *)
+        echo "tree-sitter shim: '${1:-}' not supported (only build/--version); this grammar needs the real CLI" >&2
+        exit 1
+        ;;
+esac
