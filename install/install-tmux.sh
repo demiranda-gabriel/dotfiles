@@ -44,5 +44,17 @@ if [[ ! -x "$inner" ]]; then
     exit 1
 fi
 
-ln -sf "$inner" "$LOCAL_BIN/tmux"
+# Wrapper: the static binary's compiled-in terminfo path doesn't exist here, so
+# without TERMINFO_DIRS it fails with "missing or unsuitable terminal".
+# (The AppImage's AppRun sets TERMINFO; the wrapper stands in for it.)
+mkdir -p "$SOFTWARE/bin"
+cat > "$SOFTWARE/bin/tmux" <<'WRAP'
+#!/bin/sh
+d="$HOME/software/tmux/squashfs-root/usr"
+export TERMINFO_DIRS="$d/share/terminfo:/usr/share/terminfo${TERMINFO_DIRS:+:$TERMINFO_DIRS}"
+exec "$d/bin/tmux" "$@"
+WRAP
+chmod +x "$SOFTWARE/bin/tmux"
+
+ln -sf "$SOFTWARE/bin/tmux" "$LOCAL_BIN/tmux"
 echo "✓ tmux installed: $("$LOCAL_BIN/tmux" -V)"

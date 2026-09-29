@@ -7,10 +7,12 @@ esac
 # Standalone tmux (install/install-tmux.sh) as a PATH *fallback*. On Polaris
 # ~/.local/bin/tmux -> /usr/bin/tmux, which exists on login nodes but not on
 # compute nodes; there the symlink dangles, PATH lookup skips it, and this
-# appended dir supplies tmux. Appended (not prepended) so login nodes keep the
+# appended dir supplies tmux. It holds a wrapper (made by install-tmux.sh) that
+# sets TERMINFO_DIRS — the bare binary fails with "missing or unsuitable
+# terminal". Appended (not prepended) so login nodes keep the
 # system tmux their long-lived hq/fleet servers run under — a different client
 # version can fail to attach with a protocol mismatch.
-_tmux_fallback="$HOME/software/tmux/squashfs-root/usr/bin"
+_tmux_fallback="$HOME/software/tmux/bin"
 if [ -x "$_tmux_fallback/tmux" ]; then
     case ":$PATH:" in
         *":$_tmux_fallback:"*) ;;
