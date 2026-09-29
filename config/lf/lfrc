@@ -183,7 +183,11 @@ map yK kitty_download
 # kitty permits clipboard *writes* by default, so no Mac-side config needed.
 # Inside tmux the OSC 52 is wrapped in a passthrough sequence so tmux forwards
 # it raw to kitty; outside tmux it goes direct. The path is also echoed to the
-# message line as a visible, mouse-selectable fallback.
+# message line as a visible, mouse-selectable fallback. If `lf -remote` cannot
+# reach lf's server (dead $XDG_RUNTIME_DIR on an ALCF login node, see
+# shell/05-xdg-runtime.sh), the copy has already happened, so confirm through
+# the tmux status line (or the bare terminal) instead of failing with exit
+# status 1.
 cmd copy_path ${{
     b64=$(printf '%s' "$f" | base64 | tr -d '\n')
     if [ -n "$TMUX" ]; then
@@ -191,7 +195,14 @@ cmd copy_path ${{
     else
         printf '\033]52;c;%s\007' "$b64" > /dev/tty
     fi
-    lf -remote "send $id echo copied to clipboard: $f"
+    if ! lf -remote "send $id echo copied to clipboard: $f" 2>/dev/null; then
+        if [ -n "$TMUX" ]; then
+            tmux display-message "copied to clipboard: $f"
+        else
+            printf 'copied to clipboard: %s\n' "$f" > /dev/tty
+            sleep 1
+        fi
+    fi
 }}
 map Y copy_path
 
