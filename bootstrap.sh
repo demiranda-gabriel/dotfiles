@@ -23,7 +23,8 @@ for arg in "$@"; do
         -h|--help)
             cat <<EOF
 Usage: bootstrap.sh [--viewers]
-  --viewers   Also fetch the tool stack (lf, tmux, tectonic, pandoc, the PDF
+  --viewers   Also fetch the tool stack (lf, tmux, nvim + markdown rendering,
+              tectonic, pandoc, the PDF
               viewers (doc-view venv + termpdf), gh,
               and the VS Code CLI for login-node tunnels) into ~/.local/bin
               (10s of MB downloaded — only run on a host where you want them)
@@ -118,26 +119,26 @@ fi
 
 # 3c. Symlink ~/.config/<app>/* contents from dotfiles/config/<app>/
 # Per-file symlinks (not whole-dir) so other config files in the same app dir
-# aren't shadowed.
+# aren't shadowed. Subdirectories (e.g. config/nvim/lsp/) are recreated as real
+# dirs and their files linked the same way.
 for app_dir in "$DOTFILES"/config/*/; do
     [[ -d "$app_dir" ]] || continue
     app="$(basename "$app_dir")"
-    dest_dir="$CONFIG_DIR/$app"
-    mkdir -p "$dest_dir"
-    for src in "$app_dir"*; do
-        [[ -f "$src" ]] || continue
-        target="$dest_dir/$(basename "$src")"
+    while IFS= read -r -d '' src; do
+        rel="${src#"$app_dir"}"
+        target="$CONFIG_DIR/$app/$rel"
+        mkdir -p "$(dirname "$target")"
         if [[ -L "$target" || -e "$target" ]]; then
             if [[ "$(readlink -f "$target" 2>/dev/null)" == "$src" ]]; then
-                echo "✓ ~/.config/$app/$(basename "$src") already linked"
+                echo "✓ ~/.config/$app/$rel already linked"
                 continue
             fi
             echo "⚠ $target exists and points elsewhere — skipping"
             continue
         fi
         ln -s "$src" "$target"
-        echo "✓ linked ~/.config/$app/$(basename "$src")"
-    done
+        echo "✓ linked ~/.config/$app/$rel"
+    done < <(find "$app_dir" -type f -print0 | sort -z)
 done
 
 # 3c.1. Legacy ~/.tmux.conf symlink — tmux <3.1 does not honor XDG path.
@@ -176,7 +177,7 @@ if [[ -d /n/netscratch ]]; then
     fi
 fi
 
-# 3d. Optional install stack (lf, tmux, tectonic, pandoc, pdf viewers)
+# 3d. Optional install stack (lf, tmux, nvim, tectonic, pandoc, pdf viewers)
 if (( INSTALL_VIEWERS )); then
     echo
     echo "=== Installing tool stack ==="
@@ -190,7 +191,7 @@ fi
 # 4. Toolchain probe
 echo
 echo "=== Toolchain ==="
-for tool in rclone pigz tar tmux lf tectonic pandoc doc-view termpdf pdftoppm code gh; do
+for tool in rclone pigz tar tmux lf nvim latex2text tectonic pandoc doc-view termpdf pdftoppm code gh; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo "✓ $tool: $(command -v "$tool")"
     else

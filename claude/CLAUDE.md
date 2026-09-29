@@ -98,13 +98,15 @@ All wired up by `~/dotfiles/bootstrap.sh --viewers`.
 | `lf`       | File manager (replaces ranger). Config in `~/.config/lf/`     | binary, fetched |
 | `md-view`  | Markdown → PDF (pandoc + **typst**) → doc-view. Body face Cantarell, maths New Computer Modern Math. Env: `MDVIEW_FONTSIZE` (default `14pt`; valid `10|11|12|14|17|20`), `MDVIEW_FONT` (default `sans`), `MDVIEW_MATHFONT`, `MDVIEW_THEME` (`light`/`dark`), `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE` (default `typst`) | `dotfiles/bin/` + `config/mdview/mdview.typ` |
 | `img-view` | `kitten icat` wrapper, fits image in terminal box, clears before display | `dotfiles/bin/` |
+| `nvim`     | Markdown rendered in the editor buffer by `render-markdown.nvim` (headings, tables, LaTeX via `latex2text` + tree-sitter latex parser). `<leader>m` toggles. Config `config/nvim/`; plugins via `vim.pack` (nvim ≥0.12) | `install/install-nvim.sh` (conda-forge nvim where glibc is too old for the release tarball) |
 | `doc-view` | Multi-page PDF / epub / djvu / cbz viewer. PyMuPDF renders, `kitten icat` displays, so it works inside tmux. Keys: `j`/`k` page, `w` fit-width, `+`/`-` zoom, `<n>g` goto, `r` reload, `q` | `dotfiles/bin/` |
 | `termpdf`  | Upstream viewer, fallback outside tmux only — it emits raw kitty APC with no tmux passthrough, so inside tmux it draws nothing | upstream py, fetched |
 | `tectonic` | Modern XeTeX engine, bundles TeX, auto-fetches packages — bypasses incomplete cluster TeX | binary, fetched |
 | `pandoc`   | Newer (3.9.0.2) — system pandoc on RHEL/Rocky 8 is too old for tectonic | binary, fetched |
 
 **Inside `lf`:** `<enter>` dispatches by extension (md → md-view, pdf →
-doc-view, image → img-view). `B`/`H` for big/huge font markdown, `P` for
+doc-view, image → img-view). `e` opens in nvim (the in-editor
+rendered view of markdown). `B`/`H` for big/huge font markdown, `P` for
 first-page pdf peek, `yK` for kitty transfer download to local Mac, `R`
 to reload config. Quit drops parent shell into last-visited dir.
 

@@ -20,14 +20,15 @@ The bootstrap script is idempotent. It:
 4. Creates an extra Claude config home `~/.claude-<name>` for every name in
    `claude/profiles` (see "Claude Code profiles" below).
 5. Per-file symlinks `config/<app>/*` into `~/.config/<app>/` (currently
-   `lf`, `tmux`). For `tmux` also creates `~/.tmux.conf` as a fallback
+   `lf`, `mdview`, `nvim`, `tmux`; subdirectories such as `nvim/lsp/` are
+   linked file by file too). For `tmux` also creates `~/.tmux.conf` as a fallback
    for tmux <3.1 (which doesn't honor the XDG path).
-6. Probes for `rclone`, `pigz`, `tmux`, `lf`, `tectonic`, `pandoc`,
+6. Probes for `rclone`, `pigz`, `tmux`, `lf`, `nvim`, `latex2text`, `tectonic`, `pandoc`,
    `doc-view`, `termpdf`, `pdftoppm`, and a configured `mir-backup:` remote;
    reports missing.
 
 Pass `--viewers` to also fetch the tool stack
-(`lf`, `tmux`, `tectonic`, `pandoc`, and the PDF viewer venv) into
+(`lf`, `tmux`, `nvim` with markdown rendering, `tectonic`, `pandoc`, and the PDF viewer venv) into
 `~/.local/bin/` and `~/software/`:
 
 ```bash
@@ -46,6 +47,7 @@ For reading documents over SSH+kitty without leaving the terminal.
 | `lf`      | Terminal file manager (replaces ranger). Config in `config/lf/` |
 | `md-view` | `pandoc → typst → PDF → doc-view` for markdown notes; ~30x faster than the TeX path. Page is sized to the terminal's aspect ratio. `MDVIEW_FONTSIZE=14pt\|17pt\|20pt`, `MDVIEW_FONT=sans\|serif\|<family>`, `MDVIEW_MATHFONT`, `MDVIEW_THEME=light\|dark`, `MDVIEW_COLUMNS`, `MDVIEW_JUSTIFY`, `MDVIEW_ENGINE=typst\|tectonic` |
 | `img-view`| `kitten icat` wrapper, scales image to fit terminal box       |
+| `nvim`    | In-editor markdown view: `render-markdown.nvim` draws headings, tables, code blocks and LaTeX (via `latex2text` + the tree-sitter latex parser) in the buffer. Config in `config/nvim/`; `<leader>m` toggles. Installed by `install/install-nvim.sh` |
 | `doc-view`| Multi-page PDF/epub/djvu viewer: PyMuPDF renders, `kitten icat` displays. Works inside tmux |
 | `termpdf` | Upstream viewer, kept as a fallback outside tmux (it has no tmux passthrough) |
 | `tectonic`| Modern XeTeX engine. Bundles its own TeX, auto-fetches packages — bypasses incomplete cluster TeX installs |
@@ -53,7 +55,8 @@ For reading documents over SSH+kitty without leaving the terminal.
 Inside `lf`: `<enter>` dispatches by extension (md → md-view, pdf →
 doc-view, image → img-view). `B` / `H` for big/huge font markdown, `P`
 for first-page PDF peek, `yK` for kitty transfer download to local Mac.
-`R` reloads the lf config.
+`R` reloads the lf config. `e` opens the file in `$EDITOR` (nvim), which
+is the second way to read markdown: rendered in place, and editable.
 
 ## tmux config
 
@@ -177,9 +180,11 @@ dotfiles/
 ├── config/                              ← per-file symlinks into ~/.config/<app>
 │   ├── lf/{lfrc,preview,cleaner}
 │   ├── mdview/mdview.typ                ← typst template md-view renders through
+│   ├── nvim/{init.lua,nvim-pack-lock.json,lsp/} ← vim.pack plugins incl. render-markdown.nvim
 │   └── tmux/tmux.conf                   ← also symlinked to ~/.tmux.conf (legacy fallback)
 ├── install/                             ← idempotent fetchers (run with --viewers)
 │   ├── install-lf.sh
+│   ├── install-nvim.sh                  ← nvim ≥0.12 (conda-forge fallback on old glibc) + latex2text venv + latex parser
 │   ├── install-tmux.sh
 │   ├── install-tectonic.sh
 │   ├── install-pandoc.sh
