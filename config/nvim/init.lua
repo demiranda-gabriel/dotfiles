@@ -46,7 +46,6 @@ o.splitright = true
 o.splitbelow = true
 o.scrolloff = 8
 o.updatetime = 250
-o.colorcolumn = '89'           -- ruff/black default line length is 88
 o.list = true
 o.listchars = { tab = '» ', trail = '·', nbsp = '␣' }
 
