@@ -506,3 +506,142 @@ leave a stub whose queue does not exist — its `qsub` then fails at submit time
 while the managed loop uses the new path. (Used once on 2026-08-15 before the
 short-hostname ssh route was found; the stub has since been removed.) The bravo
 worker lives at `~/.hq/bravo/worker.pbs`.
+
+## Three fleets: charlie (prod/medium, on demand)
+
+Added 2026-09-30. Polaris was full (2 of 560 nodes free) and bravo's
+`preemptable` pool is only 56 nodes machine-wide: over Sep 15–30 bravo delivered
+~690 node-hours, an average of 1.9 nodes (8 GPUs) against its 40-GPU ceiling,
+with 44–136 h waits per 1-node job. `capacity` cannot grow (32 nodes total
+across all projects, 1 running job per project). The only accessible queue that
+reaches the 496-node production pool is the `prod` route: `small` (10–24 nodes,
+3 h), `medium` (25–99 nodes, 6 h), `large` (100+, 24 h). Charlie uses `medium`.
+
+| | **alpha** (`hq-fleet`) | **bravo** (`bravo-fleet`) | **charlie** (`charlie-fleet`) |
+|---|---|---|---|
+| queue | `capacity` | `preemptable` | `prod` → `medium` |
+| shape | 4 nodes × 168 h | many 1-node × ≤72 h | 25 nodes × 6 h (100 A100s) |
+| project limits | 1 running, 2 in flight | 10 running / 20 queued | 10 queued+running in `medium`, shared with teammates |
+| HQ server | shared (`hq`) | PRIVATE (`hqb`) | PRIVATE (`hqb`) |
+| supply policy | always on | always full queue | **on demand**, plus 1 standby |
+| observed wait | 13 h gap per weekly handover | 44–136 h | 6–24 h |
+| cost per allocation | 672 node-h | ≤72 node-h | 150 node-h |
+
+### Why a ticker and not autoalloc
+
+`hq alloc add` was the first choice: it submits only while tasks wait, ends idle
+workers, and handles worker time limits natively. It works for debug-sized
+lanes (the 2-node `debug-scaling` smoke on 2026-09-30, PBS 7670961 and 7671022,
+came up cleanly with `pbsdsh`). It cannot drive `medium`: autoalloc sizes each
+allocation to the waiting demand, one 2-GPU task produced `#PBS -l select=1`,
+and `prod` rejects anything under 10 nodes. PBS keeps the **first** `-l select`
+directive, so a trailing `-l select=25` in the extra args does not override it
+(tested with a held job, PBS 7671494). Hence `charlie-fleet`: a `bravo-fleet`
+clone that reads demand from the bravo server's JSON and submits fixed 25-node
+jobs.
+
+Policy per tick (every `CHARLIE_INTERVAL`, 300 s):
+
+```
+demand = tasks WAITING on hqb + tasks RUNNING on charlie workers
+target = CHARLIE_MAX_QUEUED (2) if demand > 0 else CHARLIE_STANDBY (1)
+submit until queued == target, never past CHARLIE_MAX_INFLIGHT (3)
+```
+
+Running tasks count as demand so the **next** allocation is already queued and
+accruing eligible time while the current one runs. That is the whole answer to
+"request the next allocation at the right time": on Polaris there is no way to
+time a start, only to hold a place in line. `STANDBY=1` keeps one allocation
+queued even when idle so work submitted later finds one close to starting; if
+it starts empty its workers exit after `CHARLIE_IDLE` (20 min), about 8
+node-hours, and the loop re-queues one. Nothing is ever auto-cancelled: a queued
+job's eligible time is worth more than 8 node-hours.
+
+```bash
+charlie-fleet status        # jobs, demand, workers
+DRY_RUN=1 charlie-fleet tick
+charlie-fleet up 1          # force one allocation, ignoring demand
+charlie-fleet down-queued   # drop the reserve; running allocations untouched
+charlie-fleet down          # qdel everything charlie
+```
+
+The loop is `tmux charlie-fleet` on **login-01**, next to `hq-fleet` and
+`bravo-fleet`. Worker script `~/.hq/charlie/worker.pbs` (rendered from
+`scripts/hq/charlie-worker.pbs.tmpl`), job name `charlie-25n`, invisible to the
+other two orchestrators (exact-name and `bravo-1n` prefix matches). Log
+`~/.hq/charlie/fleet.log`; Slack on every submit, start and end.
+
+### How a task survives an allocation boundary (verified 2026-09-30)
+
+Nothing "transports" tasks between allocations. The HQ server on login-01 is the
+durable queue; workers are disposable. Measured on the debug-scaling smoke with a
+signal-trapping task, once via `hq worker stop` (PBS 7670961) and once via the
+worker's `--time-limit` (PBS 7671022):
+
+1. At the limit the worker sends **SIGINT** to each task and kills it about
+   **1 s** later. There is no usable grace window; a graceful pre-expiry save is
+   not possible.
+2. The task returns to **WAITING**, not FAILED. `hq submit --help`: the crash
+   counter is not incremented when the worker is stopped or reaches its time
+   limit, so `--crash-limit 50` is never spent on chunk boundaries.
+3. HQ re-places it on the next worker with enough time left. `--time-request 1h`
+   (exp-26's submitter) keeps a task off a 6 h worker in its last hour; on a 22
+   min test worker it would never be placed, so drills use `--time-request 5m`.
+4. The task body resumes from `last.ckpt` (Lightning restores epoch, optimizer,
+   LR schedule; the partial epoch is lost). With `save_last: true` on every
+   validation epoch, G0's ~57 s epochs bound the training loss per boundary to
+   under one epoch. The real cost is startup: **~10.5 min per leg** for the
+   exp-26 body (attempt start → first training step), almost all of it the
+   OpenEquivariance JIT compile, which both DDP ranks redo on every leg. That
+   is 3 % of a 6 h charlie chunk and the first thing to shave if chunks ever
+   get shorter (a persistent extension cache would remove most of it).
+5. Lightning does log "Detected KeyboardInterrupt, attempting graceful
+   shutdown" on the SIGINT, but the kill arrives before any checkpoint is
+   written (`last.ckpt` mtime unchanged at the cut). Do not count on it.
+
+Consequences for task bodies:
+
+- Checkpoint at least once per epoch and never longer than ~15 min apart.
+- HQ **truncates** a task's stdout/stderr when the task is requeued: the same
+  `%{JOB_ID}`/`%{TASK_ID}` path is reopened. Use `%{INSTANCE_ID}` in the log
+  path (`name.%{JOB_ID}.%{INSTANCE_ID}.out`) so every leg keeps its own file;
+  exp-26's `submit_arm.sh` did not, so each preemption erased the previous
+  leg's console log.
+- A wandb id fixed to the run name (`resume: allow`) keeps one run across legs.
+
+### Resume drill (2026-09-30, hqb job 959)
+
+One real exp-26 G0 training task (2-GPU DDP, `--time-request 5m`, 28 epochs,
+wandb offline, tag `drill`) on autoalloc `debug` workers with a 22-min time
+limit, so it crossed boundaries every ~22 min:
+
+| leg | node | allocation | ran | reached |
+|---|---|---|---|---|
+| 1 | x3004c0s13b1n0 | 7671734 (debug, 0 min wait) | 17:56–18:17 | epoch 9, step 1350; `last.ckpt` 36 s before the cut |
+| 2 | x3001c0s7b0n0 | 7671923 (queued 5 s after the cut, 1 min wait) | 18:19–18:41 | resumed at epoch 10 from `last.ckpt`; epoch 20, step 2835 |
+| 3 | x3001c0s7b0n0 | 7672112 (queued at the cut, 2 min wait) | 18:43–18:59 | resumed at epoch 21; finished epoch 27, step 3780; task FINISHED |
+
+HQ reports one job, FINISHED, makespan 1 h 3 min. Each leg spent ~10.5 min in
+startup (OEQ JIT) and the rest training at ~57 s/epoch; the three cuts cost
+under a minute of training each.
+
+Same wandb id across legs (`G0_graphene_ddp2_drill`, one offline dir per leg,
+same id suffix), one continuous Hydra `train.log` in the run dir, per-leg HQ
+logs `e26_G0_drill.959.{0,1,2}.out` thanks to `%{INSTANCE_ID}`. Two earlier
+attempts (jobs 955, 957) failed on x3003c0s25b0n0, a debug-pool node with three
+GPUs in `[GPU requires reset]` state; PBS handed the node back immediately after
+it was freed, so the retry had to park a dummy task on it and use the `debug`
+queue (separate per-user limit) to land elsewhere. `prod` nodes cannot be
+MIG-toggled by users, so charlie is less exposed to this than the debug lanes.
+
+The failed attempts also exposed a latent bug in exp-26's `hq_train_arm.sh`: the
+body enables `set -e` after attempt 1, so on attempt 2 the checkpoint lookup
+`CKPT=$(ls -1t "$OUTDIR"/last*.ckpt | head -1)` is fatal (exit 2) when no
+checkpoint exists yet. It only bites when attempt 1 dies before the first
+checkpoint; `|| true` on that line fixes it (applied to the drill's frozen copy
+only).
+
+### What the tests cost
+
+Three debug-scaling allocations: 1 node × 1.3 min (probe), 2 nodes × 22 min,
+1 node × ~22 min, plus one held job for the select test. Under 2 node-hours.

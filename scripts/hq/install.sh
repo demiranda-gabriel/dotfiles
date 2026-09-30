@@ -123,6 +123,9 @@ HQ_CAP_WALL="${HQ_CAP_WALL:-168:00:00}"
 HQ_BRIDGE_QUEUE="${HQ_BRIDGE_QUEUE:-preemptable}"
 HQ_BRIDGE_WALL="${HQ_BRIDGE_WALL:-72:00:00}"
 HQ_DEBUG_QUEUE="${HQ_DEBUG_QUEUE:-debug}"
+HQ_CHARLIE_QUEUE="${HQ_CHARLIE_QUEUE:-prod}"       # route queue; 25 nodes lands in `medium`
+HQ_CHARLIE_NODES="${HQ_CHARLIE_NODES:-25}"
+HQ_CHARLIE_WALL="${HQ_CHARLIE_WALL:-06:00:00}"
 
 echo "=== HyperQueue fleet install (PBS; account=$HQ_ACCOUNT system=$HQ_SYSTEM nodes=$HQ_NODES) ==="
 mkdir -p "$HQDIR/shim"
@@ -133,6 +136,7 @@ link_script "$DIR/bravo-fleet"  bravo-fleet   # preemptable companion fleet (PBS
 link_script "$DIR/hq-bravo-server-up" hq-bravo-server-up  # PRIVATE bravo server (2026-08-20)
 link_script "$DIR/hqb"          hqb           # client for the private bravo server
 link_script "$DIR/hq-gpus-all"  hq-gpus-all   # per-GPU view of both fleets (private)
+link_script "$DIR/charlie-fleet" charlie-fleet # prod/medium on-demand lane -> bravo server (2026-09-30)
 
 # Build the login-node get_nprocs shim
 cp -f "$DIR/shim/nproc8.c" "$HQDIR/shim/nproc8.c"
@@ -153,10 +157,13 @@ render() {  # render <template> <dest>
         -e "s|__BRIDGE_WALL__|$HQ_BRIDGE_WALL|g" \
         -e "s|__FILESYSTEMS__|$HQ_FILESYSTEMS|g" \
         -e "s|__HQDIR__|$HQDIR|g" \
+        -e "s|__CHARLIE_QUEUE__|$HQ_CHARLIE_QUEUE|g" \
+        -e "s|__CHARLIE_NODES__|$HQ_CHARLIE_NODES|g" \
+        -e "s|__CHARLIE_WALL__|$HQ_CHARLIE_WALL|g" \
         "$1" > "$2"
 }
-mkdir -p "$HQDIR/bravo"
-for pair in "capacity-workers.pbs.tmpl:capacity-workers.pbs" "preempt-bridge.pbs.tmpl:preempt-bridge.pbs" "bravo-worker.pbs.tmpl:bravo/worker.pbs"; do
+mkdir -p "$HQDIR/bravo" "$HQDIR/charlie"
+for pair in "capacity-workers.pbs.tmpl:capacity-workers.pbs" "preempt-bridge.pbs.tmpl:preempt-bridge.pbs" "bravo-worker.pbs.tmpl:bravo/worker.pbs" "charlie-worker.pbs.tmpl:charlie/worker.pbs"; do
     src="${pair%%:*}"; dst="$HQDIR/${pair##*:}"
     if [[ -e "$dst" && $FORCE -ne 1 ]]; then
         echo "✓ ${pair##*:} exists — kept (use --force to regenerate)"

@@ -1,0 +1,215 @@
+#!/bin/bash
+# charlie-fleet — the PROD/MEDIUM lane (2026-09-30): 25-node x 6 h allocations,
+# queued ON DEMAND, feeding the PRIVATE bravo HyperQueue server (`hqb`).
+#
+#   alpha   : `capacity`, 4 nodes x 168 h, 1 running job per project, shared.
+#   bravo   : `preemptable`, many 1-node x <=72 h; pool is only 56 nodes and was
+#             delivering ~8 GPUs on average against a 40-GPU ceiling (Sep 2026).
+#   charlie : `prod` -> `medium`, 25 nodes x 6 h = 100 A100s per allocation,
+#             from the 496-node production pool. Waits observed 6-24 h, so the
+#             point of this loop is to keep the NEXT allocation queued (accruing
+#             eligible time) while the current one runs, and to queue nothing
+#             when there is nothing to run.
+#
+# Why a ticker and not `hq alloc add` (autoalloc): autoalloc sizes each
+# allocation to the waiting demand (1 task -> `select=1`), and `prod` rejects
+# anything under 10 nodes. PBS keeps the FIRST `-l select` directive, so the
+# size cannot be overridden through autoalloc's extra args (tested 2026-09-30,
+# PBS 7671494). Autoalloc stays the right tool for debug-sized lanes.
+#
+# What HQ does by itself (verified 2026-09-30 on PBS 7670961/7671022): when a
+# worker hits its time limit it SIGINTs its tasks and kills them ~1 s later; the
+# tasks go back to WAITING with no crash-limit charge and are re-placed on the
+# next worker with enough time left, where the task body resumes from
+# last.ckpt. This script only manages allocation SUPPLY.
+#
+# Policy per tick:
+#   demand  = tasks WAITING on hqb  +  tasks RUNNING on charlie workers
+#   target  = CHARLIE_MAX_QUEUED if demand > 0 else CHARLIE_STANDBY
+#   submit until (queued == target) or (queued+running == CHARLIE_MAX_INFLIGHT)
+# Running tasks count as demand so the next allocation is already in the queue
+# when the current one expires. STANDBY keeps a reserve queued even when idle;
+# if it starts with nothing to run its workers exit after CHARLIE_IDLE (about
+# 25 nodes x 20 min = 8 node-hours), and the loop re-queues one.
+#
+# Usage:
+#   charlie-fleet tick        one pass (DRY_RUN=1 to preview)
+#   charlie-fleet run         tick every $CHARLIE_INTERVAL s, forever (tmux, login-01)
+#   charlie-fleet status      jobs, demand, workers
+#   charlie-fleet up [N]      force-submit N allocations now (ignores demand)
+#   charlie-fleet down        qdel every charlie job (running ones too)
+#   charlie-fleet down-queued qdel only queued/held charlie jobs
+#
+# Knobs (env or ~/.hq/fleet.env): CHARLIE_MAX_INFLIGHT (3), CHARLIE_MAX_QUEUED
+# (2), CHARLIE_STANDBY (1), CHARLIE_INTERVAL (300), CHARLIE_WALL (06:00:00),
+# CHARLIE_IDLE (20m), CHARLIE_NAME (charlie-25n, must match #PBS -N).
+# `medium` allows 10 queued+running per PROJECT, shared with teammates — keep
+# CHARLIE_MAX_INFLIGHT well under that.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+STATE=$HOME/.hq/charlie
+PBS_SCRIPT=$STATE/worker.pbs
+LOG=$STATE/fleet.log
+mkdir -p "$STATE"
+[[ -f $HOME/.hq/fleet.env ]] && source "$HOME/.hq/fleet.env"   # SLACK_WEBHOOK / NTFY_TOPIC / CHARLIE_*
+
+CHARLIE_NAME=${CHARLIE_NAME:-charlie-25n}
+CHARLIE_WALL=${CHARLIE_WALL:-06:00:00}
+CHARLIE_IDLE=${CHARLIE_IDLE:-20m}
+CHARLIE_MAX_INFLIGHT=${CHARLIE_MAX_INFLIGHT:-3}
+CHARLIE_MAX_QUEUED=${CHARLIE_MAX_QUEUED:-2}
+CHARLIE_STANDBY=${CHARLIE_STANDBY:-1}
+CHARLIE_INTERVAL=${CHARLIE_INTERVAL:-300}
+HQB_SERVER_DIR=${HQB_SERVER_DIR:-$HOME/.hq-bravo-server}
+DRY_RUN=${DRY_RUN:-0}
+HQ_BIN=$HOME/.local/bin/hq
+
+log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$LOG"; }
+
+notify() {  # best-effort; never fails a tick
+  local msg="$1"
+  [[ -n "${SLACK_WEBHOOK:-}" ]] && curl -sf -X POST -H 'Content-type: application/json' \
+     --data "{\"text\":\"[charlie-fleet] ${msg}\"}" "$SLACK_WEBHOOK" >/dev/null 2>&1
+  [[ -n "${NTFY_TOPIC:-}" ]] && curl -sf -d "[charlie-fleet] ${msg}" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null 2>&1
+  return 0
+}
+
+# PBS job ids (short) of charlie allocations in the given states (default QRH).
+# qselect -N matches the FULL job name, so the 10-char qstat truncation that
+# bravo-fleet has to work around does not apply.
+charlie_jobs() { qselect -u "$USER" -N "$CHARLIE_NAME" -s "${1:-QRH}" 2>/dev/null | sed 's/\..*//'; }
+count() { charlie_jobs "$1" | grep -c . ; }
+
+# demand -> prints "<waiting> <running_on_charlie>" or "ERR <reason>".
+# Read straight from the bravo server's JSON: waiting tasks across every
+# non-terminal job, plus running tasks whose worker belongs to a charlie
+# allocation (matched by the PBS job id HQ records on each worker).
+demand() {
+  local ids; ids=$(charlie_jobs QRH | tr '\n' ' ')
+  CHARLIE_IDS="$ids" "$HQ_BIN" --server-dir "$HQB_SERVER_DIR" --output-mode json job list 2>/dev/null | python3 -c '
+import json, os, subprocess, sys
+hq = os.environ["HQ_BIN"]; sd = os.environ["HQB_SERVER_DIR"]
+charlie = set(os.environ.get("CHARLIE_IDS", "").split())
+def hq_json(*a):
+    r = subprocess.run([hq, "--server-dir", sd, "--output-mode", "json", *a],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+    if r.returncode != 0: raise SystemExit("ERR hq " + " ".join(a) + " failed")
+    return json.loads(r.stdout) if r.stdout.strip() else None
+try:
+    jobs = json.load(sys.stdin) or []
+except Exception:
+    raise SystemExit("ERR no job list (server down?)")
+waiting = sum((j.get("task_stats") or {}).get("waiting", 0) for j in jobs)
+workers = hq_json("worker", "list") or []
+cw = {w["id"] for w in workers if w.get("ended") is None
+      and ((w.get("allocation") or {}).get("id") or "").split(".")[0] in charlie}
+running = 0
+for j in jobs:
+    if (j.get("task_stats") or {}).get("running", 0) == 0: continue
+    tl = hq_json("task", "list", str(j["id"])) or {}
+    tasks = tl.get(str(j["id"]), []) if isinstance(tl, dict) else []
+    running += sum(1 for t in tasks if (t.get("state") or "").lower() == "running" and t.get("worker") in cw)
+print(waiting, running)
+' 2>/dev/null || echo "ERR demand query failed"
+}
+export HQ_BIN HQB_SERVER_DIR
+
+submit_one() {
+  if (( DRY_RUN )); then log "DRY_RUN: would qsub -l walltime=$CHARLIE_WALL -v CHARLIE_IDLE=$CHARLIE_IDLE $PBS_SCRIPT"; return 0; fi
+  local out jid
+  out=$(qsub -l "walltime=$CHARLIE_WALL" -v "CHARLIE_IDLE=$CHARLIE_IDLE" "$PBS_SCRIPT" 2>&1)
+  jid=$(echo "$out" | grep -oE '^[0-9]+')
+  if [[ -n "$jid" ]]; then
+    log "submitted charlie allocation $jid (walltime $CHARLIE_WALL, idle $CHARLIE_IDLE)"
+    notify "submitted allocation $jid ($CHARLIE_WALL)"
+  else
+    log "SUBMIT FAILED: $out"; notify "SUBMIT FAILED: $out"; return 1
+  fi
+}
+
+# Notify when an allocation starts or ends, by diffing the running set.
+track_transitions() {
+  local now prev f=$STATE/running.ids
+  now=$(charlie_jobs R | sort | tr '\n' ' ')
+  prev=$(cat "$f" 2>/dev/null || true)
+  local id
+  for id in $now;  do [[ " $prev " == *" $id "* ]] || { log "NOTIFY: ▶ allocation $id RUNNING (100 A100s on hqb)"; notify "▶ allocation $id RUNNING"; }; done
+  for id in $prev; do [[ " $now "  == *" $id "* ]] || { log "NOTIFY: ■ allocation $id ended";  notify "■ allocation $id ended"; }; done
+  echo "$now" > "$f"
+}
+
+cmd_tick() {
+  local running queued inflight d waiting oncharlie target need
+  running=$(count R); queued=$(count QH); inflight=$((running + queued))
+  track_transitions
+  d=$(demand)
+  if [[ $d == ERR* ]]; then
+    log "tick: $d — not submitting (running=$running queued=$queued)"; return 0
+  fi
+  read -r waiting oncharlie <<< "$d"
+  if (( waiting + oncharlie > 0 )); then target=$CHARLIE_MAX_QUEUED; else target=$CHARLIE_STANDBY; fi
+  need=$(( target - queued ))
+  (( inflight + need > CHARLIE_MAX_INFLIGHT )) && need=$(( CHARLIE_MAX_INFLIGHT - inflight ))
+  log "tick: running=$running queued=$queued | demand: waiting=$waiting running_on_charlie=$oncharlie | target_queued=$target -> submit $(( need > 0 ? need : 0 ))"
+  local i=0; while (( i < need )); do submit_one || break; (( i++ )); done
+  return 0
+}
+
+cmd_up() {
+  local n=${1:-1} inflight room i=0
+  inflight=$(count QRH); room=$(( CHARLIE_MAX_INFLIGHT - inflight ))
+  (( room <= 0 )) && { log "up: $inflight in flight >= cap $CHARLIE_MAX_INFLIGHT — nothing to do"; return 0; }
+  (( n > room )) && { log "up: requested $n, only $room under the cap"; n=$room; }
+  while (( i < n )); do submit_one || break; (( i++ )); done
+}
+
+cmd_run() {
+  local lock=$STATE/run.lock
+  if [[ -f $lock ]]; then
+    local lhost lpid; read -r lhost lpid < "$lock" 2>/dev/null || true
+    if [[ "$lhost" == "$(hostname)" ]] && kill -0 "${lpid:-0}" 2>/dev/null; then
+      log "another charlie-fleet run is live here (pid $lpid) — refusing to start a second"; return 1
+    fi
+    [[ "$lhost" != "$(hostname)" ]] && log "lock held by $lhost (pid ${lpid:-?}) — starting anyway on $(hostname); kill the other loop via ssh $lhost"
+  fi
+  echo "$(hostname) $$" > "$lock"
+  trap 'rm -f "$lock"' EXIT INT TERM
+  log "charlie-fleet run started on $(hostname) pid $$ (interval ${CHARLIE_INTERVAL}s, max_inflight $CHARLIE_MAX_INFLIGHT, max_queued $CHARLIE_MAX_QUEUED, standby $CHARLIE_STANDBY)"
+  while true; do cmd_tick; sleep "$CHARLIE_INTERVAL"; done
+}
+
+cmd_status() {
+  echo "=== charlie-fleet (prod/medium, ${CHARLIE_WALL}, -> hqb) ==="
+  echo "running: $(count R)   queued/held: $(count QH)   cap: $CHARLIE_MAX_INFLIGHT in flight, $CHARLIE_MAX_QUEUED queued on demand, $CHARLIE_STANDBY standby"
+  local d; d=$(demand); echo "demand: $d   (waiting on hqb, running on charlie workers)"
+  local id
+  for id in $(charlie_jobs QRH); do
+    qstat -f "$id" 2>/dev/null | awk -v id="$id" '/job_state/{s=$3} /eligible_time/{e=$3} /resources_used.walltime/{u=$3} /^ *queue =/{q=$3} /comment/{c=$0; sub(/.*= /,"",c)} END{printf "  %s  %s  %s  eligible=%s used=%s  %s\n", id, q, s, e, (u==""?"-":u), substr(c,1,60)}'
+  done
+  echo; echo "=== charlie workers on hqb ==="
+  local pat; pat=$(charlie_jobs R | paste -sd'|' -)
+  if [[ -n "$pat" ]]; then
+    "$HQ_BIN" --server-dir "$HQB_SERVER_DIR" worker list 2>/dev/null | grep -E "$pat" || echo "  none attached yet"
+  else
+    echo "  none (no charlie allocation running)"
+  fi
+}
+
+cmd_down() {
+  local jobs; jobs=$(charlie_jobs "${1:-QRH}")
+  [[ -z "$jobs" ]] && { log "down: no charlie jobs (${1:-QRH})"; return 0; }
+  echo "$jobs" | xargs -r qdel 2>&1 | tail -2
+  log "down: qdel'd $(echo "$jobs" | wc -l) job(s) (${1:-QRH})"; notify "down: qdel'd $(echo "$jobs" | wc -l) job(s)"
+  rm -f "$STATE/running.ids"
+}
+
+case "${1:-status}" in
+  tick)        cmd_tick ;;
+  run)         cmd_run ;;
+  status)      cmd_status ;;
+  up)          shift; cmd_up "$@" ;;
+  down)        cmd_down QRH ;;
+  down-queued) cmd_down QH ;;
+  *) echo "usage: charlie-fleet {tick|run|status|up [N]|down|down-queued}"; exit 2 ;;
+esac

@@ -181,17 +181,27 @@ incomplete — `xelatex`/`lualatex` missing `ucharcat.sty`, xcolor broken.
 ## Job submission on Polaris (ALCF) — HyperQueue workflow
 
 **Polaris-only section** (PBS Pro; other clusters ignore). All compute jobs
-go through **HyperQueue** (`hq`, `~/.local/bin/`), NOT raw `qsub`. Two
-standing fleets on TWO servers (private bravo split 2026-08-20): **alpha** =
-`capacity`, 4 nodes / 16 A100s, group-shared, client `hq`; **bravo** =
-`preemptable`, up to 20 staggered 1-node jobs (max 10 running = 40 A100s),
-PRIVATE — own server + keys, invisible to the group-shared client — client
-`hqb` (usage identical to `hq`). Default big training runs to `hqb`; treat
-alpha as the shared/overflow lane and check `hq job list` for teammates'
-work before large batches.
-Because bravo workers can have <24 h left and may be preempted, write long
-payloads re-entrant (auto-resume from `last.ckpt`) and avoid `--time-request`
-longer than a worker's remaining walltime (task WAITS forever, silently).
+go through **HyperQueue** (`hq`, `~/.local/bin/`), NOT raw `qsub`. Three
+lanes on TWO servers (private bravo split 2026-08-20; charlie added
+2026-09-30): **alpha** = `capacity`, 4 nodes / 16 A100s, group-shared, client
+`hq`; **bravo** = `preemptable`, up to 20 staggered 1-node jobs (max 10 running
+= 40 A100s, but the pool is 56 nodes machine-wide and delivered ~8 GPUs on
+average in Sep 2026), PRIVATE — own server + keys, invisible to the
+group-shared client — client `hqb` (usage identical to `hq`); **charlie** =
+`prod`→`medium`, 25-node × 6 h allocations (100 A100s each) queued ON DEMAND
+by `charlie-fleet` whenever `hqb` has waiting tasks, plus one standby; also
+feeds `hqb`. Default big training runs to `hqb`; treat alpha as the
+shared/overflow lane and check `hq job list` for teammates' work before large
+batches.
+Because bravo workers can have <24 h left and may be preempted, and charlie
+workers live 6 h, write long payloads re-entrant (auto-resume from
+`last.ckpt`, checkpoint at least every epoch) and avoid `--time-request`
+longer than a worker's remaining walltime (task WAITS forever, silently). A
+worker hitting its time limit SIGINTs its tasks and kills them ~1 s later;
+they return to WAITING with no crash-limit charge and resume on the next
+worker (verified 2026-09-30). Put `%{INSTANCE_ID}` in task log paths or each
+leg truncates the previous leg's log. Full mechanics:
+`~/dotfiles/docs/hyperqueue-fleet.md` § *Three fleets: charlie*.
 
 ### Submitting work
 
@@ -200,7 +210,8 @@ hq submit --resource gpus/nvidia=1 -- python train.py  # 1 GPU; HQ sets CUDA_VIS
 hq submit --cpus 16 -- ./analysis.sh                   # CPU-only
 hq job list / hq job info <id> / hq job cat <id> stdout
 hq-fleet status                                        # fleet at a glance
-hq-gpus-all                                            # per-GPU view, BOTH fleets (demiranda-only; hq-gpus = alpha only)
+hq-gpus-all                                            # per-GPU view, BOTH servers, one "alloc" line per PBS job (demiranda-only; hq-gpus = alpha only)
+charlie-fleet status                                   # medium lane: jobs, demand, workers
 ```
 
 Tasks are cheap (~ms overhead) — submit many small ones; HQ packs them
@@ -221,6 +232,7 @@ included).
 | `hq-fleet` | orchestrator, tmux session `hq-fleet`; subcommands `status/up/down/tick`, `DRY_RUN=1` to preview; log `~/.hq/fleet.log` |
 | Primary allocation | alpha: 4-node/168h `capacity` jobs `hq-capacity` (`~/.hq/capacity-workers.pbs`); `HQ_CAP_JOBS` in fleet.env sets how many are kept in flight (1 as of 2026-08) |
 | Bravo lane | `bravo-fleet {up N\|tick\|run\|status\|down}` (`~/.hq/bravo/worker.pbs`): many 1-node `preemptable` jobs named `bravo-1n`, staggered 24-72 h walltimes; ticker = tmux `bravo-fleet` on login-01 (added 2026-08-15) |
+| Charlie lane | `charlie-fleet {tick\|run\|status\|up N\|down\|down-queued}` (`~/.hq/charlie/worker.pbs`): 25-node × 6 h `prod`→`medium` jobs named `charlie-25n`, submitted only while `hqb` has waiting tasks or tasks running on charlie (keeps `CHARLIE_MAX_QUEUED`=2 queued, `CHARLIE_STANDBY`=1 when idle, cap 3 in flight); workers `--idle-timeout 20m`; ticker = tmux `charlie-fleet` on login-01 (added 2026-09-30). Not autoalloc: `prod` rejects <10 nodes and autoalloc sizes to demand |
 | Bravo server (PRIVATE) | since 2026-08-20 bravo workers attach to a second server: tmux `hq-bravo`, started ONLY via `hq-bravo-server-up`, server-dir `~/.hq-bravo-server`, journal/log under `~/.hq-bravo/`, pinned ports 36152/44986. Client = `hqb`. Keys in `~/.hq-bravo/access/` are demiranda-only — NEVER copy them into `hq-shared/` |
 | Bridge allocation | **DISABLED since 2026-07-27** (`HQ_NO_BRIDGE=1` in fleet.env; capacity-only policy for the group-shared fleet). The `preemptable` `hq-bridge` machinery (`~/.hq/preempt-bridge.pbs`) still exists — re-enable by removing the knob |
 | Autoalloc queues | `debug` (1n/1h) and `preempt` (1n/72h) — HQ auto-qsubs only when tasks wait uncovered; safety net, normally silent |

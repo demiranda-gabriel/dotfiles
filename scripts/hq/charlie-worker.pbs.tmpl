@@ -1,0 +1,62 @@
+#!/bin/bash
+#PBS -A __ACCOUNT__
+#PBS -q __CHARLIE_QUEUE__
+#PBS -l select=__CHARLIE_NODES__:system=__SYSTEM__
+#PBS -l walltime=__CHARLIE_WALL__
+#PBS -l filesystems=__FILESYSTEMS__
+#PBS -l place=scatter
+#PBS -N charlie-25n
+#PBS -j oe
+#PBS -o __HQDIR__/charlie/workers.log
+# No scheduler mail: the fleet's Slack webhook reports every state transition.
+#PBS -m n
+#
+# CHARLIE-FLEET worker (2026-09-30): __CHARLIE_NODES__ nodes x __CHARLIE_WALL__
+# on the `prod` route queue, which lands in `medium` (25-99 nodes, <=6 h) and
+# draws on the 496-node production pool that neither `capacity` (32 nodes total
+# across all projects) nor `preemptable` (56 nodes total) can reach. Workers
+# attach to the PRIVATE bravo server, so `hqb submit` work runs here.
+#
+# Short allocations are safe for long training tasks because HyperQueue, not
+# this script, carries the work across the boundary: when the worker reaches
+# its time limit it stops (SIGINT to the task, then kill within ~1 s — verified
+# 2026-09-30, PBS 7671022), the task returns to WAITING with NO crash-limit
+# charge, and it is re-placed on the next worker with enough time left, where
+# the task body resumes from last.ckpt. Nothing is "transported" by hand.
+#
+# Differences from bravo/capacity workers, on purpose:
+#   * --idle-timeout: a worker with nothing to run for that long exits, and
+#     once every node's worker has exited the job ends. A 25-node allocation
+#     must not sit empty for 6 h.
+#   * No retry loop. The capacity script restarts workers forever (a 168 h
+#     reservation is worth keeping alive through a server restart); here a
+#     worker exit means the job is over and charlie-fleet decides whether to
+#     queue another. --on-server-lost finish-running still lets in-flight
+#     tasks finish if the server blips.
+#   * The worker's time limit is autodetected from PBS (--manager defaults to
+#     detection), which is what lets `--time-request` keep tasks off a worker
+#     that is about to expire.
+export PATH=$HOME/.local/bin:$PATH
+umask 002
+ulimit -c 0
+IDLE=${CHARLIE_IDLE:-20m}   # passed by charlie-fleet via `qsub -v`
+
+NNODES=$(wc -l < "$PBS_NODEFILE")
+echo "$(date -u +%FT%TZ) charlie worker job $PBS_JOBID starting on $NNODES node(s), idle-timeout $IDLE: $(tr '\n' ' ' < "$PBS_NODEFILE")"
+
+# Short node-local TMPDIR: HQ's unix socket path must stay under SUN_LEN (108
+# chars) and PALS appends a per-app dir to $TMPDIR on every rank, which blew the
+# limit and stranded bravo nodes for 23 h on 2026-08-16. Same fix as
+# capacity-workers.pbs: create the dir on every node first (PALS does a
+# non-recursive mkdir under $TMPDIR at launch), then pass the literal path into
+# the rank command — env propagation through mpiexec is not reliable.
+WORKER_TMPDIR=/local/scratch/$USER/tmp
+mpiexec -n "$NNODES" --ppn 1 bash -c "mkdir -p '$WORKER_TMPDIR'"
+export TMPDIR=$WORKER_TMPDIR
+
+mpiexec -n "$NNODES" --ppn 1 --cpu-bind none \
+    bash -c "export TMPDIR='$WORKER_TMPDIR'
+             mkdir -p \"\$TMPDIR\" || { echo \"FATAL: cannot mkdir \$TMPDIR on \$(hostname)\"; exit 1; }
+             ulimit -c 0
+             exec hq --server-dir $HOME/.hq-bravo-server worker start --idle-timeout '$IDLE' --on-server-lost finish-running"
+echo "$(date -u +%FT%TZ) charlie worker job $PBS_JOBID: all workers exited (idle timeout, time limit, or server lost); job ends"
