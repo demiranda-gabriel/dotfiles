@@ -206,6 +206,7 @@ protect_ancestors() {
 is_vscode_cli() {  # does this cmdline look like a VS Code/Cursor CLI supervisor?
     local c="$1"
     [[ $c == *"code tunnel"*        ]] && return 0
+    [[ $c == *"code-tunnel-cli"*    ]] && return 0  # bootstrap-installed tunnel binary name
     [[ $c == *"agent host"*         ]] && return 0
     [[ $c == *".vscode/cli"*        ]] && return 0
     [[ $c == *".vscode-server"*     ]] && return 0
@@ -307,7 +308,7 @@ SRV_DUP=0          # running versions beyond the current one
 
 scan_server_versions() {
     local p cmd tmp ver pre dir sdir="" line b
-    local -A vthr vproc
+    local -A vthr=() vproc=()
     for p in "${PIDS[@]}"; do
         [[ ${P_MINE[$p]} == 1 ]] || continue
         cmd=${P_CMD[$p]}
