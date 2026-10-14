@@ -507,7 +507,7 @@ while the managed loop uses the new path. (Used once on 2026-08-15 before the
 short-hostname ssh route was found; the stub has since been removed.) The bravo
 worker lives at `~/.hq/bravo/worker.pbs`.
 
-## Three fleets: charlie (prod/medium, on demand)
+## Three fleets: charlie (prod/medium, always-on chain)
 
 Added 2026-09-30. Polaris was full (2 of 560 nodes free) and bravo's
 `preemptable` pool is only 56 nodes machine-wide: over Sep 15–30 bravo delivered
@@ -515,7 +515,9 @@ Added 2026-09-30. Polaris was full (2 of 560 nodes free) and bravo's
 with 44–136 h waits per 1-node job. `capacity` cannot grow (32 nodes total
 across all projects, 1 running job per project). The only accessible queue that
 reaches the 496-node production pool is the `prod` route: `small` (10–24 nodes,
-3 h), `medium` (25–99 nodes, 6 h), `large` (100+, 24 h). Charlie uses `medium`.
+3 h), `medium` (25–99 nodes, 6 h), `large` (100+, 24 h). Charlie uses `medium`
+by default (25 nodes); since 2026-10-14 its size is runtime-adjustable across
+all three tiers (see *Resizing charlie* below).
 
 | | **alpha** (`hq-fleet`) | **bravo** (`bravo-fleet`) | **charlie** (`charlie-fleet`) |
 |---|---|---|---|
@@ -523,8 +525,8 @@ reaches the 496-node production pool is the `prod` route: `small` (10–24 nodes
 | shape | 4 nodes × 168 h | many 1-node × ≤72 h | 25 nodes × 6 h (100 A100s) |
 | project limits | 1 running, 2 in flight | 10 running / 20 queued | 10 queued+running in `medium`, shared with teammates |
 | HQ server | shared (`hq`) | PRIVATE (`hqb`) | PRIVATE (`hqb`) |
-| supply policy | always on | always full queue | **on demand**, plus 1 standby |
-| observed wait | 13 h gap per weekly handover | 44–136 h | 6–24 h |
+| supply policy | always on | always full queue | **always-on chain** (2026-10-12); successor submitted one predicted wait before the end |
+| observed wait | 13 h gap per weekly handover | 44–136 h | 0.1–10.7 h, median 1.2 h (69 jobs to 2026-10-12) |
 | cost per allocation | 672 node-h | ≤72 node-h | 150 node-h |
 
 ### Why a ticker and not autoalloc
@@ -540,29 +542,73 @@ directive, so a trailing `-l select=25` in the extra args does not override it
 clone that reads demand from the bravo server's JSON and submits fixed 25-node
 jobs.
 
-Policy per tick (every `CHARLIE_INTERVAL`, 300 s):
+### Policy: always-on chain (2026-10-12)
+
+Charlie is one continuous chain of 25-node allocations, kept up whether or not
+`hqb` has work (no idle monitoring; an idle chain costs 25 nodes × 24 h = 600
+node-h/day). Every allocation runs its full walltime. The ticker (every
+`CHARLIE_INTERVAL`, 300 s) only decides **when to submit the successor**:
 
 ```
-demand = tasks WAITING on hqb + tasks RUNNING on charlie workers
-target = CHARLIE_MAX_QUEUED (2) if demand > 0 else CHARLIE_STANDBY (1)
-submit until queued == target, never past CHARLIE_MAX_INFLIGHT (3)
+paused (charlie-fleet pause)        -> nothing
+successor already queued/held       -> nothing
+nothing running, nothing queued     -> submit now (cold start / chain broken)
+running, nothing queued:
+    left = minutes left on the allocation that ends last
+    lead = CHARLIE_WAIT_Q (0.8) quantile of the last CHARLIE_WAIT_N (10)
+           observed submit->start waits, clamped to [30, 360] min
+    submit when left <= lead + one tick
 ```
 
-Running tasks count as demand so the **next** allocation is already queued and
-accruing eligible time while the current one runs. That is the whole answer to
-"request the next allocation at the right time": on Polaris there is no way to
-time a start, only to hold a place in line. `STANDBY=1` keeps one allocation
-queued even when idle so work submitted later finds one close to starting; if
-it starts empty its workers exit after `CHARLIE_IDLE` (20 min), about 8
-node-hours, and the loop re-queues one. Nothing is ever auto-cancelled: a queued
-job's eligible time is worth more than 8 node-hours.
+Observed waits live in `~/.hq/charlie/waits.tsv` (`pbs_id qtime stime wait_s`),
+appended from `qstat -f` qtime/stime when an allocation starts, seeded from
+`fleet.log`. `charlie-fleet waits` shows them and the current lead.
+
+**Why a quantile and not PBS timing.** Polaris priority is
+`job_sort_formula` ∝ `eligible_time / min(max(walltime, 6 h), 12 h) × nodect`,
+so a job climbs only by accruing eligible time. Every PBS way to delay a start
+leaves the job ineligible: `qsub -a` (state W, probe 7739953) and `qsub -h`
+(state H, probe 7739956) both showed `eligible_time = 00:00:00`, and
+`-W depend` is documented as ineligible too. Each therefore starts the wait at
+release, which IS the gap. Advance reservations (`pbs_rsub`; `resv_enable =
+True`) would chain exactly but were not tried (ALCF policy unknown). Waits
+ranged 0.1–10.7 h and drift by day, so a fixed lead cannot work; a high
+quantile of recent waits aims slightly early, and early starts are made cheap:
+
+**Predecessor drain (in worker.pbs).** When an allocation starts while an
+older charlie allocation (lower PBS id, `fleet/charlie` workers on `hqb`) is
+still running, its batch script checks every 60 s and, once (a) all of its own
+workers are attached, (b) nothing is WAITING on `hqb`, and (c) its idle nodes ≥
+the predecessor's busy nodes, runs `hq worker stop` on the predecessor's
+workers. Their tasks return to WAITING (an explicit stop is not a crash), land
+on the new allocation and resume from `last.ckpt`; the predecessor's mpiexec
+exits and its PBS job ends. If tasks are waiting, or the new allocation cannot
+absorb them, both stay up and the extra GPUs are used. Overlap thus costs the
+progress since the last checkpoint instead of idle node-hours; a gap (wait >
+lead) costs tasks sitting in WAITING. Raise `CHARLIE_WAIT_Q` for fewer gaps and
+more drains. This replaced the 2026-10-07 "handover hold" (successor idled
+until its predecessor hit walltime) and the job-level idle watchdog
+(2026-10-05), both removed.
+
+History: 2026-09-30 on-demand + standby; 2026-10-02 standby removed (below);
+2026-10-05 job-level idle watchdog; 2026-10-07 fixed 240-min lead + hold;
+2026-10-12 always-on chain.
+
+**Lesson from the first version (2026-09-30 → 10-02).** It queued
+`MAX_QUEUED` successors the moment anything ran and, with `STANDBY=1`,
+re-queued a reserve every time one started. Once `medium` waits dropped to
+minutes it became one every 15–60 min: 38 allocations in two days, each 25
+nodes × 20 min idle, ~317 node-hours with zero tasks. The chain avoids this by
+construction: at most one successor is queued, and only near the end.
 
 ```bash
-charlie-fleet status        # jobs, demand, workers
+charlie-fleet status        # jobs (+ est. start of a queued successor), lead, workers
+charlie-fleet waits         # recent waits and the lead they imply
 DRY_RUN=1 charlie-fleet tick
-charlie-fleet up 1          # force one allocation, ignoring demand
-charlie-fleet down-queued   # drop the reserve; running allocations untouched
-charlie-fleet down          # qdel everything charlie
+charlie-fleet pause / resume  # stop / restart submitting; jobs untouched
+charlie-fleet up 1          # force one allocation now
+charlie-fleet down-queued   # drop the queued successor (re-queued unless paused)
+charlie-fleet down          # pause + qdel everything charlie
 ```
 
 The loop is `tmux charlie-fleet` on **login-01**, next to `hq-fleet` and
@@ -570,6 +616,132 @@ The loop is `tmux charlie-fleet` on **login-01**, next to `hq-fleet` and
 `scripts/hq/charlie-worker.pbs.tmpl`), job name `charlie-25n`, invisible to the
 other two orchestrators (exact-name and `bravo-1n` prefix matches). Log
 `~/.hq/charlie/fleet.log`; Slack on every submit, start and end.
+
+### Resizing charlie without a restart (2026-10-14)
+
+```bash
+charlie-fleet size                       # what the next allocation will get
+charlie-fleet size 40                    # 40 nodes / 160 A100s x 6 h (medium)
+charlie-fleet size 100 --wall 24:00:00   # 100 nodes x 24 h -> prod routes it to `large`
+charlie-fleet size 25 --now              # also qdel the queued successor, submit one now
+```
+
+The size of the NEXT allocation lives in `~/.hq/charlie/size` (`<nodes>
+<walltime>`) and is read on every submit, so the loop never needs a restart for
+it (fleet.env, by contrast, is read once at loop start). `submit_one` passes
+`-l select=N:system=polaris -l walltime=W` on the qsub command line, which
+overrides the `#PBS -l select=25` in worker.pbs (verified with held probe
+7745572: `Resource_List.nodect = 40`). worker.pbs counts its nodes from
+`$PBS_NODEFILE`, and the predecessor drain compares busy vs. idle node counts,
+so a bigger successor absorbs a smaller predecessor with no special casing.
+
+- `prod` routes by node count: 10–24 -> `small` (≤3 h), 25–99 -> `medium` (≤6 h),
+  100–496 -> `large` (≤24 h). `size` validates N and defaults the walltime to
+  the tier's maximum; `--wall` may only shorten it.
+- Running allocations keep their size (`qalter` is blocked). Without `--now`
+  an already-queued successor also keeps its size, and the new size applies to
+  the one after it. `--now` trades the queued job's accrued eligible time for
+  an immediate switch; when the new allocation starts it drains the old one.
+- The job name stays `charlie-25n` at every size: `qselect -N` finds the chain
+  by that exact name, and the hq wrapper / hqx match the `charlie*` prefix.
+- waits.tsv gained a 5th column (node count) for jobs recorded after
+  2026-10-14, so waits can be split per tier later. The lead still uses the last
+  `CHARLIE_WAIT_N` waits regardless of size, so right after a resize it is
+  calibrated on the old size until new samples arrive.
+- Cost scales linearly: always-on at N nodes is 24·N node-h/day (25 -> 600,
+  40 -> 960, 100 -> 2400).
+- Fallback when the size file is absent or malformed: `CHARLIE_NODES` (25) and
+  `CHARLIE_WALL` (06:00:00) from fleet.env.
+
+### Idle shutdown is per JOB, not per worker (2026-10-05; removed 2026-10-12)
+
+*Superseded by the always-on chain: charlie workers no longer shut down when
+idle. Kept for the 7716366 lesson and the revival recipe below.*
+
+Until 2026-10-05 every charlie worker ran `--idle-timeout 20m`. With demand
+smaller than the allocation, the idle workers exited one by one while the PBS
+job stayed alive for the busy node: PBS 7716366 held 25 nodes for 6 h with only
+1 worker attached (4 tasks packed on one node), so `hqb`/`hq-gpus-all` showed
+4 GPUs and ~135 node-h were paid for with no worker to use them.
+
+Now the workers start with **no** idle timeout and the batch script runs a
+watchdog on the head node: every 60 s it asks `hqb` for this job's workers
+(`allocation.id == $PBS_JOBID`) and their `runtime_info`; if none has an
+assigned/running task or multi-node reservation for `CHARLIE_IDLE` (20m), it
+`hq worker stop`s them all and the job ends. A failed query counts as busy.
+Every node stays schedulable while anything runs; a fresh allocation with
+nothing to do still exits after 20 min. Verified on debug PBS 7717779.
+
+Reviving worker-less nodes of a running job by hand (done on 7716366): PBS lets
+you ssh from a login node into your job's nodes. HQ's PBS detection needs both
+`PBS_ENVIRONMENT` and `PBS_JOBID`, otherwise the worker registers with manager
+`None` and no time limit. Set `HQ_FLEET` too, or the revived worker gets no
+fleet marker (the wrapper reads the fleet from `$PBS_JOBNAME`, absent over ssh):
+
+```bash
+ssh <node> "export PBS_ENVIRONMENT=PBS_BATCH PBS_JOBID=<full job id> HQ_FLEET=charlie TMPDIR=/local/scratch/\$USER/tmp; \
+  setsid nohup ~/.local/bin/hq --server-dir ~/.hq-bravo-server worker start --manager pbs \
+  --time-limit <remaining-30s>s --on-server-lost finish-running >/local/scratch/\$USER/revive-worker.log 2>&1 </dev/null & disown"
+```
+
+## One queue across all fleets: `hqx` (2026-10-05)
+
+Problem: alpha jobs sat WAITING for days (a318/a325/a327, 2026-10-01..05) while
+charlie had ~96 idle GPUs, because a job lives on ONE server and only that
+server's workers can run it. The two servers cannot merge: HQ has no per-user
+ACLs and the alpha key is group-shared, so any worker on it is usable by every
+teammate (the reason bravo went private on 2026-08-20).
+
+Design: keep both servers; move YOUR jobs between them.
+
+| Piece | What |
+|---|---|
+| `hqx list [-a]` | both servers as one queue (ids `a318`, `b970`), where each job runs, its pin, where it was moved from; free GPUs per fleet. `-a` adds teammates' jobs |
+| `hqx submit [--fleet F[,G]\|any] …` | `hq submit` args; default lane = private server; hooks (log routing, owner prefix) applied |
+| `hqx move <id> --to F [--running] [--keep-pin]` | cancel + resubmit on F's server; pins to F unless `--keep-pin`. `--running` also moves running tasks (they resume from `last.ckpt`) |
+| `hqx pin <id> F[,G]\|any [--running]` | change where a job may run; resubmits only if the current placement violates it |
+| `hqx router up\|down\|status\|tick` | the rebalancer: tmux `hq-router` on login-01, re-upped from any login-01 shell (`shell/41-polaris.sh`) |
+
+**Router policy** (every 60 s): for each of your WAITING jobs — owner = name
+prefix `demiranda:`, or no prefix and cwd under your eagle dir / $HOME — that
+cannot start where it is, find a worker on the OTHER server with free
+GPUs/CPUs, enough remaining walltime for its `--time-request`, and a fleet the
+job's pin allows; then cancel it and resubmit it there. It only fills free
+slots: it never moves a job just to create demand, so it never triggers a
+charlie allocation by itself. Guards: 120 s grace after submit, 600 s dwell
+after a move (no ping-pong), max 10 moves per tick, never teammates' jobs,
+never jobs with running tasks, multi-node tasks, several submits, or task
+dependencies. Moves are logged in `~/.hq-router/moves.jsonl`, the loop in
+`~/.hq-router/router.log`, liveness in `~/.hq-router/heartbeat`.
+
+**How a move works**: the server's own `job info` JSON holds the full spec
+(command, cwd, env, stdout/stderr with `%{JOB_ID}` already expanded — so the
+moved job keeps writing to the same log files — resource request variants,
+time request, crash limit, priority, max_fails). hqx writes it out as a job
+file (`hq job submit-file`), cancels the source (`--reason "hqx: moved…"`),
+submits on the target, and resubmits on the source if the target refuses.
+Array task ids are preserved, so `HQ_TASK_ID` is unchanged.
+
+**Fleet pinning** uses marker resources on workers, `fleet/<alpha|bravo|charlie>`
+(HQ rejects `_` in resource names). `~/.local/bin/hq` is now a wrapper
+(`scripts/hq/hq-fleet-wrap`) that appends `--resource fleet/<f>=sum(1000)` to
+every `worker start`, from `$PBS_JOBNAME` (bravo*/charlie*) or the server
+(shared server -> alpha); `HQ_FLEET` overrides. A wrapper rather than a .pbs
+edit because PBS snapshots scripts at qsub — the ~20 already-queued bravo /
+capacity jobs pick it up when they start. The real binary is
+`~/.local/libexec/hq/hq`; it must keep the basename `hq` (hq-server-up uses
+`pgrep -x hq`). A pinned task requests `fleet/<f>=1`; the pin set itself is
+kept in `~/.hq-router/pins.json` (a set like alpha,charlie needs the router to
+pick the server and the marker to pick the fleet on it). Workers started before
+2026-10-05 18:25 UTC have no marker: they still run unpinned work, and hqx
+infers their fleet from the PBS job name.
+
+Verified 2026-10-05 on two throwaway servers: array move with env/log
+paths/priority/crash limit intact, alpha pin never moved, bravo pin not moved
+when only charlie had room, repin bravo->charlie resubmitted with the charlie
+marker and ran, running move refused without `--running` and done with it.
+Live: wrapper markers checked for bravo-1n / charlie-25n / hq-capacity /
+unnamed; both servers still detected by hq-server-up / hq-bravo-server-up.
 
 ### How a task survives an allocation boundary (verified 2026-09-30)
 

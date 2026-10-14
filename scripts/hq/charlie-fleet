@@ -23,26 +23,72 @@
 # next worker with enough time left, where the task body resumes from
 # last.ckpt. This script only manages allocation SUPPLY.
 #
-# Policy per tick:
-#   demand  = tasks WAITING on hqb  +  tasks RUNNING on charlie workers
-#   target  = CHARLIE_MAX_QUEUED if demand > 0 else CHARLIE_STANDBY
-#   submit until (queued == target) or (queued+running == CHARLIE_MAX_INFLIGHT)
-# Running tasks count as demand so the next allocation is already in the queue
-# when the current one expires. STANDBY keeps a reserve queued even when idle;
-# if it starts with nothing to run its workers exit after CHARLIE_IDLE (about
-# 25 nodes x 20 min = 8 node-hours), and the loop re-queues one.
+# Policy: ALWAYS-ON CHAIN (2026-10-12). charlie is one continuous chain of
+# 25-node allocations, kept up whether or not hqb has work (Gabriel's call:
+# no idle monitoring; an idle chain costs 25 nodes x 24 h = 600 node-h/day).
+# Each allocation runs its full walltime, and its successor is submitted so it
+# is PREDICTED to start when it ends. Per tick:
+#   paused (charlie-fleet pause)  -> submit nothing
+#   a successor is queued/held    -> nothing to do
+#   nothing running, nothing queued -> submit now (cold start / chain broken)
+#   running, nothing queued       -> submit when left <= lead + one tick, where
+#       left = minutes of walltime left on the allocation that ends LAST
+#       lead = CHARLIE_WAIT_Q quantile of the last CHARLIE_WAIT_N observed
+#              submit->start waits (waits.tsv), clamped to
+#              [CHARLIE_LEAD_FLOOR, CHARLIE_LEAD_CAP] minutes
+# Why a quantile and not PBS timing: every PBS way to delay a start (-a, -h,
+# -W depend) leaves the job ineligible, and Polaris priority is driven by
+# eligible_time (job_sort_formula), so the job only starts its wait at release
+# — the gap we are trying to remove (probes 7739953/7739956, 2026-10-12).
+# prod waits for 25 nodes ranged 0.1-10.7 h (median 1.2 h, 69 samples to
+# 2026-10-12) and drift by day, so a high quantile of RECENT waits is used and
+# early starts are made cheap instead: worker.pbs of an allocation that starts
+# while its predecessor still runs DRAINS the predecessor (hq worker stop ->
+# tasks requeue onto the new one, resume from last.ckpt; predecessor job ends).
+# Overlap costs progress since the last checkpoint; a gap costs idle tasks.
+# CHARLIE_WAIT_Q trades one for the other (higher = fewer gaps, more drains).
+#
+# History: 2026-09-30 on-demand + standby; 2026-10-02 standby removed after 38
+# idle allocations burned ~317 node-h; 2026-10-05 job-level idle watchdog;
+# 2026-10-07 240-min fixed lead + handover hold; 2026-10-12 always-on chain
+# with quantile lead and predecessor drain; 2026-10-14 runtime-resizable
+# (`charlie-fleet size`, this version).
+#
+# SIZE (2026-10-14). The node count and walltime of the NEXT allocation live in
+# $STATE/size ("<nodes> <walltime>"), re-read on every submit, so
+# `charlie-fleet size N` takes effect without restarting the loop. qsub's
+# command-line `-l select=` overrides the `#PBS -l select=25` in worker.pbs
+# (verified with held probe 7745572, 2026-10-14), and worker.pbs counts its
+# nodes from $PBS_NODEFILE, so nothing else depends on the size. Running
+# allocations keep theirs (qalter is blocked on Polaris). `prod` routes by node
+# count, and the walltime defaults to that tier's maximum:
+#   10-24 nodes -> small (3 h)   25-99 -> medium (6 h)   100-496 -> large (24 h)
+# `size N --now` also replaces any queued successor with an N-node allocation
+# submitted immediately; when it starts, the predecessor drain moves the old
+# allocation's tasks onto it. The job name stays CHARLIE_NAME (charlie-25n) at
+# every size: qselect finds the chain by that exact name.
 #
 # Usage:
 #   charlie-fleet tick        one pass (DRY_RUN=1 to preview)
 #   charlie-fleet run         tick every $CHARLIE_INTERVAL s, forever (tmux, login-01)
-#   charlie-fleet status      jobs, demand, workers
-#   charlie-fleet up [N]      force-submit N allocations now (ignores demand)
-#   charlie-fleet down        qdel every charlie job (running ones too)
-#   charlie-fleet down-queued qdel only queued/held charlie jobs
+#   charlie-fleet status      jobs, lead, demand, workers
+#   charlie-fleet waits       observed submit->start waits and the current lead
+#   charlie-fleet size        show the size the next allocation will get
+#   charlie-fleet size N [--wall HH:MM:SS] [--now]
+#                             set it (no loop restart; see SIZE above)
+#   charlie-fleet up [N]      force-submit N allocations now (ignores the chain)
+#   charlie-fleet pause       stop submitting (running/queued jobs untouched)
+#   charlie-fleet resume      undo pause
+#   charlie-fleet down        pause + qdel every charlie job (running ones too)
+#   charlie-fleet down-queued qdel only queued/held charlie jobs (the loop
+#                             will queue a fresh successor unless paused)
 #
-# Knobs (env or ~/.hq/fleet.env): CHARLIE_MAX_INFLIGHT (3), CHARLIE_MAX_QUEUED
-# (2), CHARLIE_STANDBY (1), CHARLIE_INTERVAL (300), CHARLIE_WALL (06:00:00),
-# CHARLIE_IDLE (20m), CHARLIE_NAME (charlie-25n, must match #PBS -N).
+# Knobs (env or ~/.hq/fleet.env): CHARLIE_WAIT_Q (0.8), CHARLIE_WAIT_N (10),
+# CHARLIE_LEAD_FLOOR (30), CHARLIE_LEAD_CAP (360), CHARLIE_MAX_INFLIGHT (3, a
+# safety cap only), CHARLIE_INTERVAL (300), CHARLIE_NODES (25) and CHARLIE_WALL
+# (06:00:00) as defaults when $STATE/size is absent, CHARLIE_NAME (charlie-25n,
+# must match #PBS -N). The loop reads fleet.env ONCE at start: restart it after
+# edits. The size file is the exception — it is read on every submit.
 # `medium` allows 10 queued+running per PROJECT, shared with teammates — keep
 # CHARLIE_MAX_INFLIGHT well under that.
 set -uo pipefail
@@ -51,15 +97,20 @@ export PATH="$HOME/.local/bin:$PATH"
 STATE=$HOME/.hq/charlie
 PBS_SCRIPT=$STATE/worker.pbs
 LOG=$STATE/fleet.log
+WAITS=$STATE/waits.tsv      # pbs_id  qtime_epoch  stime_epoch  wait_s  [nodes]
+PAUSED=$STATE/paused
+SIZE_FILE=$STATE/size       # "<nodes> <walltime>" for the NEXT allocation; read on every submit
 mkdir -p "$STATE"
 [[ -f $HOME/.hq/fleet.env ]] && source "$HOME/.hq/fleet.env"   # SLACK_WEBHOOK / NTFY_TOPIC / CHARLIE_*
 
 CHARLIE_NAME=${CHARLIE_NAME:-charlie-25n}
+CHARLIE_NODES=${CHARLIE_NODES:-25}
 CHARLIE_WALL=${CHARLIE_WALL:-06:00:00}
-CHARLIE_IDLE=${CHARLIE_IDLE:-20m}
 CHARLIE_MAX_INFLIGHT=${CHARLIE_MAX_INFLIGHT:-3}
-CHARLIE_MAX_QUEUED=${CHARLIE_MAX_QUEUED:-2}
-CHARLIE_STANDBY=${CHARLIE_STANDBY:-1}
+CHARLIE_WAIT_Q=${CHARLIE_WAIT_Q:-0.8}        # quantile of recent waits used as the submit lead
+CHARLIE_WAIT_N=${CHARLIE_WAIT_N:-10}         # how many recent waits
+CHARLIE_LEAD_FLOOR=${CHARLIE_LEAD_FLOOR:-30} # minutes
+CHARLIE_LEAD_CAP=${CHARLIE_LEAD_CAP:-360}    # minutes (= one walltime: never chain two ahead)
 CHARLIE_INTERVAL=${CHARLIE_INTERVAL:-300}
 HQB_SERVER_DIR=${HQB_SERVER_DIR:-$HOME/.hq-bravo-server}
 DRY_RUN=${DRY_RUN:-0}
@@ -87,7 +138,11 @@ count() { charlie_jobs "$1" | grep -c . ; }
 # allocation (matched by the PBS job id HQ records on each worker).
 demand() {
   local ids; ids=$(charlie_jobs QRH | tr '\n' ' ')
-  CHARLIE_IDS="$ids" "$HQ_BIN" --server-dir "$HQB_SERVER_DIR" --output-mode json job list 2>/dev/null | python3 -c '
+  # CHARLIE_IDS must reach python3, not hq: a prefix assignment applies only to
+  # the command it precedes. Until 2026-10-02 it sat on hq, so python saw no
+  # charlie ids, running_on_charlie was always 0, and a busy allocation never
+  # got its successor queued.
+  "$HQ_BIN" --server-dir "$HQB_SERVER_DIR" --output-mode json job list 2>/dev/null | CHARLIE_IDS="$ids" python3 -c '
 import json, os, subprocess, sys
 hq = os.environ["HQ_BIN"]; sd = os.environ["HQB_SERVER_DIR"]
 charlie = set(os.environ.get("CHARLIE_IDS", "").split())
@@ -115,17 +170,102 @@ print(waiting, running)
 }
 export HQ_BIN HQB_SERVER_DIR
 
+# Minutes of walltime left on the RUNNING charlie allocation that ends last,
+# or -1 when none is running. Tasks on a dying allocation migrate to any other
+# running one with time to spare, so only the last survivor matters.
+max_remaining_min() {
+  local id best=-1 rem
+  for id in $(charlie_jobs R); do
+    rem=$(qstat -f "$id" 2>/dev/null | awk -F' = ' '
+      /Resource_List.walltime/ {w=$2} /resources_used.walltime/ {u=$2}
+      END { if (w == "") { print -1; exit }
+            split(w, a, ":"); split(u, b, ":");
+            printf "%d", (a[1]*60 + a[2]) - (b[1]*60 + b[2]) }')
+    (( rem > best )) && best=$rem
+  done
+  echo "$best"
+}
+
+# prod routing tier for a node count -> "<queue> <max walltime>", or "" if
+# outside 10-496 (prod rejects it).
+tier() {
+  local n=$1
+  if   (( n >= 10  && n <= 24  )); then echo "small 03:00:00"
+  elif (( n >= 25  && n <= 99  )); then echo "medium 06:00:00"
+  elif (( n >= 100 && n <= 496 )); then echo "large 24:00:00"
+  fi
+}
+hms_s() { local h m s; IFS=: read -r h m s <<<"$1"; echo $(( 10#$h * 3600 + 10#$m * 60 + 10#${s:-0} )); }
+
+# Size of the NEXT allocation -> "<nodes> <walltime>". The size file wins over
+# CHARLIE_NODES/CHARLIE_WALL; a malformed file falls back to them (and says so).
+next_size() {
+  local n w
+  if [[ -s $SIZE_FILE ]]; then
+    read -r n w < "$SIZE_FILE"
+    if [[ $n =~ ^[0-9]+$ && $w =~ ^[0-9]+:[0-5][0-9]:[0-5][0-9]$ && -n $(tier "$n") ]]; then
+      echo "$n $w"; return
+    fi
+    log "WARNING: ignoring malformed $SIZE_FILE ($(head -c 80 "$SIZE_FILE")); using $CHARLIE_NODES x $CHARLIE_WALL" >&2
+  fi
+  echo "$CHARLIE_NODES $CHARLIE_WALL"
+}
+
 submit_one() {
-  if (( DRY_RUN )); then log "DRY_RUN: would qsub -l walltime=$CHARLIE_WALL -v CHARLIE_IDLE=$CHARLIE_IDLE $PBS_SCRIPT"; return 0; fi
+  local nodes wall; read -r nodes wall < <(next_size)
+  if (( DRY_RUN )); then log "DRY_RUN: would qsub -l select=$nodes:system=polaris -l walltime=$wall $PBS_SCRIPT"; return 0; fi
   local out jid
-  out=$(qsub -l "walltime=$CHARLIE_WALL" -v "CHARLIE_IDLE=$CHARLIE_IDLE" "$PBS_SCRIPT" 2>&1)
+  out=$(qsub -l "select=$nodes:system=polaris" -l "walltime=$wall" "$PBS_SCRIPT" 2>&1)
   jid=$(echo "$out" | grep -oE '^[0-9]+')
   if [[ -n "$jid" ]]; then
-    log "submitted charlie allocation $jid (walltime $CHARLIE_WALL, idle $CHARLIE_IDLE)"
-    notify "submitted allocation $jid ($CHARLIE_WALL)"
+    log "submitted charlie allocation $jid ($nodes nodes x $wall, $(tier "$nodes" | cut -d' ' -f1))${1:+ — $1}"
+    notify "submitted allocation $jid ($nodes nodes / $(( nodes * 4 )) A100s x $wall)${1:+ — $1}"
   else
     log "SUBMIT FAILED: $out"; notify "SUBMIT FAILED: $out"; return 1
   fi
+}
+
+# Record one observed wait (qtime -> stime) for a job that just started.
+record_wait() {
+  local id=$1 q st
+  grep -q "^$id\b" "$WAITS" 2>/dev/null && return 0
+  read -r q st < <(qstat -f "$id" 2>/dev/null | awk -F' = ' '/^ *qtime =/{q=$2} /^ *stime =/{s=$2} END{print q "|" s}' |
+                   { IFS='|' read -r a b; echo "$(date -d "$a" +%s 2>/dev/null || echo x) $(date -d "$b" +%s 2>/dev/null || echo x)"; })
+  [[ $q =~ ^[0-9]+$ && $st =~ ^[0-9]+$ ]] || return 0
+  # 5th column (since 2026-10-14) = node count, for per-tier waits after resizes
+  local nn; nn=$(qstat -f "$id" 2>/dev/null | awk -F' = ' '/Resource_List.nodect/{print $2}')
+  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$q" "$st" $(( st - q )) "${nn:-?}" >> "$WAITS"
+}
+
+# First run: seed waits.tsv from the submit/RUNNING lines already in fleet.log.
+seed_waits() {
+  [[ -s $WAITS ]] && return 0
+  python3 - "$LOG" > "$WAITS" <<'EOF'
+import re, sys, datetime as d
+sub, run = {}, {}
+for l in open(sys.argv[1], errors="replace"):
+    m = re.match(r"(\S+Z) (submitted charlie allocation|NOTIFY: \S+ allocation) (\d+)( RUNNING)?", l)
+    if not m: continue
+    t = int(d.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc).timestamp())
+    if m.group(2).startswith("submitted"): sub.setdefault(m.group(3), t)
+    elif m.group(4): run.setdefault(m.group(3), t)
+for j in sorted(sub, key=int):
+    if j in run and run[j] >= sub[j]:
+        print(f"{j}\t{sub[j]}\t{run[j]}\t{run[j]-sub[j]}")
+EOF
+}
+
+# Submit lead in minutes: CHARLIE_WAIT_Q quantile of the last CHARLIE_WAIT_N
+# waits, clamped. Prints "<lead_min> <n_samples>".
+lead_min() {
+  seed_waits
+  tail -n "$CHARLIE_WAIT_N" "$WAITS" 2>/dev/null | awk -v q="$CHARLIE_WAIT_Q" -v lo="$CHARLIE_LEAD_FLOOR" -v hi="$CHARLIE_LEAD_CAP" '
+    {w[NR] = $4 / 60}
+    END { n = NR; if (n == 0) { print hi, 0; exit }
+          for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (w[j] < w[i]) { t = w[i]; w[i] = w[j]; w[j] = t }
+          k = int(q * (n - 1) + 0.999999) + 1; if (k > n) k = n
+          v = int(w[k] + 0.5); if (v < lo) v = lo; if (v > hi) v = hi
+          print v, n }'
 }
 
 # Notify when an allocation starts or ends, by diffing the running set.
@@ -134,26 +274,48 @@ track_transitions() {
   now=$(charlie_jobs R | sort | tr '\n' ' ')
   prev=$(cat "$f" 2>/dev/null || true)
   local id
-  for id in $now;  do [[ " $prev " == *" $id "* ]] || { log "NOTIFY: ▶ allocation $id RUNNING (100 A100s on hqb)"; notify "▶ allocation $id RUNNING"; }; done
+  local nn
+  for id in $now;  do [[ " $prev " == *" $id "* ]] || {
+    record_wait "$id"
+    nn=$(qstat -f "$id" 2>/dev/null | awk -F' = ' '/Resource_List.nodect/{print $2}')
+    log "NOTIFY: ▶ allocation $id RUNNING (${nn:-?} nodes / $(( ${nn:-0} * 4 )) A100s on hqb)"
+    notify "▶ allocation $id RUNNING (${nn:-?} nodes / $(( ${nn:-0} * 4 )) A100s)"; }; done
   for id in $prev; do [[ " $now "  == *" $id "* ]] || { log "NOTIFY: ■ allocation $id ended";  notify "■ allocation $id ended"; }; done
   echo "$now" > "$f"
 }
 
 cmd_tick() {
-  local running queued inflight d waiting oncharlie target need
+  local running queued inflight left lead n margin
   running=$(count R); queued=$(count QH); inflight=$((running + queued))
   track_transitions
-  d=$(demand)
-  if [[ $d == ERR* ]]; then
-    log "tick: $d — not submitting (running=$running queued=$queued)"; return 0
+  if [[ -e $PAUSED ]]; then log "tick: PAUSED ($PAUSED) — running=$running queued=$queued, submitting nothing"; return 0; fi
+  read -r lead n < <(lead_min)
+  if (( queued > 0 )); then
+    log "tick: running=$running queued=$queued — successor already queued"; return 0
   fi
-  read -r waiting oncharlie <<< "$d"
-  if (( waiting + oncharlie > 0 )); then target=$CHARLIE_MAX_QUEUED; else target=$CHARLIE_STANDBY; fi
-  need=$(( target - queued ))
-  (( inflight + need > CHARLIE_MAX_INFLIGHT )) && need=$(( CHARLIE_MAX_INFLIGHT - inflight ))
-  log "tick: running=$running queued=$queued | demand: waiting=$waiting running_on_charlie=$oncharlie | target_queued=$target -> submit $(( need > 0 ? need : 0 ))"
-  local i=0; while (( i < need )); do submit_one || break; (( i++ )); done
+  if (( inflight >= CHARLIE_MAX_INFLIGHT )); then
+    log "tick: running=$running at cap $CHARLIE_MAX_INFLIGHT — not submitting"; return 0
+  fi
+  if (( running == 0 )); then
+    log "tick: nothing running or queued — chain broken, submitting now"
+    submit_one "cold start"; return 0
+  fi
+  left=$(max_remaining_min); margin=$(( (CHARLIE_INTERVAL + 59) / 60 ))
+  if (( left <= lead + margin )); then
+    log "tick: running=$running left=${left}min <= lead ${lead}min (q$CHARLIE_WAIT_Q of last $n waits) + ${margin}min tick — submitting successor"
+    submit_one "successor, ${left} min left, lead ${lead} min"
+  else
+    log "tick: running=$running left=${left}min, lead ${lead}min (q$CHARLIE_WAIT_Q of last $n) — successor due in $(( left - lead - margin )) min"
+  fi
   return 0
+}
+
+cmd_waits() {
+  seed_waits
+  echo "last $CHARLIE_WAIT_N submit->start waits (h), oldest first:"
+  tail -n "$CHARLIE_WAIT_N" "$WAITS" | awk '{printf "  %s  %5.2f h  (submitted %s)\n", $1, $4/3600, strftime("%m-%d %H:%M", $2, 1)}'
+  local lead n; read -r lead n < <(lead_min)
+  echo "lead = q$CHARLIE_WAIT_Q of $n samples, clamped [$CHARLIE_LEAD_FLOOR, $CHARLIE_LEAD_CAP] = $lead min   (all-time samples: $(wc -l < "$WAITS"))"
 }
 
 cmd_up() {
@@ -175,17 +337,64 @@ cmd_run() {
   fi
   echo "$(hostname) $$" > "$lock"
   trap 'rm -f "$lock"' EXIT INT TERM
-  log "charlie-fleet run started on $(hostname) pid $$ (interval ${CHARLIE_INTERVAL}s, max_inflight $CHARLIE_MAX_INFLIGHT, max_queued $CHARLIE_MAX_QUEUED, standby $CHARLIE_STANDBY)"
+  log "charlie-fleet run started on $(hostname) pid $$ (always-on chain; interval ${CHARLIE_INTERVAL}s, lead = q$CHARLIE_WAIT_Q of last $CHARLIE_WAIT_N waits in [$CHARLIE_LEAD_FLOOR, $CHARLIE_LEAD_CAP] min, max_inflight $CHARLIE_MAX_INFLIGHT)"
   while true; do cmd_tick; sleep "$CHARLIE_INTERVAL"; done
 }
 
+cmd_size() {
+  local n="" wall="" now=0
+  while (( $# )); do
+    case $1 in
+      --now)  now=1 ;;
+      --wall) shift; wall=${1:-} ;;
+      --wall=*) wall=${1#--wall=} ;;
+      *)      n=$1 ;;
+    esac
+    shift
+  done
+  if [[ -z $n ]]; then
+    local cn cw; read -r cn cw < <(next_size)
+    echo "next allocation: $cn nodes ($(( cn * 4 )) A100s) x $cw -> prod/$(tier "$cn" | cut -d' ' -f1)$([[ -s $SIZE_FILE ]] || echo "   (default; no $SIZE_FILE)")"
+    return 0
+  fi
+  [[ $n =~ ^[0-9]+$ ]] || { echo "size: node count must be an integer, got '$n'" >&2; return 2; }
+  local t q maxw; t=$(tier "$n")
+  [[ -n $t ]] || { echo "size: prod accepts 10-496 nodes (small 10-24 / medium 25-99 / large 100-496), got $n" >&2; return 2; }
+  read -r q maxw <<<"$t"
+  [[ -z $wall ]] && wall=$maxw
+  [[ $wall =~ ^[0-9]+:[0-5][0-9]:[0-5][0-9]$ ]] || { echo "size: walltime must be HH:MM:SS, got '$wall'" >&2; return 2; }
+  (( $(hms_s "$wall") <= $(hms_s "$maxw") )) || { echo "size: $q allows at most $maxw for $n nodes, got $wall" >&2; return 2; }
+  (( $(hms_s "$wall") >= 300 )) || { echo "size: prod needs at least 00:05:00, got $wall" >&2; return 2; }
+  if (( DRY_RUN )); then
+    log "DRY_RUN: would set next allocations to $n nodes x $wall -> prod/$q"
+    (( now )) && log "DRY_RUN: would qdel queued [$(echo $(charlie_jobs QH))] and qsub -l select=$n:system=polaris -l walltime=$wall"
+    return 0
+  fi
+  echo "$n $wall" > "$SIZE_FILE.tmp" && mv "$SIZE_FILE.tmp" "$SIZE_FILE"
+  log "size: next allocations will be $n nodes ($(( n * 4 )) A100s) x $wall -> prod/$q"
+  notify "size set: $n nodes / $(( n * 4 )) A100s x $wall ($q)"
+  (( now )) || { echo "  takes effect at the next successor; running/queued allocations keep their size (--now to replace the queued one)"; return 0; }
+  local queued; queued=$(charlie_jobs QH)
+  if [[ -n $queued ]]; then
+    echo "$queued" | xargs -r qdel; log "size --now: qdel'd queued successor(s) $(echo $queued)"
+  fi
+  [[ -e $PAUSED ]] && { log "size --now: chain is PAUSED — submitting anyway (explicit request)"; }
+  if (( $(count R) + 1 > CHARLIE_MAX_INFLIGHT )); then
+    log "size --now: $(count R) running >= cap $CHARLIE_MAX_INFLIGHT — not submitting"; return 1
+  fi
+  submit_one "resize --now"
+}
+
 cmd_status() {
-  echo "=== charlie-fleet (prod/medium, ${CHARLIE_WALL}, -> hqb) ==="
-  echo "running: $(count R)   queued/held: $(count QH)   cap: $CHARLIE_MAX_INFLIGHT in flight, $CHARLIE_MAX_QUEUED queued on demand, $CHARLIE_STANDBY standby"
+  local sn sw; read -r sn sw < <(next_size)
+  echo "=== charlie-fleet (prod, next: $sn nodes / $(( sn * 4 )) A100s x $sw -> $(tier "$sn" | cut -d' ' -f1); -> hqb) ==="
+  local lead n; read -r lead n < <(lead_min)
+  echo "mode: always-on chain$([[ -e $PAUSED ]] && echo '   *** PAUSED (charlie-fleet resume) ***')"
+  echo "running: $(count R)   queued/held: $(count QH)   last allocation ends in: $(max_remaining_min) min   successor lead: $lead min (q$CHARLIE_WAIT_Q of last $n waits)"
   local d; d=$(demand); echo "demand: $d   (waiting on hqb, running on charlie workers)"
   local id
   for id in $(charlie_jobs QRH); do
-    qstat -f "$id" 2>/dev/null | awk -v id="$id" '/job_state/{s=$3} /eligible_time/{e=$3} /resources_used.walltime/{u=$3} /^ *queue =/{q=$3} /comment/{c=$0; sub(/.*= /,"",c)} END{printf "  %s  %s  %s  eligible=%s used=%s  %s\n", id, q, s, e, (u==""?"-":u), substr(c,1,60)}'
+    qstat -f "$id" 2>/dev/null | awk -v id="$id" '/job_state/{s=$3} /eligible_time/{e=$3} /resources_used.walltime/{u=$3} /^ *queue =/{q=$3} /comment/{c=$0; sub(/.*= /,"",c)} /estimated.start_time/{est=$0; sub(/.*= /,"",est)} END{printf "  %s  %s  %s  eligible=%s used=%s  %s%s\n", id, q, s, e, (u==""?"-":u), (s=="Q" && est!="" ? "est.start " est "  " : ""), substr(c,1,60)}'
   done
   echo; echo "=== charlie workers on hqb ==="
   local pat; pat=$(charlie_jobs R | paste -sd'|' -)
@@ -197,6 +406,7 @@ cmd_status() {
 }
 
 cmd_down() {
+  [[ ${1:-QRH} == QRH ]] && { touch "$PAUSED"; log "down: paused the chain (charlie-fleet resume to restart)"; }
   local jobs; jobs=$(charlie_jobs "${1:-QRH}")
   [[ -z "$jobs" ]] && { log "down: no charlie jobs (${1:-QRH})"; return 0; }
   echo "$jobs" | xargs -r qdel 2>&1 | tail -2
@@ -209,7 +419,11 @@ case "${1:-status}" in
   run)         cmd_run ;;
   status)      cmd_status ;;
   up)          shift; cmd_up "$@" ;;
+  waits)       cmd_waits ;;
+  size)        shift; cmd_size "$@" ;;
+  pause)       touch "$PAUSED"; log "paused: no new charlie allocations until 'charlie-fleet resume'"; notify "paused" ;;
+  resume)      rm -f "$PAUSED"; log "resumed: always-on chain"; notify "resumed" ;;
   down)        cmd_down QRH ;;
   down-queued) cmd_down QH ;;
-  *) echo "usage: charlie-fleet {tick|run|status|up [N]|down|down-queued}"; exit 2 ;;
+  *) echo "usage: charlie-fleet {tick|run|status|waits|size [N [--wall HH:MM:SS] [--now]]|up [N]|pause|resume|down|down-queued}"; exit 2 ;;
 esac
