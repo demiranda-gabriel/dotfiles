@@ -81,7 +81,15 @@ fi
 if ! $PIN "$CODE" tunnel user show >/dev/null 2>&1; then
   $PIN "$CODE" tunnel user login --provider github
 fi
-$PIN "$CODE" tunnel --accept-server-license-terms --name "$NAME"
+# Reconnection grace: how long code-server keeps a disconnected window's
+# extension host (~45-60 threads each) alive waiting for it to come back.
+# Upstream default is 3 h, so a few reloads/reconnects stack several orphaned
+# exthosts and hit the 256-pid login cgroup (2026-10-08 on login-04: 253/256,
+# windows hung). 10 min still survives brief network drops; a laptop asleep
+# longer reloads the window instead of resuming it.
+GRACE_S="${VSCODE_GRACE_S:-600}"
+$PIN "$CODE" tunnel --accept-server-license-terms --name "$NAME" \
+  --reconnection-grace-time "$GRACE_S"
 
 # Keep the pane alive if the tunnel ever exits, so its output stays inspectable.
 echo "[vscode-login-tunnel] tunnel process exited; dropping to a shell."

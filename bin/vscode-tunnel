@@ -9,10 +9,51 @@
 #   vscode-tunnel up <name>    # start with an explicit tunnel name
 #   vscode-tunnel attach       # attach to the session (Ctrl-b d to detach)
 #   vscode-tunnel status       # tmux session + registered tunnel + pid usage
-#   vscode-tunnel down         # stop the tunnel + kill the tmux session
+#   vscode-tunnel down         # stop the tunnel + watcher, kill leftover processes
+#   vscode-tunnel check        # exit 0 if the tunnel holds a live relay connection
+#   vscode-tunnel watch-up     # start the zombie watchdog (tmux 'vscode-watch')
+#
+# Watchdog (2026-10-15): a tunnel self-update can leave a ZOMBIE — the old
+# process keeps the singleton lock but drops its relay connection, the respawned
+# child just attaches to it ("Connected to an existing tunnel process"), and the
+# pane still shows "Tunnel: polaris-04" while no client can connect (2026-09-24,
+# 2026-10-08, 2026-10-15 on login-04). The only reliable signal is an
+# ESTABLISHED socket on a `code-tunnel-cli tunnel` process (`tunnel status`
+# lies: stale last_connected_at). `watch` checks every WATCH_INTERVAL s and
+# restarts after WATCH_STRIKES consecutive failures, so a normal self-update
+# respawn (seconds) is never mistaken for a zombie. No cron on ALCF login
+# nodes, hence a tmux loop (2 pids of the 256-pid cgroup).
 set -uo pipefail
 SESS=vscode
+WSESS=vscode-watch
 TUNNEL="$HOME/.local/bin/vscode-login-tunnel.sh"
+WATCH_INTERVAL="${VSCODE_WATCH_INTERVAL:-120}"
+WATCH_STRIKES="${VSCODE_WATCH_STRIKES:-3}"
+WLOG="$HOME/.vscode/tunnel-watch-$(hostname -s).log"
+
+# PIDs of every code-tunnel-cli process (tunnel, respawned child, agent host).
+# Matched on comm, never `pkill -f`: inside `ssh host '...'` an -f pattern also
+# matches the remote bash -c line and kills the caller's own shell.
+cli_pids() { ps -u "$USER" -o pid=,comm= | awk '$2=="code-tunnel-cli"{print $1}'; }
+
+# Healthy = some `code-tunnel-cli tunnel` process holds an ESTABLISHED socket.
+tunnel_ok() {
+  local p
+  for p in $(ps -u "$USER" -o pid=,args= | awk '$2 ~ /code-tunnel-cli$/ && $3=="tunnel"{print $1}'); do
+    lsof -nP -a -p "$p" -i -sTCP:ESTABLISHED 2>/dev/null | grep -q ESTABLISHED && return 0
+  done
+  return 1
+}
+
+kill_cli() {
+  local p; p=$(cli_pids)
+  [[ -n "$p" ]] || return 0
+  kill -TERM $p 2>/dev/null; sleep 3
+  p=$(cli_pids); [[ -n "$p" ]] && kill -KILL $p 2>/dev/null
+  return 0
+}
+
+wlog() { echo "$(date -u +%FT%TZ) $*" >> "$WLOG"; }
 
 cmd="${1:-up}"
 shift 2>/dev/null || true
@@ -30,11 +71,18 @@ case "$cmd" in
       || echo "tunnel:       none registered on $(hostname -s)"
     p="/sys/fs/cgroup/users/$USER/pids.current"
     [[ -r "$p" ]] && echo "login pids:   $(cat "$p") / 256 (cgroup cap)"
+    tunnel_ok && echo "relay:        connected (ESTABLISHED socket)" \
+              || echo "relay:        NOT connected (zombie or down)"
+    tmux has-session -t "$WSESS" 2>/dev/null \
+      && echo "watchdog:     running (log: $WLOG)" \
+      || echo "watchdog:     absent (start: vscode-tunnel watch-up)"
     ;;
   down)
+    tmux kill-session -t "$WSESS" 2>/dev/null && echo "Stopped watchdog tmux '$WSESS'."
     tmux kill-session -t "$SESS" 2>/dev/null \
       && echo "Stopped tmux '$SESS' (credential cache kept for next time)." \
       || echo "tmux '$SESS' was not running."
+    kill_cli   # the agent host (and a zombie's parent) outlive the tmux pane
     echo "To fully unregister this machine from your VS Code list:"
     echo "    $HOME/.local/bin/code tunnel unregister"
     ;;
@@ -50,6 +98,43 @@ case "$cmd" in
       echo "First run needs a GitHub device-code login — attach to complete it:"
       echo "    vscode-tunnel attach     # enter the code shown at the printed URL"
     fi
+    "$0" watch-up >/dev/null   # every up (incl. the 41-polaris.sh re-up) arms the watchdog
     ;;
-  *) echo "usage: vscode-tunnel [up [name]|attach|status|down]"; exit 1 ;;
+  check)
+    tunnel_ok ;;
+  restart)
+    tmux kill-session -t "$SESS" 2>/dev/null
+    kill_cli
+    tmux new-session -d -s "$SESS" "'$TUNNEL' ${1:-}"
+    echo "Restarted tmux '$SESS'." ;;
+  watch-up)
+    if tmux has-session -t "$WSESS" 2>/dev/null; then
+      echo "watchdog '$WSESS' already running (log: $WLOG)"
+    else
+      tmux new-session -d -s "$WSESS" "'$0' watch"
+      echo "Started watchdog tmux '$WSESS' (log: $WLOG)."
+    fi ;;
+  watch)
+    # Acts only while the 'vscode' session exists: no session means the user
+    # ran `down` (a reboot kills this loop too; 41-polaris.sh re-ups both).
+    wlog "watchdog started (interval ${WATCH_INTERVAL}s, strikes $WATCH_STRIKES)"
+    bad=0
+    while :; do
+      if ! tmux has-session -t "$SESS" 2>/dev/null; then
+        bad=0
+      elif tunnel_ok; then
+        (( bad > 0 )) && wlog "relay back after $bad failed check(s)"
+        bad=0
+      else
+        bad=$((bad + 1))
+        wlog "no relay connection ($bad/$WATCH_STRIKES)"
+        if (( bad >= WATCH_STRIKES )); then
+          wlog "zombie tunnel -> restart"
+          "$0" restart >> "$WLOG" 2>&1
+          bad=0
+        fi
+      fi
+      sleep "$WATCH_INTERVAL"
+    done ;;
+  *) echo "usage: vscode-tunnel [up [name]|attach|status|check|restart|watch-up|down]"; exit 1 ;;
 esac

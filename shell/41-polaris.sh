@@ -13,6 +13,12 @@ if [[ -d /lus/eagle ]]; then
   if [[ "$(hostname -s)" == polaris-login-01 ]] \
       && command -v hq-fleet >/dev/null 2>&1; then
     hq-fleet up >/dev/null 2>&1
+    # hqx router (2026-10-05): moves waiting jobs between the shared and
+    # private servers into free GPU slots. Checked with tmux directly so a
+    # healthy shell start costs no python.
+    if command -v hqx >/dev/null 2>&1 && ! tmux has-session -t hq-router 2>/dev/null; then
+      hqx router up >/dev/null 2>&1
+    fi
   fi
 
   # Same idea for the VS Code login-node tunnel, which the fleet's self-heal
@@ -20,20 +26,24 @@ if [[ -d /lus/eagle ]]; then
   # nothing brings it back, so the machine silently drops out of the Remote-
   # Tunnels list until noticed by hand. `vscode-tunnel up` early-returns on a
   # live tmux session, so the steady-state cost is one `tmux has-session`.
+  # It also arms the zombie watchdog (tmux `vscode-watch`, 2026-10-15), which
+  # restarts a tunnel that is up but has lost its relay connection.
   #
-  # login-01 only: a tunnel registers ONE machine per CLI data dir, and
+  # login-04 only (moved off login-01 2026-10-06: login-01 hit its 256-pid
+  # cap and wedged, and it already hosts the hq servers + fleet tickers). A
+  # tunnel registers ONE machine per CLI data dir, and
   # vscode-login-tunnel.sh gives each node its own dir (see its header) — so
   # re-upping on every node would litter the VS Code machine list with a
   # polaris-0N entry per login node and burn ~17 pids of the 256-pid cgroup on
-  # each. login-01 is where the main tmux + Claude agents live, matching `tl`.
+  # each.
   #
   # Interactive-only, unlike the fleet block: ~/.bashrc has no `$-` guard, and
   # spawning a tunnel from an `ssh host cmd`/scp/rsync shell is pure surprise.
   # The token check keeps a credential-less node from parking a device-code
   # prompt in a detached pane forever (the script's first-run login path).
   if [[ $- == *i* ]] \
-      && [[ "$(hostname -s)" == polaris-login-01 ]] \
-      && [[ -f "$HOME/.vscode/cli-polaris-login-01/token.json" ]] \
+      && [[ "$(hostname -s)" == polaris-login-04 ]] \
+      && [[ -f "$HOME/.vscode/cli-polaris-login-04/token.json" ]] \
       && command -v vscode-tunnel >/dev/null 2>&1; then
     vscode-tunnel up >/dev/null 2>&1
   fi
