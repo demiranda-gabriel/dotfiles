@@ -10,14 +10,27 @@
 # Rendering is delegated to the group hq-gpus, which honors an existing
 # HQ_SERVER_DIR (it only setdefault()s the shared one). Extra args pass
 # through (e.g. --mock renders twice, harmlessly).
+#
+# Speed (2026-10-15): both servers are queried IN PARALLEL into temp files and
+# printed in order, so the wall time is the slower server, not the sum. hq-gpus
+# itself now batches its per-job queries (5 hq calls per server, ~2 s, instead
+# of 2 per job: 27 s at 31 jobs). Colours survive because hq-gpus is told the
+# real stdout is a terminal via HQ_GPUS_COLOR.
 set -uo pipefail
 
 HQ_GPUS=/lus/eagle/projects/HetRxnEnergy/hq-shared/bin/hq-gpus
 
 bold() { [[ -t 1 ]] && printf '\033[1m%s\033[0m\n' "$1" || printf '%s\n' "$1"; }
 
+[[ -t 1 ]] && export HQ_GPUS_COLOR=1
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+HQ_SERVER_DIR="$HOME/.hq-server"       "$HQ_GPUS" "$@" > "$tmp/alpha" 2>&1 &
+HQ_SERVER_DIR="$HOME/.hq-bravo-server" "$HQ_GPUS" "$@" > "$tmp/bravo" 2>&1 &
+wait
+
 bold "════════ alpha — group-shared server (submit: hq) ════════"
-HQ_SERVER_DIR="$HOME/.hq-server" "$HQ_GPUS" "$@"
+cat "$tmp/alpha"
 echo
 bold "════════ bravo — PRIVATE server (submit: hqb) ════════"
-HQ_SERVER_DIR="$HOME/.hq-bravo-server" "$HQ_GPUS" "$@"
+cat "$tmp/bravo"

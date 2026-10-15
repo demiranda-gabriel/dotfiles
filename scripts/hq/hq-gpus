@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+# hq-gpus — GPU status of the HetRxnEnergy shared HyperQueue fleet.
+#
+# One row per GPU across every attached worker node: free or running, which
+# job holds it, who submitted it, and for how long. Every worker the server
+# knows is listed, whatever PBS job spawned it — the standing fleet, an
+# autoalloc debug node, or a one-off allocation such as a 25-node `medium`
+# job. An "allocations" block under the header names each PBS job feeding
+# the server (queue, node/GPU count, time left) and the Alloc column ties
+# every GPU row back to it. Ownership comes from the
+# "<user>:" job-name convention; a job submitted without that prefix is
+# attributed from its submit directory instead (marked "~" in the User
+# column) rather than shown as an anonymous "?".
+#
+# Waiting jobs are listed below the table, followed by any running CPU-only
+# tasks — those hold cores rather than GPUs, so they are counted separately
+# and never occupy a GPU row.
+#
+# Works for EVERY project member: it needs only the shared client access
+# file (no ssh to the operator's compute nodes, no nvidia-smi) — everything
+# is derived from the HQ scheduler's own state. Consequently the GPU column
+# is a *logical slot* (0..3 filled in task order), not the physical index
+# nvidia-smi would report; occupancy, ownership, and runtimes are exact.
+#
+# Usage: hq-gpus            live fleet view
+#        hq-gpus --mock     synthetic data through the same rendering path
+#                           (interface development / demo; no server needed)
+import datetime
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+
+SHARE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+os.environ.setdefault("HQ_SERVER_DIR", os.path.join(SHARE, "client"))
+HQ = os.path.join(SHARE, "bin", "hq")
+if not os.path.exists(HQ):
+    HQ = "hq"
+
+PIPE = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+def hq_json(*args):
+    try:
+        r = subprocess.run([HQ, "--output-mode=json", *args], timeout=30, **PIPE)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+# ---- colour helpers (same conventions as lhj) ------------------------------
+TTY = sys.stdout.isatty() or os.environ.get("HQ_GPUS_COLOR") == "1"  # hq-gpus-all renders into a temp file
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if TTY else s
+BOLD  = lambda s: c("1", s)
+DIM   = lambda s: c("2", s)
+RED   = lambda s: c("31", s)
+GREEN = lambda s: c("32", s)
+YELLOW= lambda s: c("33", s)
+BLUE  = lambda s: c("38;5;39", s)
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+def vlen(s):
+    return len(_ANSI.sub("", s))
+
+def render(headers, rows, aligns=None):
+    ncol = len(headers)
+    aligns = aligns or ["l"] * ncol
+    widths = [max(vlen(headers[i]), *(vlen(r[i]) for r in rows)) if rows
+              else vlen(headers[i]) for i in range(ncol)]
+    def cell(txt, i):
+        pad = widths[i] - vlen(txt)
+        return (" " + txt + " " * pad + " ") if aligns[i] == "l" else \
+               (" " + " " * pad + txt + " ")
+    def line(l, m, r):
+        return l + m.join("─" * (widths[i] + 2) for i in range(ncol)) + r
+    out = [line("┌", "┬", "┐"),
+           "│" + "│".join(cell(BOLD(headers[i]), i) for i in range(ncol)) + "│",
+           line("├", "┼", "┤")]
+    for row in rows:
+        out.append("│" + "│".join(cell(row[i], i) for i in range(ncol)) + "│")
+    out.append(line("└", "┴", "┘"))
+    return "\n".join(out)
+
+def fmt_age(secs):
+    if secs is None or secs < 0:
+        return "--"
+    if secs < 3600:
+        return f"{round(secs / 60)} min"
+    if secs < 2 * 86400:
+        return f"{secs / 3600:.1f} h"
+    return f"{secs / 86400:.1f} d"
+
+def split_name(name):
+    """'wcw:zno-md' -> ('wcw', 'zno-md'); no prefix -> ('?', name)."""
+    m = re.match(r"^([A-Za-z0-9_.-]+):(.+)$", name or "")
+    return (m.group(1), m.group(2)) if m else ("?", name or "?")
+
+# --- fallback attribution: submit directory ---------------------------------
+# The "<user>:" name prefix is a convention, not something HQ enforces: a submit
+# that sets --name explicitly (or runs from a shell that bypasses the client
+# wrappers) lands in the queue unprefixed and used to render as "?". Every job
+# does carry its submit-time cwd, and on this machine a working directory is
+# under /home/<user>/ or /lus/<fs>/projects/<proj>/<user>/, so the owner is
+# recoverable. Only names that resolve to a real account are accepted, which
+# keeps shared subdirs (".../HetRxnEnergy/shared/...") from inventing a user.
+_CWD_USER = re.compile(r"^/(?:home|lus/[^/]+/projects/[^/]+)/([A-Za-z0-9_.-]+)/")
+_IS_USER = {}
+
+def _is_account(name):
+    if name not in _IS_USER:
+        try:
+            pwd.getpwnam(name)
+            _IS_USER[name] = True
+        except Exception:          # KeyError, or a flaky LDAP lookup
+            _IS_USER[name] = False
+    return _IS_USER[name]
+
+def _job_cwd(info):
+    """Submit-time working directory from `hq job info` json ('' if absent)."""
+    found = []
+    def walk(o):
+        if isinstance(o, dict):
+            v = o.get("cwd")
+            if isinstance(v, str) and v:
+                found.append(v)
+            for x in o.values():
+                walk(x)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    walk(info)
+    return found[0] if found else ""
+
+def user_from_cwd(info):
+    """Owner inferred from the job's submit directory, or None."""
+    m = _CWD_USER.match(_job_cwd(info))
+    return m.group(1) if m and _is_account(m.group(1)) else None
+
+def ts(s):
+    try:
+        return datetime.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc) if s else None
+    except Exception:
+        return None
+
+# ---- data model -------------------------------------------------------------
+# nodes   = [{host, ngpus, alloc, tasks: [{job, name, user, guess, ngpus, runtime_s}]}]
+#           (one entry per running task on that node; ngpus GPUs each;
+#            alloc = short PBS job id of the allocation the node runs in)
+# waiting = [{job, name, user, guess, ntasks, gpus_per_task, age_s}]
+# allocs  = [{alloc, name, queue, nodes, ngpus, left_s}]  one per PBS allocation
+# `guess` = user came from the submit directory, not the name prefix.
+
+# hq stores resource request amounts as fixed-point ×10⁴
+# (validated live 2026-07-29: 1 GPU -> {"request": {"Compact": 10000}}).
+_SCALE = 10_000
+
+def _amount(req):
+    """{"Compact": 40000} / {"Scatter": ...} / raw int -> units."""
+    if isinstance(req, (int, float)):
+        return int(req // _SCALE) if req >= _SCALE else int(req)
+    if isinstance(req, dict):
+        for v in req.values():
+            if isinstance(v, (int, float)):
+                return int(v // _SCALE)
+    return 0
+
+def _job_gpus_per_task(info):
+    """gpus/nvidia per task from `hq job info` json (0 = cpu-only)."""
+    found = []
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("resource") == "gpus/nvidia" and "request" in o:
+                found.append(_amount(o["request"]))
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(info)
+    return max(found) if found else 0
+
+def _worker_ngpus(w):
+    """GPU count from the worker resource descriptor (validated live:
+    {"kind": "range", "start": 0, "end": 3} on Polaris); fallback 4."""
+    res = (w.get("configuration", {}).get("resources", {}) or {})
+    for r in res.get("resources", []):
+        if r.get("name") == "gpus/nvidia":
+            kind = r.get("kind")
+            if kind == "range":
+                return int(r["end"]) - int(r["start"]) + 1
+            if kind == "list":
+                return len(r.get("values", []))
+            if kind == "groups":
+                return sum(len(g) for g in r.get("groups", []))
+            if kind == "sum":
+                return int(r.get("size", 0))
+    return 4  # Polaris fallback
+
+# ---- allocations -------------------------------------------------------------
+# HQ records the PBS job each worker was started under (`allocation.id`, set by
+# the worker from $PBS_JOBID). Grouping workers by it makes ad-hoc allocations
+# visible next to the standing fleet instead of blending into one pool: a
+# 25-node `medium` job and the 4-node `capacity` job read as two lines here.
+def _alloc_id(w):
+    a = (w.get("allocation") or {}).get("id") or ""
+    return a.split(".")[0] if a else "manual"
+
+_PBS_FACTS = {}
+def _pbs_job_facts(jid):
+    """(queue, Job_Name) via `qstat -f`, best effort — ('?', '?') when the
+    scheduler is unreachable or the worker was not started under PBS."""
+    if jid in _PBS_FACTS:
+        return _PBS_FACTS[jid]
+    q = nm = "?"
+    if jid != "manual":
+        try:
+            r = subprocess.run(["qstat", "-f", jid], timeout=15, **PIPE)
+            if r.returncode == 0:
+                m = re.search(r"^\s*queue = (\S+)", r.stdout, re.M)
+                q = m.group(1) if m else q
+                m = re.search(r"^\s*Job_Name = (\S+)", r.stdout, re.M)
+                nm = m.group(1) if m else nm
+        except Exception:
+            pass
+    _PBS_FACTS[jid] = (q, nm)
+    return q, nm
+
+def _prefetch_pbs(jids):
+    """Fill _PBS_FACTS with one `qstat -f` for every allocation at once."""
+    jids = [j for j in jids if j != "manual" and j not in _PBS_FACTS]
+    if not jids:
+        return
+    try:
+        r = subprocess.run(["qstat", "-f", *jids], timeout=15, **PIPE)
+    except Exception:
+        return
+    for block in re.split(r"^Job Id: ", r.stdout, flags=re.M)[1:]:
+        jid = block.split(".", 1)[0].strip()
+        m = re.search(r"^\s*queue = (\S+)", block, re.M)
+        n = re.search(r"^\s*Job_Name = (\S+)", block, re.M)
+        _PBS_FACTS[jid] = (m.group(1) if m else "?", n.group(1) if n else "?")
+
+def summarize_allocs(workers, now):
+    by = {}
+    for w in workers:
+        aid = _alloc_id(w)
+        e = by.setdefault(aid, {"alloc": aid, "nodes": 0, "ngpus": 0, "left_s": None})
+        e["nodes"] += 1
+        e["ngpus"] += _worker_ngpus(w)
+        st = ts(w.get("started"))
+        tl = w.get("configuration", {}).get("time_limit")
+        if st and tl:
+            left = int((st + datetime.timedelta(seconds=tl) - now).total_seconds())
+            e["left_s"] = left if e["left_s"] is None else min(e["left_s"], left)
+    _prefetch_pbs([e["alloc"] for e in by.values()])
+    for e in by.values():
+        e["queue"], e["name"] = _pbs_job_facts(e["alloc"])
+    return sorted(by.values(), key=lambda e: (-e["nodes"], e["alloc"]))
+
+def collect_live():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    workers = hq_json("worker", "list")
+    if workers is None:   # doubles as the reachability check (was a separate `server info`, +0.3 s)
+        sys.exit("hq-gpus: cannot reach the HQ server on polaris-login-01 "
+                 "(it self-heals within ~10 min; ping the operator if this persists)")
+    active = {w["id"]: w for w in workers if w.get("ended") is None}
+    nodes = {w["id"]: {"host": w.get("configuration", {}).get("hostname", "?"),
+                       "ngpus": _worker_ngpus(w), "tasks": [],
+                       "alloc": _alloc_id(w)}
+             for w in active.values()}
+    allocs = summarize_allocs(active.values(), now)
+
+    waiting = []
+    jobs = hq_json("job", "list") or []   # non-terminal jobs only
+    # Two batched calls instead of two per job: every `hq` invocation costs
+    # ~0.3 s of client start-up + server handshake, so per-job calls made this
+    # O(jobs) and took ~25 s at 30 jobs. `job info` / `task list` accept a
+    # comma-separated id selector and return a list / a dict keyed by job id.
+    sel = ",".join(str(j["id"]) for j in jobs)
+    infos = {d["info"]["id"]: [d] for d in (hq_json("job", "info", sel) or [])} if sel else {}
+    tls = (hq_json("task", "list", sel) or {}) if sel else {}
+    for j in jobs:
+        jid = j["id"]
+        user, name = split_name(j.get("name", ""))
+        info = infos.get(jid)
+        gpt = _job_gpus_per_task(info)    # gpus per task (0 = cpu-only)
+        guess = False
+        if user == "?":                   # no "<user>:" prefix — fall back to cwd
+            owner = user_from_cwd(info)
+            if owner:
+                user, guess = owner, True
+        tasks = tls.get(str(jid), []) if isinstance(tls, dict) else []
+        n_wait = 0
+        for t in tasks:
+            st = (t.get("state") or "").lower()
+            if st == "running" and t.get("worker") in nodes:
+                start = ts(t.get("started_at"))
+                rt = int((now - start).total_seconds()) if start else None
+                nodes[t["worker"]]["tasks"].append(
+                    {"job": jid, "name": name, "user": user, "guess": guess,
+                     "ngpus": gpt, "runtime_s": rt})
+            elif st == "waiting":
+                n_wait += 1
+        if n_wait:
+            # job-level started_at (job info top level) = submission time
+            sub = None
+            if isinstance(info, list) and info:
+                sub = ts(info[0].get("started_at"))
+            age = int((now - sub).total_seconds()) if sub else None
+            waiting.append({"job": jid, "name": name, "user": user,
+                            "guess": guess, "ntasks": n_wait,
+                            "gpus_per_task": gpt, "age_s": age})
+    return (sorted(nodes.values(), key=lambda n: (n["alloc"], n["host"])),
+            waiting, allocs)
+
+def collect_mock():
+    H = 3600
+    nodes = [
+        {"host": "x3006c0s13b0n0", "ngpus": 4, "alloc": "7661376", "tasks": [
+            {"job": 301, "name": "co-pt-neb",     "user": "demiranda", "ngpus": 1, "runtime_s": int(5.2 * H)},
+            {"job": 302, "name": "zno-md",        "user": "wcw",       "ngpus": 1, "runtime_s": int(1.4 * H)},
+            {"job": 302, "name": "zno-md",        "user": "wcw",       "ngpus": 1, "runtime_s": int(1.4 * H)},
+        ]},
+        {"host": "x3006c0s19b0n0", "ngpus": 4, "alloc": "7661376", "tasks": [
+            {"job": 298, "name": "allegro-train", "user": "anjohan",   "ngpus": 4, "runtime_s": int(22.1 * H)},
+        ]},
+        {"host": "x3006c0s25b1n0", "ngpus": 4, "alloc": "7670850", "tasks": [
+            {"job": 305, "name": "quick-test",    "user": "lorenzor",  "ngpus": 1, "runtime_s": 12 * 60,
+             "guess": True},
+        ]},
+    ]
+    waiting = [
+        {"job": 306, "name": "eos-sweep",  "user": "wcw",       "ntasks": 8, "gpus_per_task": 1, "age_s": 25 * 60},
+        {"job": 307, "name": "big-refit",  "user": "demiranda", "ntasks": 1, "gpus_per_task": 2, "age_s": 8 * 60},
+    ]
+    allocs = [
+        {"alloc": "7661376", "name": "hq-capacity", "queue": "capacity", "nodes": 2, "ngpus": 8,  "left_s": int(83.9 * H)},
+        {"alloc": "7670850", "name": "hq-medium25", "queue": "medium",   "nodes": 1, "ngpus": 4,  "left_s": int(5.2 * H)},
+    ]
+    return nodes, waiting, allocs
+
+# ---- views ------------------------------------------------------------------
+def user_cell(t):
+    """User column for a task/waiting dict. A "~" marks an owner inferred from
+    the submit directory rather than read off the "<user>:" name prefix."""
+    user = t["user"]
+    mark = DIM("~") if t.get("guess") else ""
+    if user == "?":
+        return DIM("?")
+    return (GREEN(user) if user == os.environ.get("USER", "") else user) + mark
+
+def gpu_view(nodes, waiting, allocs=None, mock=False):
+    rows, total, busy = [], 0, 0
+    cpu_only = []          # running tasks that hold no GPU at all
+    for nd in nodes:
+        total += nd["ngpus"]
+        slot = 0
+        for t in sorted(nd["tasks"], key=lambda t: -(t["runtime_s"] or 0)):
+            ngpus = t.get("ngpus") or 0
+            if ngpus < 1:
+                # CPU-only task (`hq submit --cpus N` with no gpus/nvidia
+                # request). It occupies cores, NOT a GPU. The old expression
+                # `range(max(n,1) if n else 1)` sent a 0-GPU task down the
+                # slot loop anyway, so it consumed a GPU row and incremented
+                # `busy` — over-reporting occupancy and hiding genuinely free
+                # GPUs (a lone CPU task on an idle node read as "1/4 in use").
+                # Track it separately and list it under the table instead.
+                cpu_only.append((nd["host"], t))
+                continue
+            for i in range(ngpus):
+                if slot >= nd["ngpus"]:
+                    break                       # over-assignment guard
+                label = f"{t['job']} " + BLUE(t["name"])
+                if ngpus > 1 and i > 0:
+                    label = DIM(f"└ same task (gpu {i+1}/{ngpus})")
+                rows.append([nd["host"], str(slot), YELLOW("running"),
+                             label, user_cell(t),
+                             fmt_age(t["runtime_s"]),
+                             DIM(nd.get("alloc", "—"))])
+                slot += 1
+                busy += 1
+        for g in range(slot, nd["ngpus"]):
+            rows.append([nd["host"], str(g), BOLD(GREEN("free")),
+                         DIM("—"), DIM("—"), DIM("—"), DIM(nd.get("alloc", "—"))])
+
+    hdr = f"{busy}/{total} GPUs in use · {len(nodes)} node(s) attached"
+    if waiting:
+        hdr += f" · {sum(w['ntasks'] for w in waiting)} task(s) waiting"
+    if cpu_only:
+        hdr += f" · {len(cpu_only)} cpu-only task(s)"
+    if mock:
+        hdr = RED("[MOCK DATA] ") + hdr
+    print(BOLD(hdr))
+    # One line per PBS allocation feeding this server. Anything outside the
+    # standing fleet (a one-off `medium` job, an autoalloc debug node) is named
+    # here by its own job id and queue rather than hiding inside the totals.
+    for a in allocs or []:
+        left = (fmt_age(a["left_s"]) + " left") if a.get("left_s") is not None \
+            else "no time limit"
+        if a.get("left_s") is not None and a["left_s"] < 3600:
+            left = RED(left)
+        print(f"  alloc {BOLD(a['alloc'])} · {a.get('name', '?')} · "
+              f"{a.get('queue', '?')} · {a['nodes']} node(s) · "
+              f"{a['ngpus']} GPUs · {left}")
+    if rows:
+        print(render(["Node", "GPU", "Status", "Job", "User", "Runtime", "Alloc"],
+                     rows, aligns=["l", "r", "l", "l", "l", "r", "l"]))
+    else:
+        print(DIM("no workers attached — fleet paused or between weekly "
+                  "allocations (qstat -u demiranda to check)"))
+    if cpu_only:
+        # Listed rather than dropped: these are running work, they just hold no
+        # GPU. Showing them keeps the view honest without inflating occupancy.
+        crows = [[str(t["job"]), BLUE(t["name"]), user_cell(t), host,
+                  fmt_age(t["runtime_s"])] for host, t in cpu_only]
+        print(BOLD("\ncpu-only (holds no GPU):"))
+        print(render(["Job", "Name", "User", "Node", "Runtime"], crows,
+                     aligns=["r", "l", "l", "l", "r"]))
+    if waiting:
+        wrows = [[str(w["job"]), BLUE(w["name"]), user_cell(w),
+                  str(w["ntasks"]),
+                  (f"{w['gpus_per_task']} GPU" if w["gpus_per_task"] else "CPU"),
+                  fmt_age(w["age_s"])] for w in waiting]
+        print(BOLD("\nwaiting:"))
+        # "Submitted", not "Queued for": age_s is measured from job SUBMISSION,
+        # and HQ drops the task start time when a task is requeued (worker lost
+        # / preemption), so time-actually-spent-waiting is not recoverable. The
+        # old label claimed the latter and could report "5.1 d" for a task that
+        # had trained for days and been waiting only 14 minutes.
+        print(render(["Job", "Name", "User", "Tasks", "Per-task", "Submitted"],
+                     wrows, aligns=["r", "l", "l", "r", "l", "r"]))
+    # Legend only when it applies: "~" owners are a good inference, not a fact
+    # the scheduler recorded, and the distinction matters on a shared fleet.
+    if any(t.get("guess") for nd in nodes for t in nd["tasks"]) \
+            or any(w.get("guess") for w in waiting):
+        print(DIM('\n~ owner inferred from the job\'s submit directory '
+                  '(its name carries no "<user>:" prefix)'))
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__ or open(__file__).read().split('"""')[0])
+        sys.exit(
+            "usage: hq-gpus [--mock]\n"
+            "  (no args)  live per-GPU view of the shared fleet\n"
+            "  --mock     synthetic demo data (no server needed)")
+    if "--mock" in args:
+        gpu_view(*collect_mock(), mock=True)
+        return
+    gpu_view(*collect_live())
+
+if __name__ == "__main__":
+    main()
