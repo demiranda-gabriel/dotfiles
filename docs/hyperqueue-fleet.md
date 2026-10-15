@@ -555,7 +555,7 @@ successor already queued/held       -> nothing
 nothing running, nothing queued     -> submit now (cold start / chain broken)
 running, nothing queued:
     left = minutes left on the allocation that ends last
-    lead = CHARLIE_WAIT_Q (0.8) quantile of the last CHARLIE_WAIT_N (10)
+    lead = CHARLIE_WAIT_Q (0.8 default; 1.0 = max in fleet.env since 2026-10-15) quantile of the last CHARLIE_WAIT_N (10)
            observed submit->start waits, clamped to [30, 360] min
     submit when left <= lead + one tick
 ```
