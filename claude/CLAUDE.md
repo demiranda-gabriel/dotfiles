@@ -20,11 +20,18 @@ able to act on it without scrolling back through the conversation.
 - **Plain English, full sentences.** Explain the mechanism and the *why*,
   not just the *what*. Avoid bullet fragments that only parse if the
   previous turn is still in my head.
-- **Detailed, not padded.** Length should come from context I need —
-  assumptions made, what was verified vs. assumed, caveats, what is still
-  pending — never from restating my question or listing paths not taken.
-  A short answer that names the run and the number is already
-  self-contained.
+- **Concise by default.** Give the result and the high-level picture, then
+  stop. Leave out numbers, file paths and mechanics I don't need to decide
+  or act; offer them instead ("ask for the per-run table").
+- **No unexplained shorthand.** Internal labels (experiment ids like
+  "e11", arm letters, split names, acronyms coined in the project) mean
+  nothing after a context switch. Say what the thing is in plain words;
+  the label may follow in parentheses for lookup.
+- **Justify every suggestion.** For each proposed next step: what to do,
+  why (which open question it settles), and roughly what it costs.
+- **Detail only when it is needed to act.** Length should come from
+  assumptions, caveats and pending state, never from completeness for its
+  own sake or from listing paths not taken.
 - **Surface decisions explicitly.** If something needs my call, say so in
   its own line with a recommendation and the trade-off; don't bury it.
 - **Close with state:** done and verified / running (with job or run IDs)
