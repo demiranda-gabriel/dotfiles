@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# agent-session — start coding-agent sessions in tmux windows, one per project,
+# and clean up windows whose agent is gone.
+#
+#   agent-session new <agent> <project>   agent ∈ claude | claude-harvard | codex
+#   agent-session list                    windows this tool manages, with status
+#   agent-session cleanup [--yes]         kill stale windows (dry run without --yes)
+#   agent-session adopt <window> <agent> <project>
+#                                         tag a window started by hand so that
+#                                         list/cleanup manage it
+#   Any command takes --host <node> (e.g. polaris-login-04 or login-04).
+#   Defaults: codex sessions start on $AGENT_CODEX_HOST (polaris-login-04),
+#   claude / claude-harvard on this node; list and cleanup cover this node plus
+#   $AGENT_REMOTE_HOSTS (default: the codex host). Remote nodes are driven over
+#   ssh, and windows there open in a tmux session named "agents" (created if
+#   missing).
+#
+# Each window is opened in the CURRENT tmux session (or $AGENT_SESSION_TMUX),
+# with its cwd at $AGENT_PROJECTS_ROOT/<project>, and the agent command is TYPED
+# into the window's interactive shell (send-keys) rather than passed to tmux as
+# the window command. That keeps shell aliases (`claude` is aliased to
+# `claude --dangerously-skip-permissions`) and leaves a shell behind if the agent
+# exits, which is what cleanup detects.
+#
+# Windows are tagged with tmux window options @agent_kind / @agent_project.
+# list and cleanup only ever touch tagged windows, so plain shells, editors and
+# hand-started agents are never killed.
+#
+# Stale = the tagged window no longer runs its agent: the agent process has
+# exited (the pane is back at a shell prompt, e.g. after the remote session was
+# archived/deleted and the CLI quit), or the pane is dead. An agent that is still
+# running is reported "alive" and left alone, even if idle.
+#
+# Env: AGENT_CODEX_HOST    (default polaris-login-04)
+#      AGENT_REMOTE_HOSTS  (space-separated; default: the codex host)
+#      AGENT_PROJECTS_ROOT (default /lus/eagle/projects/HetRxnEnergy/demiranda/projects)
+#      AGENT_SESSION_TMUX  (tmux session to open windows in; default: current,
+#                           or "agents" when not inside tmux, e.g. over ssh)
+#      AGENT_SESSION_WAIT  (seconds to wait for startup; default 20)
+set -uo pipefail
+
+ROOT="${AGENT_PROJECTS_ROOT:-/lus/eagle/projects/HetRxnEnergy/demiranda/projects}"
+WAIT="${AGENT_SESSION_WAIT:-20}"
+
+die() { echo "agent-session: $*" >&2; exit 2; }
+
+tmux_session() {
+    if [ -n "${AGENT_SESSION_TMUX:-}" ]; then echo "$AGENT_SESSION_TMUX"; return; fi
+    if [ -n "${TMUX:-}" ]; then tmux display-message -p '#S'; return; fi
+    tmux has-session -t agents 2>/dev/null || tmux new-session -d -s agents -c "$ROOT"
+    echo agents
+}
+
+agent_cmd() {  # agent project -> command line typed into the shell
+    case "$1" in
+        claude)         echo "claude --rc" ;;
+        claude-harvard) echo "claude-harvard --rc" ;;
+        codex)          echo "codex --remote unix:// -C $ROOT/$2" ;;
+        *) die "unknown agent '$1' (claude | claude-harvard | codex)" ;;
+    esac
+}
+
+base_name() {  # agent project -> window name stem
+    case "$1" in
+        claude)         echo "$2" ;;
+        claude-harvard) echo "h-$2" ;;
+        codex)          echo "codex-$2" ;;
+    esac
+}
+
+unique_name() {  # session stem -> stem, stem-2, stem-3, ...
+    local names n=1 cand="$2"
+    names=$(tmux list-windows -t "$1:" -F '#W')
+    while printf '%s\n' "$names" | grep -qxF "$cand"; do
+        n=$((n + 1)); cand="$2-$n"
+    done
+    echo "$cand"
+}
+
+# Agent process under a pane: prints "<pid> <comm>" of the first descendant of
+# pane_pid whose command is claude / claude-harvard / codex, or nothing.
+agent_proc() {
+    ps -eo pid=,ppid=,comm= 2>/dev/null | awk -v root="$1" '
+      { P[$1]=$2; C[$1]=$3; order[NR]=$1 }
+      END {
+        desc[root]=1; changed=1
+        while (changed) { changed=0
+          for (i in order) { p=order[i]; if (!(p in desc) && (P[p] in desc)) { desc[p]=1; changed=1 } } }
+        for (i in order) { p=order[i]
+          if (p != root && (p in desc) && C[p] ~ /^(claude|claude-harvard|codex)$/) { print p, C[p]; exit } }
+      }'
+}
+
+pane_state() {  # window_id -> alive|exited|dead
+    local dead pid
+    read -r dead pid < <(tmux display-message -p -t "$1" '#{pane_dead} #{pane_pid}')
+    [ "$dead" = 1 ] && { echo dead; return; }
+    [ -n "$(agent_proc "$pid")" ] || { echo exited; return; }
+    # Codex keeps its TUI running, with nothing on screen, after the thread is
+    # archived in the app; the only trace is that the thread's rollout file
+    # moves to ~/.codex/archived_sessions/ (verified 2026-11-15).
+    local thread; thread=$(tmux display-message -p -t "$1" '#{@agent_thread}')
+    if [ -n "$thread" ] && compgen -G "$HOME/.codex/archived_sessions/*$thread.jsonl" >/dev/null; then
+        echo archived; return
+    fi
+    # Claude Code keeps running after its remote session is archived/ended
+    # elsewhere; it only prints "Remote Control disconnected — this session was
+    # ended or archived ... (code 4090)" (verified 2026-11-15). Stale if the LAST
+    # remote-control line in the pane history is that disconnect.
+    local last
+    last=$(tmux capture-pane -p -J -S -3000 -t "$1" 2>/dev/null |
+           grep -E 'Remote Control disconnected|remote-control is active|Remote Control (re)?connected' | tail -1)
+    if grep -qE 'Remote Control disconnected.*(ended|archived)' <<<"$last"; then echo archived; else echo alive; fi
+}
+
+startup_status() {  # window_id -> prints a status line + remote URL if any
+    local txt i
+    for ((i = 0; i < WAIT; i++)); do
+        txt=$(tmux capture-pane -p -t "$1" 2>/dev/null)
+        if grep -qiE 'trust this folder|do you trust' <<<"$txt"; then
+            echo "status: WAITING ON TRUST PROMPT (folder not yet trusted; answer it in the window)"; break
+        fi
+        if grep -qE 'remote-control is active|Ask Codex to do anything|OpenAI Codex' <<<"$txt"; then
+            echo "status: ready"; break
+        fi
+        sleep 1
+    done
+    [ "$i" -ge "$WAIT" ] && echo "status: not confirmed after ${WAIT}s (still starting, or failed — check the window)"
+    # Claude wraps the URL across lines; join before matching.
+    tr -d '\n' <<<"$txt" | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9]+' | head -1 | sed 's/^/remote: /'
+}
+
+tag() {  # window_id agent project
+    tmux set-option -w -t "$1" @agent_kind "$2"
+    tmux set-option -w -t "$1" @agent_project "$3"
+    tmux set-option -w -t "$1" @agent_started "$(date +%FT%T)"
+}
+
+cmd_new() {
+    [ $# -eq 2 ] || die "usage: agent-session new <claude|claude-harvard|codex> <project>"
+    local agent="$1" project="$2" sess name wid cmd
+    cmd=$(agent_cmd "$agent" "$project") || exit 2
+    [ -d "$ROOT/$project" ] || die "no project '$project' in $ROOT (have: $(ls -1 "$ROOT" | tr '\n' ' '))"
+    sess=$(tmux_session); [ -n "$sess" ] || die "no tmux session found"
+    name=$(unique_name "$sess" "$(base_name "$agent" "$project")")
+    wid=$(tmux new-window -d -t "$sess:" -n "$name" -c "$ROOT/$project" -P -F '#{window_id}') || die "tmux new-window failed"
+    tmux set-option -w -t "$wid" automatic-rename off
+    tag "$wid" "$agent" "$project"
+    tmux send-keys -t "$wid" "$cmd" Enter
+    echo "window: $(tmux display-message -p -t "$wid" '#S:#I #W') ($wid)"
+    echo "command: $cmd"
+    local st; st=$(startup_status "$wid"); echo "$st"
+    if [ "$agent" = codex ] && grep -q '^status: ready' <<<"$st"; then codex_open "$wid" "$project"; fi
+}
+
+# A Codex session has no thread until its first message, and the Codex app only
+# lists threads — so an untouched session is invisible there (verified
+# 2026-11-15). Send a short opening message to create the thread.
+codex_open() {  # window_id project
+    local ref i f; ref=$(printf '%04x%04x' $RANDOM $RANDOM)
+    local msg="Session for the $2 project, opened by agent-session (ref $ref). Reply with the single word: ready."
+    tmux send-keys -t "$1" -l "$msg"
+    sleep 1; tmux send-keys -t "$1" Enter
+    # Codex can swallow the first Enter (fast input is treated as a paste):
+    # if the text is still in the input box, press Enter again.
+    for i in 1 2 3; do
+        sleep 2
+        tmux capture-pane -p -t "$1" | grep -q 'Ask Codex to do anything' && break
+        tmux send-keys -t "$1" Enter
+    done
+    for ((i = 0; i < 45; i++)); do
+        if tmux capture-pane -p -t "$1" | grep -q 'Worked for'; then
+            echo "opening message: answered (thread created; session is visible in the Codex app)"
+            # Record the thread id (from the rollout file holding our ref) so
+            # cleanup can tell when the thread is archived.
+            f=$(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -mmin -10 2>/dev/null |
+                xargs -r grep -l "ref $ref" 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+                f=${f%.jsonl}; tmux set-option -w -t "$1" @agent_thread "${f: -36}"
+                echo "thread: ${f: -36}"
+            else echo "thread: id not found (archive detection disabled for this window)"; fi
+            return
+        fi
+        sleep 1
+    done
+    echo "opening message: sent, but no reply seen after 45s — check the window"
+}
+
+list_rows() {  # window_id name index kind project state
+    tmux list-windows -a -F '#{window_id} #S:#I #W #{@agent_kind} #{@agent_project}' |
+    while read -r wid where name kind project; do
+        [ -n "$kind" ] || continue
+        echo "$wid $where $name $kind $project $(pane_state "$wid")"
+    done
+}
+
+cmd_list() {
+    printf '%-6s %-8s %-22s %-15s %-16s %s\n' ID WINDOW NAME AGENT PROJECT STATE
+    list_rows | while read -r wid where name kind project state; do
+        printf '%-6s %-8s %-22s %-15s %-16s %s\n' "$wid" "$where" "$name" "$kind" "$project" "$state"
+    done
+}
+
+cmd_cleanup() {
+    local yes=0 n=0
+    [ "${1:-}" = "--yes" ] && yes=1
+    while read -r wid where name kind project state; do
+        [ "$state" = alive ] && continue
+        n=$((n + 1))
+        if [ $yes = 1 ]; then
+            tmux kill-window -t "$wid" && echo "killed $where $name ($kind/$project: $state)"
+        else
+            echo "would kill $where $name ($kind/$project: $state)"
+        fi
+    done < <(list_rows)
+    [ $n = 0 ] && echo "no stale agent windows"
+    [ $yes = 0 ] && [ $n -gt 0 ] && echo "(dry run — re-run with --yes to kill)"
+    return 0
+}
+
+cmd_adopt() {
+    [ $# -eq 3 ] || die "usage: agent-session adopt <window> <agent> <project>"
+    agent_cmd "$2" "$3" >/dev/null || exit 2
+    tag "$1" "$2" "$3" && echo "tagged $(tmux display-message -p -t "$1" '#S:#I #W') as $2/$3"
+}
+
+local_main() {
+    case "${1:-}" in
+        new)     shift; cmd_new "$@" ;;
+        list)    shift; cmd_list ;;
+        cleanup) shift; cmd_cleanup "$@" ;;
+        adopt)   shift; cmd_adopt "$@" ;;
+        *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    esac
+}
+
+# ---- host routing -----------------------------------------------------------
+LOCAL=$(hostname -s)
+norm_host() { case "$1" in login*) echo "polaris-$1" ;; *) echo "$1" ;; esac; }
+CODEX_HOST=$(norm_host "${AGENT_CODEX_HOST:-polaris-login-04}")
+
+on_host() {  # host args... -> run agent-session --local there
+    local h="$1"; shift
+    if [ "$h" = "$LOCAL" ]; then "$0" --local "$@"
+    else ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" \
+             "$(printf '%q ' "$HOME/.local/bin/agent-session" --local "$@")"
+    fi
+}
+
+host="" args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --local) shift; local_main "$@"; exit ;;
+        --host|-H) host=$(norm_host "${2:-}"); shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
+case "${1:-}" in
+    new)
+        if [ -z "$host" ]; then [ "${2:-}" = codex ] && host=$CODEX_HOST || host=$LOCAL; fi
+        # Codex's daemon publishes its control socket as a symlink in the SHARED
+        # home (~/.codex/app-server-control/app-server-control.sock -> /tmp/...).
+        # A daemon on a second node steals that path, and when it stops it
+        # deletes the link, orphaning the first node's daemon ("requested
+        # app-server socket is not available"; incident 2026-11-15). So all
+        # codex sessions live on ONE node.
+        [ "${2:-}" = codex ] && [ "$host" != "$CODEX_HOST" ] &&
+            die "codex must run on $CODEX_HOST only (shared-home daemon socket); set AGENT_CODEX_HOST to move it"
+        echo "host: $host"; on_host "$host" "$@" ;;
+    adopt) on_host "${host:-$LOCAL}" "$@" ;;
+    list|cleanup)
+        hosts=${host:-$(printf '%s\n' "$LOCAL" ${AGENT_REMOTE_HOSTS:-$CODEX_HOST} | awk '!s[$0]++')}
+        for h in $hosts; do echo "== $h"; on_host "$h" "$@" || echo "(could not reach $h)"; done ;;
+    *) local_main ;;
+esac
