@@ -203,7 +203,8 @@ codex_open() {  # window_id project
 }
 
 list_rows() {  # window_id name index kind project state
-    tmux list-windows -a -F '#{window_id} #S:#I #W #{@agent_kind} #{@agent_project}' |
+    # No tmux server on a node means no windows there, not an error.
+    tmux list-windows -a -F '#{window_id} #S:#I #W #{@agent_kind} #{@agent_project}' 2>/dev/null |
     while read -r wid where name kind project; do
         [ -n "$kind" ] || continue
         echo "$wid $where $name $kind $project $(pane_state "$wid")"
@@ -215,6 +216,7 @@ cmd_list() {
     list_rows | while read -r wid where name kind project state; do
         printf '%-6s %-8s %-22s %-15s %-16s %s\n' "$wid" "$where" "$name" "$kind" "$project" "$state"
     done
+    return 0
 }
 
 cmd_cleanup() {
