@@ -19,11 +19,21 @@ A repeated name gets `-2`, `-3`, … Projects live in
 `/lus/eagle/projects/HetRxnEnergy/demiranda/projects/` (override with
 `AGENT_PROJECTS_ROOT`).
 
-**Hosts.** `codex` sessions always start on **polaris-login-04**
-(`AGENT_CODEX_HOST`), driven over ssh, in a tmux session named `agents` there.
-`claude` / `claude-harvard` start on the current node, in the current tmux
-session. Every command takes `--host <node>` (`login-04` is accepted).
-`list` and `cleanup` cover the current node plus the codex node.
+**Hosts.** Defaults are per site, picked from the hostname.
+
+| Site    | `claude` / `claude-harvard`                 | `codex`               | Projects root |
+|---------|---------------------------------------------|-----------------------|---------------|
+| Polaris | the current node, current tmux session      | **polaris-login-04**  | `/lus/eagle/projects/HetRxnEnergy/demiranda/projects` |
+| Aurora  | **aurora-uan-0011**, tmux session `agents`  | **aurora-uan-0012**   | `/lus/flare/projects/HetRxnEnergy/demiranda/projects` |
+
+On Aurora the Claude host is pinned (`AGENT_CLAUDE_HOST`) because tmux is per
+login node and `ssh aurora` lands on a random one. Remote nodes are driven
+over ssh, in a tmux session named `agents`. Every command takes
+`--host <node>` (`login-04` and `uan-0012` are accepted). `list` and `cleanup`
+cover the current node, the Claude host and the codex node. On Aurora
+`claude-harvard` is the shell alias from `claude-profile-init harvard`; on
+Polaris it is `bin/claude-harvard`. To drive Aurora from Polaris:
+`ssh aurora agent-session new claude <project>` (set up 2026-11-16).
 
 ## Codex: opening message
 

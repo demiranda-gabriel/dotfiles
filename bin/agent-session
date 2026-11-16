@@ -8,12 +8,15 @@
 #   agent-session adopt <window> <agent> <project>
 #                                         tag a window started by hand so that
 #                                         list/cleanup manage it
-#   Any command takes --host <node> (e.g. polaris-login-04 or login-04).
-#   Defaults: codex sessions start on $AGENT_CODEX_HOST (polaris-login-04),
-#   claude / claude-harvard on this node; list and cleanup cover this node plus
-#   $AGENT_REMOTE_HOSTS (default: the codex host). Remote nodes are driven over
-#   ssh, and windows there open in a tmux session named "agents" (created if
-#   missing).
+#   Any command takes --host <node> (e.g. polaris-login-04, login-04, uan-0012).
+#   Defaults are per site, chosen from the hostname:
+#     Polaris: codex on polaris-login-04; claude / claude-harvard on this node.
+#     Aurora:  codex on aurora-uan-0012; claude / claude-harvard on
+#              aurora-uan-0011 (tmux is per login node and `ssh aurora` lands
+#              on a random one, so the claude host is pinned there).
+#   list and cleanup cover this node, the claude host and $AGENT_REMOTE_HOSTS
+#   (default: the codex host). Remote nodes are driven over ssh, and windows
+#   there open in a tmux session named "agents" (created if missing).
 #
 # Each window is opened in the CURRENT tmux session (or $AGENT_SESSION_TMUX),
 # with its cwd at $AGENT_PROJECTS_ROOT/<project>, and the agent command is TYPED
@@ -31,15 +34,28 @@
 # archived/deleted and the CLI quit), or the pane is dead. An agent that is still
 # running is reported "alive" and left alone, even if idle.
 #
-# Env: AGENT_CODEX_HOST    (default polaris-login-04)
+# Env: AGENT_CODEX_HOST    (default per site, see above)
+#      AGENT_CLAUDE_HOST   (default per site; empty = this node)
 #      AGENT_REMOTE_HOSTS  (space-separated; default: the codex host)
-#      AGENT_PROJECTS_ROOT (default /lus/eagle/projects/HetRxnEnergy/demiranda/projects)
+#      AGENT_PROJECTS_ROOT (default per site: /lus/eagle/... on Polaris,
+#                           /lus/flare/projects/HetRxnEnergy/demiranda/projects on Aurora)
 #      AGENT_SESSION_TMUX  (tmux session to open windows in; default: current,
 #                           or "agents" when not inside tmux, e.g. over ssh)
 #      AGENT_SESSION_WAIT  (seconds to wait for startup; default 20)
 set -uo pipefail
 
-ROOT="${AGENT_PROJECTS_ROOT:-/lus/eagle/projects/HetRxnEnergy/demiranda/projects}"
+# ---- site defaults ----------------------------------------------------------
+case "$(hostname -s)" in
+    aurora-uan-*)
+        SITE_ROOT=/lus/flare/projects/HetRxnEnergy/demiranda/projects
+        SITE_CODEX_HOST=aurora-uan-0012
+        SITE_CLAUDE_HOST=aurora-uan-0011 ;;
+    *)
+        SITE_ROOT=/lus/eagle/projects/HetRxnEnergy/demiranda/projects
+        SITE_CODEX_HOST=polaris-login-04
+        SITE_CLAUDE_HOST="" ;;
+esac
+ROOT="${AGENT_PROJECTS_ROOT:-$SITE_ROOT}"
 WAIT="${AGENT_SESSION_WAIT:-20}"
 
 die() { echo "agent-session: $*" >&2; exit 2; }
@@ -236,8 +252,10 @@ local_main() {
 
 # ---- host routing -----------------------------------------------------------
 LOCAL=$(hostname -s)
-norm_host() { case "$1" in login*) echo "polaris-$1" ;; *) echo "$1" ;; esac; }
-CODEX_HOST=$(norm_host "${AGENT_CODEX_HOST:-polaris-login-04}")
+norm_host() { case "$1" in login*) echo "polaris-$1" ;; uan-*) echo "aurora-$1" ;; *) echo "$1" ;; esac; }
+CODEX_HOST=$(norm_host "${AGENT_CODEX_HOST:-$SITE_CODEX_HOST}")
+CLAUDE_HOST=$(norm_host "${AGENT_CLAUDE_HOST:-$SITE_CLAUDE_HOST}")
+[ -n "$CLAUDE_HOST" ] || CLAUDE_HOST=$LOCAL
 
 on_host() {  # host args... -> run agent-session --local there
     local h="$1"; shift
@@ -259,7 +277,7 @@ set -- "${args[@]+"${args[@]}"}"
 
 case "${1:-}" in
     new)
-        if [ -z "$host" ]; then [ "${2:-}" = codex ] && host=$CODEX_HOST || host=$LOCAL; fi
+        if [ -z "$host" ]; then [ "${2:-}" = codex ] && host=$CODEX_HOST || host=$CLAUDE_HOST; fi
         # Codex's daemon publishes its control socket as a symlink in the SHARED
         # home (~/.codex/app-server-control/app-server-control.sock -> /tmp/...).
         # A daemon on a second node steals that path, and when it stops it
@@ -269,9 +287,9 @@ case "${1:-}" in
         [ "${2:-}" = codex ] && [ "$host" != "$CODEX_HOST" ] &&
             die "codex must run on $CODEX_HOST only (shared-home daemon socket); set AGENT_CODEX_HOST to move it"
         echo "host: $host"; on_host "$host" "$@" ;;
-    adopt) on_host "${host:-$LOCAL}" "$@" ;;
+    adopt) on_host "${host:-$CLAUDE_HOST}" "$@" ;;
     list|cleanup)
-        hosts=${host:-$(printf '%s\n' "$LOCAL" ${AGENT_REMOTE_HOSTS:-$CODEX_HOST} | awk '!s[$0]++')}
+        hosts=${host:-$(printf '%s\n' "$LOCAL" "$CLAUDE_HOST" ${AGENT_REMOTE_HOSTS:-$CODEX_HOST} | awk '!s[$0]++')}
         for h in $hosts; do echo "== $h"; on_host "$h" "$@" || echo "(could not reach $h)"; done ;;
     *) local_main ;;
 esac
