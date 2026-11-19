@@ -1,0 +1,167 @@
+#!/bin/bash
+# vscode-gpu — keep ONE VS Code remote tunnel running on an A100 of the ALPHA
+# (capacity, group-shared) HQ fleet. The compute-node counterpart to
+# vscode-tunnel (login node, no GPU).
+#
+#   vscode-gpu              # = up: submit a tunnel job unless one is already live
+#   vscode-gpu status       # the tunnel job (alpha + any leftover on bravo) + node
+#   vscode-gpu log [-f]     # tail the tunnel's stdout (device-code login shows here)
+#   vscode-gpu down         # cancel the alpha tunnel job(s)
+#
+# Connect from VS Code: Remote-Tunnels → "polaris-gpu".
+#
+# WHY ALPHA (2026-09-29): this tunnel used to be an ad-hoc `hqb submit` on the
+# bravo lane (job 921). Bravo workers are 1-node `preemptable` jobs with 24-72 h
+# walltimes, so the editor kept dropping out under preemption/rotation; the
+# alpha capacity allocation (4 nodes, 168 h) is far more stable.
+#
+# "Live" means an alpha job named "$USER:vscode-gpu" with a task RUNNING or
+# WAITING — a waiting one is about to get a GPU, so submitting a second would
+# just race it for the same tunnel name. A bravo job of the same name also
+# blocks `up`: two `code tunnel` processes registering "polaris-gpu" steal the
+# relay from each other, so the old one must be cancelled first
+# (`hqb job cancel <id>`).
+#
+# The job gets the default crash limit (not 1) so that when the capacity
+# allocation rotates and its worker goes away, HQ requeues the tunnel onto the
+# next alpha worker instead of failing it.
+set -uo pipefail
+
+HQ_BIN="$HOME/.local/bin/hq"                       # alpha client (binary, no shell fn)
+HQB="$HOME/.local/bin/hqb"                         # bravo client (only for checks)
+JOB_NAME=vscode-gpu                                # submitted as "$USER:vscode-gpu"
+TUNNEL_NAME="${VSCODE_GPU_TUNNEL_NAME:-polaris-gpu}"
+DATA_DIR="$HOME/.vscode/cli-gpu"                   # own CLI data dir (see seed_data_dir)
+LOG_DIR="$HOME/.hq/vscode-logs"
+CODE_CLI="$HOME/.local/bin/code-tunnel-cli"
+PROXY=http://proxy.alcf.anl.gov:3128
+
+# Alpha submits go through the same hooks as the `hq` shell function (owner
+# prefix on the job name; the explicit --stdout/--stderr below win over the
+# log-routing hook). Sourced here because a script never sees that function.
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+_hooks="${_self%/bin/*}/scripts/hq/hq-submit-hooks.sh"
+hq_alpha() {
+    if [[ -r "$_hooks" ]]; then
+        . "$_hooks"
+        hq_submit_hooks_argv "" "$@"
+        "$HQ_BIN" "${HQ_ARGV[@]}"
+    else
+        "$HQ_BIN" "$@"
+    fi
+}
+
+# Print the ids of live (running or waiting) "$USER:vscode-gpu" jobs, one per
+# line. $1 = client command. Silent (no ids) if that server is unreachable.
+live_ids() {
+    "$@" job list --output-mode json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    jobs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for j in jobs:
+    s = j.get("task_stats", {})
+    if j.get("name") == sys.argv[1] and (s.get("running", 0) or s.get("waiting", 0)):
+        print(j["id"])
+' "$USER:$JOB_NAME"
+}
+
+# The tunnel needs its own CLI data dir: code_tunnel.json in it pins the tunnel
+# identity (name + id), and sharing a dir with the login-node tunnel would make
+# the two fight over one registration. First run seeds it: from the old bravo
+# dir when present (keeps the same tunnel id, so VS Code's existing
+# "polaris-gpu" entry just reconnects), else just the GitHub credentials from
+# the login-node tunnel (avoids a device-code prompt on a headless node).
+seed_data_dir() {
+    [[ -f "$DATA_DIR/token.json" ]] && return 0
+    mkdir -p "$DATA_DIR"
+    local src
+    for src in "$HOME/.vscode/cli-gpu-bravo" "$HOME/.vscode/cli-polaris-login-01"; do
+        [[ -f "$src/token.json" ]] || continue
+        cp -p "$src/token.json" "$DATA_DIR/"
+        [[ -f "$src/agent-host-token" ]] && cp -p "$src/agent-host-token" "$DATA_DIR/"
+        # Tunnel identity only from a dir that already registered our name.
+        if [[ -f "$src/code_tunnel.json" ]] \
+            && grep -q "\"name\":\"$TUNNEL_NAME\"" "$src/code_tunnel.json"; then
+            cp -p "$src/code_tunnel.json" "$DATA_DIR/"
+        fi
+        echo "Seeded $DATA_DIR from $src."
+        return 0
+    done
+    echo "No cached VS Code credentials found — the job will print a GitHub"
+    echo "device-code login; complete it via: vscode-gpu log -f"
+}
+
+submit() {
+    seed_data_dir
+    mkdir -p "$LOG_DIR"
+    # Single-quoted payload: expanded on the compute node, with values passed
+    # through the environment (--env) rather than spliced into the string.
+    local payload='
+export http_proxy=$VSG_PROXY https_proxy=$VSG_PROXY HTTP_PROXY=$VSG_PROXY HTTPS_PROXY=$VSG_PROXY
+export no_proxy=localhost,127.0.0.1,.alcf.anl.gov
+export VSCODE_CLI_DISABLE_KEYCHAIN_ENCRYPT=1 VSCODE_CLI_DATA_DIR=$VSG_DATA_DIR
+export XDG_RUNTIME_DIR=/tmp/xdg-$(id -u); mkdir -p "$XDG_RUNTIME_DIR"
+echo "host=$(hostname) CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES start=$(date -Is)"
+exec "$VSG_CODE_CLI" tunnel --accept-server-license-terms --name "$VSG_TUNNEL_NAME"'
+    hq_alpha submit --name "$JOB_NAME" \
+        --resource gpus/nvidia=1 --cpus 16 \
+        --env "VSG_PROXY=$PROXY" --env "VSG_DATA_DIR=$DATA_DIR" \
+        --env "VSG_CODE_CLI=$CODE_CLI" --env "VSG_TUNNEL_NAME=$TUNNEL_NAME" \
+        --stdout "$LOG_DIR/%{JOB_ID}.out" --stderr "$LOG_DIR/%{JOB_ID}.err" \
+        -- bash -c "$payload"
+}
+
+cmd="${1:-up}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  up)
+    alpha=$(live_ids "$HQ_BIN")
+    if [[ -n "$alpha" ]]; then
+        echo "vscode-gpu already live on alpha: job(s) $(echo $alpha). Nothing submitted."
+        echo "    vscode-gpu status   # node + state"
+        exit 0
+    fi
+    bravo=$(live_ids "$HQB")
+    if [[ -n "$bravo" ]]; then
+        echo "A '$JOB_NAME' job is still live on BRAVO: $(echo $bravo)." >&2
+        echo "It registers the same tunnel name, so cancel it first:" >&2
+        echo "    hqb job cancel $(echo $bravo | tr ' ' ',')" >&2
+        exit 1
+    fi
+    "$HQ_BIN" server info >/dev/null 2>&1 || {
+        echo "alpha HQ server unreachable — run hq-server-up (or hq-fleet status)." >&2
+        exit 1; }
+    echo "No live vscode-gpu tunnel on alpha — submitting one."
+    submit
+    echo "Connect: VS Code → Remote-Tunnels → $TUNNEL_NAME  (log: vscode-gpu log -f)"
+    ;;
+  status)
+    alpha=$(live_ids "$HQ_BIN"); bravo=$(live_ids "$HQB")
+    [[ -z "$alpha" ]] && echo "alpha: no live vscode-gpu job   (start: vscode-gpu)"
+    for id in $alpha; do
+        echo "alpha job $id:"
+        "$HQ_BIN" job info "$id" 2>/dev/null | grep -E '^\| (State|Workers|Resources|Makespan) '
+    done
+    for id in $bravo; do
+        echo "bravo job $id still live (legacy lane) — cancel: hqb job cancel $id"
+    done
+    [[ -f "$DATA_DIR/code_tunnel.json" ]] \
+        && echo "tunnel: $(cat "$DATA_DIR/code_tunnel.json")"
+    exit 0
+    ;;
+  log)
+    id=$(live_ids "$HQ_BIN" | tail -1)
+    [[ -z "$id" ]] && id=$(ls -t "$LOG_DIR"/*.out 2>/dev/null | head -1 | xargs -r basename | sed 's/\.out$//')
+    [[ -z "$id" ]] && { echo "no vscode-gpu log found in $LOG_DIR" >&2; exit 1; }
+    echo "== $LOG_DIR/$id.out =="
+    if [[ "${1:-}" == -f ]]; then tail -f "$LOG_DIR/$id.out"; else tail -n 40 "$LOG_DIR/$id.out"; fi
+    ;;
+  down)
+    alpha=$(live_ids "$HQ_BIN")
+    [[ -z "$alpha" ]] && { echo "No live vscode-gpu job on alpha."; exit 0; }
+    "$HQ_BIN" job cancel "$(echo $alpha | tr ' ' ',')"
+    ;;
+  *) echo "usage: vscode-gpu [up|status|log [-f]|down]" >&2; exit 1 ;;
+esac
