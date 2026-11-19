@@ -617,6 +617,36 @@ The loop is `tmux charlie-fleet` on **login-01**, next to `hq-fleet` and
 other two orchestrators (exact-name and `bravo-1n` prefix matches). Log
 `~/.hq/charlie/fleet.log`; Slack on every submit, start and end.
 
+### Two queued successors and run-time handover (2026-10-16)
+
+Waits grew past an allocation's length (387 min for a 360 min allocation on
+2026-10-15), so a single successor left a gap however early it was queued.
+The tick now computes `cover` = minutes left on the last-ending running
+allocation + the walltime of every queued successor, and submits when
+`cover <= lead + one tick` with fewer than `CHARLIE_MAX_QUEUED` (2) queued.
+With nothing queued this is the old rule; a second successor appears only when
+`lead` > one walltime. `CHARLIE_LEAD_CAP` went 360 -> 720 min to allow it.
+
+Two queued jobs can start in either order, so the handover no longer treats a
+lower PBS id as older: `scripts/hq/charlie-handover` (linked into
+`~/.local/bin`, called every 60 s by worker.pbs) orders allocations by END time
+(HQ worker `started` + `time_limit`). It lives outside the PBS script because
+PBS freezes a job's script at qsub: fixes to inline logic never reach queued
+jobs. Decisions:
+
+- **drain**: nothing waits on hqb and our idle nodes >= the predecessor's busy
+  nodes -> stop all its workers; tasks requeue (no crash charge) and resume
+  from checkpoints on our nodes.
+- **emptied**: a predecessor worker idle on two consecutive polls is stopped
+  even while tasks wait (it cannot take them, e.g. a `--time-request` longer
+  than its remaining walltime). When its last worker goes, its mpiexec exits
+  and the PBS job ends, returning the nodes.
+- unknown runtime info counts as busy; any error prints WAIT (never stops).
+
+Jobs queued before 2026-10-16 03:13 UTC (7748354) still carry the old inline
+id-ordered logic; it is only wrong when a lower id starts later, and the new
+logic on the other allocation covers that case.
+
 ### Resizing charlie without a restart (2026-10-14)
 
 ```bash

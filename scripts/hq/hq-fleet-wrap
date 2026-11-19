@@ -1,0 +1,52 @@
+#!/bin/bash
+# hq-fleet-wrap — installed AS ~/.local/bin/hq on Polaris (2026-10-05), in front
+# of the real binary at ~/.local/libexec/hq/hq. It changes exactly one thing:
+# `hq ... worker start` gets a fleet marker resource
+#
+#     --resource fleet/<alpha|bravo|charlie>=sum(1000)
+#
+# so that tasks can be pinned to a fleet (`--resource fleet/charlie=1`, which
+# `hqx submit --fleet charlie` adds for you). Unpinned tasks request no marker
+# and run on any worker; the 1000 units never limit how many tasks fit.
+#
+# WHY A WRAPPER and not an edit to the worker .pbs scripts: PBS snapshots the
+# batch script at qsub, so the ~20 bravo/capacity jobs already queued would
+# start WITHOUT markers for days. Every worker script runs bare `hq` from
+# $HOME/.local/bin at START time, so this wrapper reaches them too.
+#
+# The real binary keeps the file name `hq` (in libexec/) on purpose:
+# hq-server-up finds the server with `pgrep -x hq`, which matches the process
+# name = executable basename. Renaming it (hq-bin, hq.real) would make every
+# fleet tick believe the server is dead.
+#
+# Fleet resolution, first match wins:
+#   $HQ_FLEET                            explicit (manual worker revivals)
+#   $PBS_JOBNAME bravo*                  -> bravo
+#   $PBS_JOBNAME charlie*                -> charlie
+#   server is not ~/.hq-bravo-server     -> alpha (capacity, autoalloc, bridge)
+#   otherwise                            -> no marker (worker still works)
+# A worker that already has a fleet/ resource on its command line is untouched.
+REAL="${HQ_FLEET_WRAP_REAL:-$HOME/.local/libexec/hq/hq}"   # override only for tests
+
+is_start=0 has_marker=0 server_dir=${HQ_SERVER_DIR:-} prev=""
+for a in "$@"; do
+    [[ $prev == worker && $a == start ]] && is_start=1
+    [[ $prev == --server-dir ]] && server_dir=$a
+    [[ $a == --server-dir=* ]] && server_dir=${a#--server-dir=}
+    [[ $a == *fleet/* ]] && has_marker=1
+    prev=$a
+done
+
+if (( is_start && ! has_marker )); then
+    fleet=${HQ_FLEET:-}
+    if [[ -z $fleet ]]; then
+        case ${PBS_JOBNAME:-} in
+            bravo*)   fleet=bravo ;;
+            charlie*) fleet=charlie ;;
+            *) [[ $server_dir != *hq-bravo-server* ]] && fleet=alpha ;;
+        esac
+    fi
+    [[ -n $fleet ]] && set -- "$@" --resource "fleet/$fleet=sum(1000)"
+fi
+
+exec "$REAL" "$@"

@@ -29,13 +29,21 @@
 # Each allocation runs its full walltime, and its successor is submitted so it
 # is PREDICTED to start when it ends. Per tick:
 #   paused (charlie-fleet pause)  -> submit nothing
-#   a successor is queued/held    -> nothing to do
 #   nothing running, nothing queued -> submit now (cold start / chain broken)
-#   running, nothing queued       -> submit when left <= lead + one tick, where
-#       left = minutes of walltime left on the allocation that ends LAST
-#       lead = CHARLIE_WAIT_Q quantile of the last CHARLIE_WAIT_N observed
-#              submit->start waits (waits.tsv), clamped to
-#              [CHARLIE_LEAD_FLOOR, CHARLIE_LEAD_CAP] minutes
+#   nothing running, >=1 queued   -> wait for it (no pile-up during a gap)
+#   running                       -> submit when cover <= lead + one tick and
+#                                    fewer than CHARLIE_MAX_QUEUED are queued, where
+#       cover = left + walltime of every queued/held successor (minutes the
+#               chain is already covered, assuming each starts as the last ends)
+#       left  = minutes of walltime left on the allocation that ends LAST
+#       lead  = CHARLIE_WAIT_Q quantile of the last CHARLIE_WAIT_N observed
+#               submit->start waits (waits.tsv), clamped to
+#               [CHARLIE_LEAD_FLOOR, CHARLIE_LEAD_CAP] minutes
+# With nothing queued, cover = left: the classic rule. A SECOND successor is
+# queued only when lead > one walltime, i.e. waits are longer than an
+# allocation lasts (2026-10-16: 387 min wait for a 360 min allocation left a
+# gap however early the single successor went in). Overlapping allocations are
+# handled by charlie-handover (run from worker.pbs).
 # Why a quantile and not PBS timing: every PBS way to delay a start (-a, -h,
 # -W depend) leaves the job ineligible, and Polaris priority is driven by
 # eligible_time (job_sort_formula), so the job only starts its wait at release
@@ -84,7 +92,8 @@
 #                             will queue a fresh successor unless paused)
 #
 # Knobs (env or ~/.hq/fleet.env): CHARLIE_WAIT_Q (0.8), CHARLIE_WAIT_N (10),
-# CHARLIE_LEAD_FLOOR (30), CHARLIE_LEAD_CAP (360), CHARLIE_MAX_INFLIGHT (3, a
+# CHARLIE_LEAD_FLOOR (30), CHARLIE_LEAD_CAP (720), CHARLIE_MAX_QUEUED (2),
+# CHARLIE_MAX_INFLIGHT (3, a
 # safety cap only), CHARLIE_INTERVAL (300), CHARLIE_NODES (25) and CHARLIE_WALL
 # (06:00:00) as defaults when $STATE/size is absent, CHARLIE_NAME (charlie-25n,
 # must match #PBS -N). The loop reads fleet.env ONCE at start: restart it after
@@ -110,7 +119,8 @@ CHARLIE_MAX_INFLIGHT=${CHARLIE_MAX_INFLIGHT:-3}
 CHARLIE_WAIT_Q=${CHARLIE_WAIT_Q:-0.8}        # quantile of recent waits used as the submit lead
 CHARLIE_WAIT_N=${CHARLIE_WAIT_N:-10}         # how many recent waits
 CHARLIE_LEAD_FLOOR=${CHARLIE_LEAD_FLOOR:-30} # minutes
-CHARLIE_LEAD_CAP=${CHARLIE_LEAD_CAP:-360}    # minutes (= one walltime: never chain two ahead)
+CHARLIE_LEAD_CAP=${CHARLIE_LEAD_CAP:-720}    # minutes (two walltimes: lets a 2nd successor queue on long waits)
+CHARLIE_MAX_QUEUED=${CHARLIE_MAX_QUEUED:-2}  # queued/held successors at most
 CHARLIE_INTERVAL=${CHARLIE_INTERVAL:-300}
 HQB_SERVER_DIR=${HQB_SERVER_DIR:-$HOME/.hq-bravo-server}
 DRY_RUN=${DRY_RUN:-0}
@@ -184,6 +194,16 @@ max_remaining_min() {
     (( rem > best )) && best=$rem
   done
   echo "$best"
+}
+
+# Total requested walltime, in minutes, of the queued/held charlie jobs.
+queued_wall_min() {
+  local id tot=0 w
+  for id in $(charlie_jobs QH); do
+    w=$(qstat -f "$id" 2>/dev/null | awk -F' = ' '/Resource_List.walltime/ {split($2, a, ":"); print a[1]*60 + a[2]}')
+    tot=$(( tot + ${w:-0} ))
+  done
+  echo "$tot"
 }
 
 # prod routing tier for a node count -> "<queue> <max walltime>", or "" if
@@ -285,27 +305,32 @@ track_transitions() {
 }
 
 cmd_tick() {
-  local running queued inflight left lead n margin
+  local running queued inflight left lead n margin qwall cover
   running=$(count R); queued=$(count QH); inflight=$((running + queued))
   track_transitions
   if [[ -e $PAUSED ]]; then log "tick: PAUSED ($PAUSED) — running=$running queued=$queued, submitting nothing"; return 0; fi
   read -r lead n < <(lead_min)
-  if (( queued > 0 )); then
-    log "tick: running=$running queued=$queued — successor already queued"; return 0
+  if (( running == 0 && queued > 0 )); then
+    log "tick: nothing running, queued=$queued — waiting for it to start"; return 0
+  fi
+  if (( queued >= CHARLIE_MAX_QUEUED )); then
+    log "tick: running=$running queued=$queued — at CHARLIE_MAX_QUEUED=$CHARLIE_MAX_QUEUED"; return 0
   fi
   if (( inflight >= CHARLIE_MAX_INFLIGHT )); then
-    log "tick: running=$running at cap $CHARLIE_MAX_INFLIGHT — not submitting"; return 0
+    log "tick: running=$running queued=$queued at cap $CHARLIE_MAX_INFLIGHT — not submitting"; return 0
   fi
   if (( running == 0 )); then
     log "tick: nothing running or queued — chain broken, submitting now"
     submit_one "cold start"; return 0
   fi
   left=$(max_remaining_min); margin=$(( (CHARLIE_INTERVAL + 59) / 60 ))
-  if (( left <= lead + margin )); then
-    log "tick: running=$running left=${left}min <= lead ${lead}min (q$CHARLIE_WAIT_Q of last $n waits) + ${margin}min tick — submitting successor"
-    submit_one "successor, ${left} min left, lead ${lead} min"
+  qwall=$(queued_wall_min); cover=$(( left + qwall ))
+  local what="successor"; (( queued > 0 )) && what="successor #$(( queued + 1 )) (waits exceed a walltime)"
+  if (( cover <= lead + margin )); then
+    log "tick: running=$running queued=$queued cover=${cover}min (left ${left} + queued ${qwall}) <= lead ${lead}min (q$CHARLIE_WAIT_Q of last $n waits) + ${margin}min tick — submitting $what"
+    submit_one "$what, cover ${cover} min, lead ${lead} min"
   else
-    log "tick: running=$running left=${left}min, lead ${lead}min (q$CHARLIE_WAIT_Q of last $n) — successor due in $(( left - lead - margin )) min"
+    log "tick: running=$running queued=$queued cover=${cover}min (left ${left} + queued ${qwall}), lead ${lead}min (q$CHARLIE_WAIT_Q of last $n) — next due in $(( cover - lead - margin )) min"
   fi
   return 0
 }

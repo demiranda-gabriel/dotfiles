@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+# charlie-handover — one handover decision for a running charlie allocation.
+# Called every POLL s by charlie-worker.pbs (head node of the allocation).
+# Kept OUT of the PBS script on purpose: PBS freezes a job's script at qsub,
+# so logic inlined there cannot be fixed for jobs already queued (with two
+# successors queued that can be 12+ h of jobs). This file is read at run time.
+#
+#   charlie-handover <PBS_JOBID> <NNODES> <state-file>
+#
+# Prints one line:
+#   NONE                          no charlie allocation ends before ours: done
+#   WAIT <reason>                 predecessors exist, nothing to stop yet
+#   STOP <wids> <pbs ids> <why>   `hq worker stop` these predecessor workers
+#
+# Predecessor = another charlie allocation (fleet/charlie marker) that ENDS
+# before ours, from each worker's start time + autodetected time limit. Not
+# "lower PBS id": with two successors queued (2026-10-16) the lower id can
+# start later and end later, and draining it would throw away the longer-lived
+# allocation.
+#
+# Two ways a predecessor's workers get stopped:
+#   emptied  a predecessor worker idle on two consecutive polls is stopped even
+#            while tasks wait — HQ places a fitting task within a second, so a
+#            worker idle for a whole poll cannot take what is waiting (e.g. a
+#            --time-request longer than its remaining walltime). Losing it costs
+#            nothing; once every worker of an allocation is gone its mpiexec
+#            exits and the PBS job ends, returning the nodes.
+#   drain    nothing waits on hqb and our idle nodes can absorb every busy
+#            predecessor node: stop them all, tasks go back to WAITING (a stop
+#            is not a crash) and resume from their checkpoints on our nodes.
+# Unknown runtime info counts as busy — never stop on missing information.
+import datetime, json, os, subprocess, sys
+
+HQB = [os.path.expanduser("~/.local/bin/hq"), "--server-dir",
+       os.path.expanduser("~/.hq-bravo-server"), "--output-mode", "json"]
+
+
+def hq(*args):
+    r = subprocess.run(HQB + list(args), stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, universal_newlines=True, timeout=60)
+    if r.returncode:
+        raise RuntimeError(" ".join(args) + " failed")
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def is_charlie(w):
+    res = w.get("configuration", {}).get("resources", {}).get("resources", [])
+    return any(r.get("name") == "fleet/charlie" for r in res)
+
+
+def alloc(w):
+    return (w.get("allocation") or {}).get("id") or ""
+
+
+def end_ts(w):
+    """Epoch seconds at which this worker's time limit runs out, or None."""
+    tl = (w.get("configuration") or {}).get("time_limit")
+    st = w.get("started")
+    if tl is None or not st:
+        return None
+    t0 = datetime.datetime.strptime(st[:19], "%Y-%m-%dT%H:%M:%S")
+    return (t0 - datetime.datetime(1970, 1, 1)).total_seconds() + float(tl)
+
+
+def busy(w):
+    ri = w.get("runtime_info")
+    if ri is None:
+        return None
+    s = ri.get("SingleNodeTasks")
+    return s is None or bool(s.get("assigned_tasks", 0) or s.get("running_tasks", 0)
+                             or s.get("is_reserved"))
+
+
+def main():
+    me, nn, state = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    ws = [w for w in (hq("worker", "list") or []) if w.get("ended") is None]
+    mine = [w for w in ws if alloc(w) == me]
+    my_ends = [e for e in (end_ts(w) for w in mine) if e is not None]
+    if not my_ends:
+        print("WAIT our workers not attached yet"); return
+    my_end = min(my_ends)
+    # An allocation's end = its earliest-ending worker; unknown end -> never a predecessor.
+    ends, unknown = {}, set()
+    for w in ws:
+        a = alloc(w)
+        if a and a != me and is_charlie(w):
+            e = end_ts(w)
+            if e is None:
+                unknown.add(a)
+            else:
+                ends[a] = min(e, ends.get(a, e))
+    preds = {a for a, e in ends.items() if a not in unknown and e < my_end - 60}
+    pw = [w for w in ws if alloc(w) in preds]
+    if not pw:
+        try: os.remove(state)
+        except OSError: pass
+        print("NONE"); return
+    if len(mine) < nn:
+        print("WAIT only %d/%d of our workers attached" % (len(mine), nn)); return
+    ids = ",".join(str(w["id"]) for w in mine + pw)
+    info = {w["id"]: busy(w) for w in (hq("worker", "info", ids) or [])}
+    waiting = sum((j.get("task_stats") or {}).get("waiting", 0) for j in (hq("job", "list") or []))
+    pbs = lambda wl: ",".join(sorted({alloc(w).split(".")[0] for w in wl}))
+
+    # drain: nothing waits and we can absorb every busy predecessor node
+    free = sum(1 for w in mine if info.get(w["id"]) is False)
+    need = sum(1 for w in pw if info.get(w["id"]) is not False)
+    if waiting == 0 and need <= free:
+        print("STOP %s %s drain(%d busy -> %d idle)" % (",".join(str(w["id"]) for w in pw), pbs(pw), need, free))
+        return
+
+    # emptied: predecessor workers idle on this AND the previous poll
+    idle = sorted(w["id"] for w in pw if info.get(w["id"]) is False)
+    try:
+        prev = set(int(x) for x in open(state).read().split())
+    except (OSError, ValueError):
+        prev = set()
+    with open(state, "w") as f:
+        f.write(" ".join(map(str, idle)))
+    stop = [i for i in idle if i in prev]
+    if stop:
+        sw = [w for w in pw if w["id"] in stop]
+        print("STOP %s %s emptied(%d idle worker(s) for 2 polls)" % (",".join(map(str, stop)), pbs(sw), len(stop)))
+        return
+    if waiting:
+        print("WAIT %d task(s) waiting on hqb: keep both allocations busy" % waiting)
+    else:
+        print("WAIT predecessor has %d busy node(s), we have only %d idle" % (need, free))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # never stop anything on an error
+        print("WAIT decision failed: %s" % e)

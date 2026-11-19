@@ -11,7 +11,7 @@
 # No scheduler mail: the fleet's Slack webhook reports every state transition.
 #PBS -m n
 #
-# CHARLIE-FLEET worker (2026-09-30): __CHARLIE_NODES__ nodes x __CHARLIE_WALL__
+# CHARLIE-FLEET worker: __CHARLIE_NODES__ nodes x __CHARLIE_WALL__
 # on the `prod` route queue, which lands in `medium` (25-99 nodes, <=6 h) and
 # draws on the 496-node production pool that neither `capacity` (32 nodes total
 # across all projects) nor `preemptable` (56 nodes total) can reach. Workers
@@ -24,25 +24,44 @@
 # charge, and it is re-placed on the next worker with enough time left, where
 # the task body resumes from last.ckpt. Nothing is "transported" by hand.
 #
-# Differences from bravo/capacity workers, on purpose:
-#   * --idle-timeout: a worker with nothing to run for that long exits, and
-#     once every node's worker has exited the job ends. A 25-node allocation
-#     must not sit empty for 6 h.
+# ALWAYS-ON CHAIN (2026-10-12). charlie is one continuous chain of allocations:
+# every allocation runs its full walltime (no idle shutdown — the job-level
+# idle watchdog of 2026-10-05 was removed), and charlie-fleet queues the
+# successor so it is predicted to start when this one ends (submit lead =
+# a high percentile of recent prod waits). Because waits vary 0.1-10 h, the
+# successor often starts EARLY. Rather than idling it (the old "handover hold")
+# this script then DRAINS the predecessor: once our own workers are attached,
+# nothing is WAITING on hqb, and we have enough idle nodes to absorb every busy
+# predecessor node, it runs `hq worker stop` on the predecessor's workers. Their
+# tasks go back to WAITING (an explicit stop is not a crash), land on our idle
+# nodes, and resume from last.ckpt; the predecessor's mpiexec exits and its PBS
+# job ends, returning the nodes. Overlap therefore costs the progress since the
+# last checkpoint, not hours of 25 idle nodes. If tasks ARE waiting, or ours
+# cannot absorb theirs, both allocations stay up and the extra GPUs are used;
+# the check repeats every $POLL s until no older charlie allocation is left.
+# Since 2026-10-16 a predecessor worker that sits idle for two polls is also
+# stopped while tasks wait ("emptied": it cannot take them), so an allocation
+# whose work has moved on ends early instead of idling to its walltime; and
+# "older" means ENDS earlier, not lower PBS id (see charlie-handover).
+#
+# Other differences from bravo/capacity workers, on purpose:
 #   * No retry loop. The capacity script restarts workers forever (a 168 h
 #     reservation is worth keeping alive through a server restart); here a
-#     worker exit means the job is over and charlie-fleet decides whether to
-#     queue another. --on-server-lost finish-running still lets in-flight
-#     tasks finish if the server blips.
+#     worker exit means the job is over and charlie-fleet queues the next one.
+#     --on-server-lost finish-running still lets in-flight tasks finish if the
+#     server blips.
 #   * The worker's time limit is autodetected from PBS (--manager defaults to
 #     detection), which is what lets `--time-request` keep tasks off a worker
 #     that is about to expire.
 export PATH=$HOME/.local/bin:$PATH
 umask 002
 ulimit -c 0
-IDLE=${CHARLIE_IDLE:-20m}   # passed by charlie-fleet via `qsub -v`
+HQB="$HOME/.local/bin/hq --server-dir $HOME/.hq-bravo-server"
+POLL=60                     # handover check period, seconds
+ts() { date -u +%FT%TZ; }
 
 NNODES=$(wc -l < "$PBS_NODEFILE")
-echo "$(date -u +%FT%TZ) charlie worker job $PBS_JOBID starting on $NNODES node(s), idle-timeout $IDLE: $(tr '\n' ' ' < "$PBS_NODEFILE")"
+echo "$(ts) charlie worker job $PBS_JOBID starting on $NNODES node(s), always-on (no idle shutdown): $(tr '\n' ' ' < "$PBS_NODEFILE")"
 
 # Short node-local TMPDIR: HQ's unix socket path must stay under SUN_LEN (108
 # chars) and PALS appends a per-app dir to $TMPDIR on every rank, which blew the
@@ -58,5 +77,38 @@ mpiexec -n "$NNODES" --ppn 1 --cpu-bind none \
     bash -c "export TMPDIR='$WORKER_TMPDIR'
              mkdir -p \"\$TMPDIR\" || { echo \"FATAL: cannot mkdir \$TMPDIR on \$(hostname)\"; exit 1; }
              ulimit -c 0
-             exec hq --server-dir $HOME/.hq-bravo-server worker start --idle-timeout '$IDLE' --on-server-lost finish-running"
-echo "$(date -u +%FT%TZ) charlie worker job $PBS_JOBID: all workers exited (idle timeout, time limit, or server lost); job ends"
+             exec hq --server-dir $HOME/.hq-bravo-server worker start --on-server-lost finish-running" &
+MPI_PID=$!
+
+# Handover decision, read at RUN time from ~/.local/bin/charlie-handover
+# (scripts/hq/charlie-handover): PBS freezes this script at qsub, so logic
+# inlined here could not be fixed for jobs already queued. It prints NONE (no
+# charlie allocation ends before ours), WAIT <reason>, or STOP <worker ids>
+# <pbs ids> <why> — predecessor workers that are idle for two polls
+# ("emptied") or that our idle nodes can absorb while nothing waits ("drain").
+# Predecessor = ENDS before us (worker start + time limit), not lower PBS id.
+HANDOVER_STATE=$TMPDIR/charlie-handover.${PBS_JOBID%%.*}
+handover_decision() {
+    charlie-handover "$PBS_JOBID" "$NNODES" "$HANDOVER_STATE" 2>/dev/null || echo "WAIT handover script failed"
+}
+
+# Handover loop: runs only while a charlie allocation ending before ours is alive, then
+# this script just waits for its own workers (walltime ends them).
+last=""
+while kill -0 "$MPI_PID" 2>/dev/null; do
+    sleep "$POLL"
+    kill -0 "$MPI_PID" 2>/dev/null || break
+    d=$(handover_decision)
+    case $d in
+        NONE)  [[ -n $last ]] && echo "$(ts) charlie job $PBS_JOBID: no predecessor allocation left; handover done"
+               break ;;
+        STOP*) read -r _ wids pbsids rest <<<"$d"
+               echo "$(ts) charlie job $PBS_JOBID: stopping workers [$wids] of predecessor(s) $pbsids: $rest"
+               $HQB worker stop "$wids"
+               last=$d ;;
+        *)     [[ $d != "$last" ]] && echo "$(ts) charlie job $PBS_JOBID: handover pending — ${d#WAIT }"
+               last=$d ;;
+    esac
+done
+wait "$MPI_PID"
+echo "$(ts) charlie worker job $PBS_JOBID: all workers exited (time limit, drained by successor, or server lost); job ends"

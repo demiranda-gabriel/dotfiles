@@ -137,6 +137,18 @@ link_script "$DIR/hq-bravo-server-up" hq-bravo-server-up  # PRIVATE bravo server
 link_script "$DIR/hqb"          hqb           # client for the private bravo server
 link_script "$DIR/hq-gpus-all"  hq-gpus-all   # per-GPU view of both fleets (private)
 link_script "$DIR/charlie-fleet" charlie-fleet # prod/medium on-demand lane -> bravo server (2026-09-30)
+link_script "$DIR/charlie-handover" charlie-handover # handover decision, read at run time by charlie worker.pbs (2026-10-16)
+link_script "$DIR/hqx"          hqx           # one queue over both servers + router (2026-10-05)
+# Fleet-marker wrapper in front of the hq binary (2026-10-05, see hq-fleet-wrap).
+# The real binary moves to ~/.local/libexec/hq/hq — it must keep the basename
+# `hq`, because hq-server-up finds the server with `pgrep -x hq`.
+if [[ -f "$HOME/.local/bin/hq" && ! -L "$HOME/.local/bin/hq" ]]; then
+    mkdir -p "$HOME/.local/libexec/hq"
+    cp -p "$HOME/.local/bin/hq" "$HOME/.local/libexec/hq/hq"
+    ln -s "$DIR/hq-fleet-wrap" "$HOME/.local/bin/hq.wrap.tmp"
+    mv -T "$HOME/.local/bin/hq.wrap.tmp" "$HOME/.local/bin/hq"
+    echo "✓ hq binary -> ~/.local/libexec/hq/hq; ~/.local/bin/hq is now the fleet-marker wrapper"
+fi
 
 # Build the login-node get_nprocs shim
 cp -f "$DIR/shim/nproc8.c" "$HQDIR/shim/nproc8.c"

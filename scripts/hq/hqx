@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+"""hqx — one job list across the two Polaris HyperQueue servers, with fleet
+pinning, manual moves, and a router that sends waiting jobs to free GPUs on
+any fleet (2026-10-05).
+
+WHY TWO SERVERS STAY TWO: HyperQueue has no per-user ACLs. The alpha server's
+key is group-shared (hq-shared/), so any worker attached to it is usable by
+every teammate; bravo moved to its own PRIVATE server on 2026-08-20 for exactly
+that reason. hqx therefore never merges the servers. It shows them as one
+queue, and moves YOUR jobs between them by cancel + resubmit, rebuilding each
+job from the server's own JSON record (command, cwd, env, log paths, resource
+requests, time request, crash limit, priority). Teammates' jobs are never
+touched.
+
+    server a  (shared, `hq`)            fleet alpha    capacity 4-node jobs
+    server b  (PRIVATE, `hqb`)          fleet bravo    preemptable 1-node jobs
+                                        fleet charlie  prod/medium 25-node jobs
+
+Jobs are named <server letter><HQ job id>: a318, b970. A move gives a new id;
+`hqx list` shows where a job came from.
+
+Pinning. Workers carry a marker resource fleet/<name> (added at `worker start`
+by the hq wrapper, scripts/hq/hq-fleet-wrap). A task that requests
+fleet/charlie=1 can only run on charlie. hqx keeps each job's allowed fleet set
+in ~/.hq-router/pins.json; a job with no entry there is pinned by its marker if
+it has one, otherwise it may run anywhere.
+
+Usage:
+  hqx list [-a]                        merged queue (+ free GPUs per fleet); -a: include teammates
+  hqx submit [--fleet F[,G]|any] <hq submit args>    e.g. hqx submit --fleet charlie --resource gpus/nvidia=1 -- python train.py
+  hqx move <id> --to F [--running] [--keep-pin]      move a job (pins it to F unless --keep-pin)
+  hqx pin <id> F[,G]|any [--running]   change where a job may run
+  hqx router tick|run|status|up|down   the rebalancer (tmux `hq-router` on polaris-login-01)
+Env: DRY_RUN=1 makes router tick/move/pin print what they would do.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+USER = os.environ.get("USER", "demiranda")
+REAL_HQ = os.path.join(HOME, ".local/libexec/hq/hq")
+if not os.path.exists(REAL_HQ):
+    REAL_HQ = os.path.join(HOME, ".local/bin/hq")
+HOOKS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hq-submit-hooks.sh")
+STATE = os.environ.get("HQX_STATE", os.path.join(HOME, ".hq-router"))
+PINS = os.path.join(STATE, "pins.json")
+MOVES = os.path.join(STATE, "moves.jsonl")
+LOG = os.path.join(STATE, "router.log")
+
+SERVERS = {
+    "a": {"dir": os.environ.get("HQX_SERVER_A"), "lane": "", "fleets": ["alpha"]},
+    "b": {"dir": os.environ.get("HQX_SERVER_B", os.path.join(HOME, ".hq-bravo-server")),
+          "lane": "bravo", "fleets": ["bravo", "charlie"]},
+}
+FLEETS = ["alpha", "bravo", "charlie"]
+FLEET_SERVER = {"alpha": "a", "bravo": "b", "charlie": "b"}
+# Jobs whose name has no "<user>:" prefix count as yours only if submitted from here.
+OWN_PREFIXES = ["/lus/eagle/projects/HetRxnEnergy/" + USER, HOME]
+
+GRACE_S = int(os.environ.get("HQX_GRACE", "120"))     # a job must wait this long before it is moved
+DWELL_S = int(os.environ.get("HQX_DWELL", "600"))     # and stay put this long after a move
+MAX_MOVES = int(os.environ.get("HQX_MAX_MOVES", "10"))  # per tick
+INTERVAL_S = int(os.environ.get("HQX_INTERVAL", "60"))
+DRY = os.environ.get("DRY_RUN", "0") not in ("", "0")
+SCALE = 10000.0  # HQ stores resource amounts x 10000
+
+
+# ----------------------------------------------------------------- utilities
+def now():
+    return time.time()
+
+
+def ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg):
+    line = "%s %s" % (ts(), msg)
+    print(line, flush=True)
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def parse_time(s):
+    if not s:
+        return None
+    # Python 3.6 strptime: %z takes +0000 (no colon), %f at most 6 digits.
+    s = re.sub(r"\.(\d{6})\d*", r".\1", s.strip()).replace("Z", "+0000")
+    s = re.sub(r"([+-]\d\d):(\d\d)$", r"\1\2", s)
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
+def hq_cmd(srv, *args):
+    cmd = [REAL_HQ]
+    if SERVERS[srv]["dir"]:
+        cmd += ["--server-dir", SERVERS[srv]["dir"]]
+    return cmd + list(args)
+
+
+def hq_run(srv, *args, check=True):
+    p = subprocess.run(hq_cmd(srv, *args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       universal_newlines=True)
+    if check and p.returncode != 0:
+        raise RuntimeError("hq %s %s failed: %s" % (srv, " ".join(args), p.stderr.strip()[-400:]))
+    return p
+
+
+def hq_json(srv, *args):
+    p = hq_run(srv, "--output-mode", "json", *args)
+    out = p.stdout.strip()
+    return json.loads(out) if out else []
+
+
+def load_pins():
+    try:
+        with open(PINS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_pins(pins):
+    if DRY:
+        return
+    os.makedirs(STATE, exist_ok=True)
+    tmp = PINS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(pins, f, indent=1, sort_keys=True)
+    os.replace(tmp, PINS)
+
+
+def load_moves():
+    moves = []
+    try:
+        with open(MOVES) as f:
+            for line in f:
+                try:
+                    moves.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return moves
+
+
+def record_move(rec):
+    if DRY:
+        return
+    os.makedirs(STATE, exist_ok=True)
+    with open(MOVES, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def parse_fleets(s):
+    if s in (None, "", "any"):
+        return None
+    fl = sorted(set(x.strip() for x in s.split(",") if x.strip()))
+    bad = [x for x in fl if x not in FLEETS]
+    if bad:
+        sys.exit("unknown fleet(s) %s; choose from %s or 'any'" % (",".join(bad), ",".join(FLEETS)))
+    return None if set(fl) == set(FLEETS) else fl
+
+
+def split_id(jid):
+    m = re.match(r"^([ab])(\d+)$", jid)
+    if not m:
+        sys.exit("job ids look like a318 (shared alpha server) or b970 (private server); got %r" % jid)
+    return m.group(1), int(m.group(2))
+
+
+# ------------------------------------------------------------ cluster model
+def pbs_job_names(ids):
+    """PBS job id -> job name, for workers that carry no fleet marker."""
+    names = {}
+    if not ids:
+        return names
+    p = subprocess.run(["qstat", "-f", "-F", "json"] + sorted(ids), stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, universal_newlines=True)
+    try:
+        for jid, j in json.loads(p.stdout).get("Jobs", {}).items():
+            names[jid] = j.get("Job_Name", "")
+            names[jid.split(".")[0]] = names[jid]
+    except ValueError:
+        pass
+    return names
+
+
+def res_total(r):
+    k = r.get("kind")
+    if k == "groups":
+        return float(sum(len(g) for g in r["groups"]))
+    if k == "range":
+        return float(r["end"] - r["start"] + 1)
+    if k == "list":
+        return float(len(r.get("values", [])))
+    if k == "sum":
+        return float(r["size"])
+    return 0.0
+
+
+def load_workers(srv):
+    ws = []
+    for w in hq_json(srv, "worker", "list"):
+        conf = w["configuration"]
+        totals = {r["name"]: res_total(r) for r in conf["resources"]["resources"]}
+        markers = [n.split("/", 1)[1] for n in totals if n.startswith("fleet/")]
+        alloc = (w.get("allocation") or {}).get("id")
+        start = parse_time(w.get("started"))
+        tl = conf.get("time_limit")
+        ws.append({
+            "srv": srv, "id": w["id"], "host": conf["hostname"], "alloc": alloc,
+            "totals": totals, "free": dict(totals),
+            "marker": markers[0] if markers else None, "fleet": markers[0] if markers else None,
+            "end": (start + tl) if (start and tl) else None,
+        })
+    if srv == "a":
+        for w in ws:
+            w["fleet"] = w["fleet"] or "alpha"
+    else:
+        names = pbs_job_names({w["alloc"] for w in ws if w["alloc"] and not w["fleet"]})
+        for w in ws:
+            if not w["fleet"] and w["alloc"]:
+                n = names.get(w["alloc"], names.get(w["alloc"].split(".")[0], ""))
+                w["fleet"] = "bravo" if n.startswith("bravo") else "charlie" if n.startswith("charlie") else None
+    return ws
+
+
+def variant_amounts(variant):
+    """{resource: amount or 'all'} for one request variant."""
+    out = {}
+    for r in variant.get("resources", []):
+        req = r["request"]
+        if isinstance(req, str):  # "All"
+            out[r["resource"]] = "all"
+        else:
+            out[r["resource"]] = list(req.values())[0] / SCALE
+    return out
+
+
+def variant_string(amount_req):
+    """HQ request JSON -> job-file request string ("4 compact", "all", ...)."""
+    if isinstance(amount_req, str):
+        return "all"
+    (policy, val), = amount_req.items()
+    n = "%g" % (val / SCALE)
+    suffix = {"Compact": "compact", "ForceCompact": "compact!", "Tight": "tight",
+              "ForceTight": "tight!", "Scatter": "scatter"}.get(policy, "compact")
+    return "%s %s" % (n, suffix)
+
+
+def load_jobs(srv, states=("waiting", "running")):
+    """Full JSON for every job in the given states, keyed by HQ id."""
+    listed = hq_json(srv, "job", "list", "--filter", ",".join(states))
+    ids = [str(j["id"]) for j in listed]
+    if not ids:
+        return {}
+    jobs = {}
+    for k in range(0, len(ids), 200):
+        for j in hq_json(srv, "job", "info", ",".join(ids[k:k + 200])):
+            jobs[j["info"]["id"]] = j
+    return jobs
+
+
+def running_placements(srv, jobs):
+    """[(job id, task id, worker id)] for running tasks."""
+    run_ids = [str(i) for i, j in jobs.items() if j["info"]["task_stats"]["running"]]
+    out = []
+    if not run_ids:
+        return out
+    data = hq_json(srv, "task", "list", ",".join(run_ids))
+    for jid, tasks in data.items():
+        for t in tasks:
+            if t.get("state") != "running":
+                continue
+            w = t.get("worker")
+            if isinstance(w, list):
+                w = w[0] if w else None
+            if w is not None:
+                out.append((int(jid), t["id"], w))
+    return out
+
+
+def task_specs(j):
+    """{task id: spec} for every task, or None if hqx cannot rebuild the job
+    (several submits into an open job, or a task graph with dependencies).
+    A plain `hq submit` stores one shared "array" spec; a job file stores a
+    "graph" list with one spec per task, in task-id order."""
+    subs = j.get("submits") or []
+    if len(subs) != 1:
+        return None
+    sub = subs[0]
+    ids = sorted(t["id"] for t in j["tasks"])
+    if "array" in sub:
+        return {i: sub["array"] for i in ids}
+    g = sub.get("graph") or []
+    if len(g) != len(ids) or any(x.get("deps") for x in g):
+        return None
+    return dict(zip(ids, g))
+
+
+def job_array(j):
+    """A representative spec (first task) for ownership, priority, pins."""
+    subs = j.get("submits") or [{}]
+    sub = subs[0]
+    if "array" in sub:
+        return sub["array"]
+    g = sub.get("graph") or []
+    return g[0] if g else {"program": {}, "resources": [], "priority": 0}
+
+
+def job_owned(j):
+    name = j["info"]["name"]
+    if name.startswith(USER + ":"):
+        return True
+    if ":" in name:
+        return False
+    cwd = job_array(j)["program"].get("cwd") or ""
+    return any(cwd.startswith(p) for p in OWN_PREFIXES)
+
+
+def job_marker(j):
+    for v in job_array(j)["resources"]:
+        for r in v.get("resources", []):
+            if r["resource"].startswith("fleet/"):
+                return r["resource"].split("/", 1)[1]
+    return None
+
+
+def job_pin(pins, key, j):
+    if key in pins:
+        return pins[key]
+    m = job_marker(j)
+    return [m] if m else None
+
+
+def marker_for(pin, srv):
+    """Marker a job needs on server srv to respect pin (None = no marker)."""
+    if pin is None:
+        return None
+    here = [f for f in pin if f in SERVERS[srv]["fleets"]]
+    if not here:
+        raise ValueError("pin %s excludes every fleet on server %s" % (pin, srv))
+    return None if set(here) == set(SERVERS[srv]["fleets"]) else here[0]
+
+
+def fits(variant, w, pin, t_now):
+    """Can this request variant start on worker w right now?"""
+    if pin is not None and w["fleet"] not in pin:
+        return False
+    if variant.get("n_nodes", 0):
+        return False
+    mt = variant.get("min_time") or 0
+    if w["end"] is not None and w["end"] - t_now < mt:
+        return False
+    for res, amt in variant_amounts(variant).items():
+        if res not in w["totals"]:
+            return False
+        if amt == "all":
+            if w["free"][res] < w["totals"][res]:
+                return False
+        elif w["free"][res] + 1e-9 < amt:
+            return False
+    return True
+
+
+def reserve(variant, w):
+    for res, amt in variant_amounts(variant).items():
+        if res in w["free"]:
+            w["free"][res] = 0.0 if amt == "all" else w["free"][res] - amt
+
+
+def charge_running(srv, jobs, workers):
+    by_id = {w["id"]: w for w in workers}
+    for jid, _tid, wid in running_placements(srv, jobs):
+        w = by_id.get(wid)
+        if w is not None:
+            specs = task_specs(jobs[jid]) or {}
+            spec = specs.get(_tid) or job_array(jobs[jid])
+            if spec.get("resources"):
+                reserve(spec["resources"][0], w)
+
+
+# ------------------------------------------------------------- job rebuild
+def toml_str(s):
+    return json.dumps(s)  # JSON string escapes are valid TOML basic strings
+
+
+def build_job_file(j, task_ids, marker):
+    """TOML job definition reproducing job j (tasks task_ids) with marker."""
+    specs = task_specs(j)
+    if specs is None:
+        raise ValueError("job has several submits or task dependencies; hqx cannot rebuild it")
+    L = ["name = %s" % toml_str(j["info"]["name"])]
+    if j.get("max_fails") is not None:
+        L.append("max_fails = %d" % j["max_fails"])
+    for tid in task_ids:
+        a = specs[tid]
+        prog = a["program"]
+        L += ["", "[[task]]", "id = %d" % tid,
+              "command = [%s]" % ", ".join(toml_str(x) for x in prog["args"])]
+        if prog.get("cwd"):
+            L.append("cwd = %s" % toml_str(prog["cwd"]))
+        for k in ("stdout", "stderr"):
+            if prog.get(k):
+                L.append("%s = %s" % (k, toml_str(prog[k])))
+        if prog.get("env"):
+            L.append("env = { %s }" % ", ".join("%s = %s" % (toml_str(k), toml_str(v))
+                                                 for k, v in sorted(prog["env"].items())))
+        if a.get("priority"):
+            L.append("priority = %d" % a["priority"])
+        if a.get("crash_limit") is not None:
+            L.append("crash_limit = %d" % a["crash_limit"])
+        if a.get("time_limit"):
+            L.append('time_limit = "%ds"' % int(a["time_limit"]))
+        if a.get("task_dir"):
+            L.append("task_dir = true")
+        if a.get("pin_mode"):
+            L.append("pin = %s" % toml_str(str(a["pin_mode"]).lower()))
+        for v in a["resources"]:
+            L += ["", "[[task.request]]"]
+            res = {r["resource"]: variant_string(r["request"]) for r in v.get("resources", [])
+                   if not r["resource"].startswith("fleet/")}
+            if marker:
+                res["fleet/" + marker] = "1"
+            L.append("resources = { %s }" % ", ".join("%s = %s" % (toml_str(k), toml_str(x))
+                                                       for k, x in res.items()))
+            if v.get("min_time"):
+                L.append('time_request = "%ds"' % int(v["min_time"]))
+            if v.get("n_nodes"):
+                L.append("n_nodes = %d" % v["n_nodes"])
+    return "\n".join(L) + "\n"
+
+
+def submit_file(srv, text):
+    os.makedirs(os.path.join(STATE, "jobfiles"), exist_ok=True)
+    path = os.path.join(STATE, "jobfiles", "%d-%d.toml" % (int(now() * 1000), os.getpid()))
+    with open(path, "w") as f:
+        f.write(text)
+    p = hq_run(srv, "job", "submit-file", path)
+    m = re.search(r"job ID: (\d+)", p.stdout + p.stderr)
+    if not m:
+        raise RuntimeError("could not parse job id from: %s" % (p.stdout + p.stderr).strip())
+    return int(m.group(1))
+
+
+def move_job(src, jid, j, dst, marker, reason, allow_running=False):
+    """Cancel job j on src and resubmit its unfinished tasks on dst.
+    Returns the new id, or None if nothing was moved."""
+    tasks = [t for t in j["tasks"] if t["state"] in ("waiting", "running")]
+    if not tasks:
+        return None
+    if task_specs(j) is None:
+        log("skip %s%d: several submits or task dependencies, cannot rebuild" % (src, jid))
+        return None
+    if any(t["state"] == "running" for t in tasks) and not allow_running:
+        log("skip %s%d: has running tasks" % (src, jid))
+        return None
+    text = build_job_file(j, sorted(t["id"] for t in tasks), marker)
+    tag = "%s%d -> server %s%s (%s)" % (src, jid, dst, " fleet/" + marker if marker else "", reason)
+    if DRY:
+        log("DRY_RUN: would move " + tag)
+        return None
+    # Re-check right before cancelling: if HQ placed it meanwhile, leave it.
+    cur = hq_json(src, "job", "info", str(jid))[0]
+    st = cur["info"]["task_stats"]
+    if st["running"] and not allow_running:
+        log("skip %s%d: started meanwhile" % (src, jid))
+        return None
+    hq_run(src, "job", "cancel", str(jid), "--reason", "hqx: moved to server %s" % dst)
+    try:
+        new = submit_file(dst, text)
+    except Exception as e:  # put it back where it was
+        log("ERROR moving %s: %s; resubmitting on %s" % (tag, e, src))
+        back = submit_file(src, build_job_file(j, sorted(t["id"] for t in tasks), job_marker(j)))
+        record_move({"t": ts(), "from": "%s%d" % (src, jid), "to": "%s%d" % (src, back),
+                     "name": j["info"]["name"], "reason": "restore after failed move"})
+        return None
+    record_move({"t": ts(), "from": "%s%d" % (src, jid), "to": "%s%d" % (dst, new),
+                 "name": j["info"]["name"], "reason": reason, "marker": marker})
+    pins = load_pins()
+    old = "%s%d" % (src, jid)
+    if old in pins:
+        pins["%s%d" % (dst, new)] = pins.pop(old)
+        save_pins(pins)
+    log("moved %s => %s%d" % (tag, dst, new))
+    return new
+
+
+# ----------------------------------------------------------------- router
+def router_tick():
+    t = now()
+    pins = load_pins()
+    moves = load_moves()
+    last_move_in = {m["to"]: parse_time(m["t"]) for m in moves}
+    jobs = {s: load_jobs(s) for s in SERVERS}
+    workers = {s: load_workers(s) for s in SERVERS}
+    for s in SERVERS:
+        charge_running(s, jobs[s], workers[s])
+    # Forget pins of jobs that are no longer waiting/running.
+    live = {"%s%d" % (s, i) for s in jobs for i in jobs[s]}
+    stale = [k for k in pins if k not in live]
+    if stale:
+        for k in stale:
+            pins.pop(k)
+        save_pins(pins)
+
+    cands = []
+    for s, js in jobs.items():
+        for jid, j in js.items():
+            st = j["info"]["task_stats"]
+            if not st["waiting"]:
+                continue
+            key = "%s%d" % (s, jid)
+            arrived = last_move_in.get(key) or parse_time(j.get("started_at")) or t
+            a = job_array(j)
+            cands.append((-(a.get("priority") or 0), arrived, s, jid, j, key))
+    cands.sort(key=lambda c: (c[0], c[1]))
+
+    n_moves = 0
+    for _negprio, arrived, s, jid, j, key in cands:
+        pin = job_pin(pins, key, j)
+        v = job_array(j)["resources"]
+        # Would it start where it is? Then just account for it.
+        here = next((w for w in workers[s] for var in v if fits(var, w, pin, t)), None)
+        if here is not None:
+            var = next(var for var in v if fits(var, here, pin, t))
+            reserve(var, here)
+            continue
+        if not job_owned(j) or j["info"]["task_stats"]["running"]:
+            continue
+        if t - arrived < (DWELL_S if key in last_move_in else GRACE_S):
+            continue
+        if any(var.get("n_nodes") for var in v) or task_specs(j) is None:
+            continue
+        other = "b" if s == "a" else "a"
+        try:
+            mk = marker_for(pin, other)
+        except ValueError:
+            continue  # pinned to fleets that only exist where it already is
+        target = None
+        for w in workers[other]:
+            if mk and w["marker"] != mk:
+                continue
+            var = next((var for var in v if fits(var, w, pin, t)), None)
+            if var is not None:
+                target = (w, var)
+                break
+        if target is None:
+            continue
+        if n_moves >= MAX_MOVES:
+            break
+        w, var = target
+        new = move_job(s, jid, j, other, mk, "free slot on %s worker %d (%s)" % (w["fleet"], w["id"], w["host"]))
+        if new is not None or DRY:
+            reserve(var, w)
+            n_moves += 1
+    return n_moves
+
+
+def router_run():
+    import fcntl
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(os.path.join(STATE, "run.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("hq-router already running (lock %s)" % lock.name)
+    log("router started (interval %ds, grace %ds, dwell %ds)" % (INTERVAL_S, GRACE_S, DWELL_S))
+    while True:
+        try:
+            n = router_tick()
+            with open(os.path.join(STATE, "heartbeat"), "w") as f:
+                f.write("%s ok, %d move(s)\n" % (ts(), n))
+        except Exception as e:
+            log("tick error: %s" % e)
+        time.sleep(INTERVAL_S)
+
+
+ROUTER_HOST = "polaris-login-01"
+
+
+def tmux_on_login01(cmd):
+    if os.uname()[1].split(".")[0] == ROUTER_HOST:
+        return subprocess.call(["bash", "-lc", cmd])
+    return subprocess.call(["ssh", "-o", "BatchMode=yes", ROUTER_HOST, "bash -lc %s" % json.dumps(cmd)])
+
+
+def router_cmd(args):
+    sub = args[0] if args else "status"
+    if sub == "tick":
+        n = router_tick()
+        log("tick done, %d move(s)" % n)
+    elif sub == "run":
+        router_run()
+    elif sub == "up":
+        me = os.path.realpath(__file__)
+        shim = os.path.join(HOME, ".hq/shim/nproc8.so")
+        tmux_on_login01("tmux has-session -t hq-router 2>/dev/null && echo 'hq-router already up' || "
+                        "tmux new-session -d -s hq-router 'LD_PRELOAD=%s taskset -c 0-7 %s router run' && echo 'hq-router started'"
+                        % (shim, me))
+    elif sub == "down":
+        tmux_on_login01("tmux kill-session -t hq-router 2>/dev/null && echo 'hq-router stopped' || echo 'hq-router not running'")
+    elif sub == "status":
+        tmux_on_login01("tmux has-session -t hq-router 2>/dev/null && echo 'hq-router: running (tmux hq-router on %s)' || echo 'hq-router: NOT running'" % ROUTER_HOST)
+        try:
+            with open(os.path.join(STATE, "heartbeat")) as f:
+                print("last tick: " + f.read().strip())
+        except OSError:
+            print("last tick: none yet")
+        try:
+            with open(LOG) as f:
+                print("".join(f.readlines()[-10:]), end="")
+        except OSError:
+            pass
+    else:
+        sys.exit("hqx router tick|run|up|down|status")
+
+
+# ------------------------------------------------------------- user verbs
+def fmt_pin(p):
+    return "any" if p is None else ",".join(p)
+
+
+def cmd_list(args):
+    show_all = "-a" in args
+    pins = load_pins()
+    origin = {m["to"]: m["from"] for m in load_moves()}
+    rows = []
+    free = {f: 0.0 for f in FLEETS}
+    total = {f: 0.0 for f in FLEETS}
+    for s in SERVERS:
+        jobs = load_jobs(s)
+        ws = load_workers(s)
+        charge_running(s, jobs, ws)
+        wfleet = {w["id"]: w["fleet"] for w in ws}
+        for w in ws:
+            f = w["fleet"] or "?"
+            if f in free:
+                free[f] += w["free"].get("gpus/nvidia", 0)
+                total[f] += w["totals"].get("gpus/nvidia", 0)
+        where = {}
+        for jid, _tid, wid in running_placements(s, jobs):
+            where.setdefault(jid, set()).add(wfleet.get(wid) or "?")
+        for jid, j in sorted(jobs.items()):
+            if not show_all and not job_owned(j):
+                continue
+            key = "%s%d" % (s, jid)
+            st = j["info"]["task_stats"]
+            state = "RUNNING" if st["running"] else "WAITING"
+            src, hops = key, []
+            while src in origin and len(hops) < 10:
+                src = origin[src]
+                hops.append(src)
+            rows.append((key, state, "%d/%d" % (st["running"], st["waiting"]),
+                         ",".join(sorted(where.get(jid, []))) or "-",
+                         fmt_pin(job_pin(pins, key, j)), j["info"]["name"],
+                         "<-" + hops[-1] if hops else ""))
+    hdr = ("ID", "STATE", "RUN/WAIT", "ON", "PIN", "NAME", "MOVED")
+    w = [max(len(str(r[i])) for r in rows + [hdr]) for i in range(len(hdr))]
+    for r in [hdr] + rows:
+        print("  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)).rstrip())
+    print()
+    print("free GPUs:  " + "   ".join("%s %d/%d" % (f, free[f], total[f]) for f in FLEETS))
+
+
+def cmd_submit(args):
+    pin = None
+    rest = list(args)
+    if rest[:1] and rest[0].startswith("--fleet"):
+        if "=" in rest[0]:
+            pin = parse_fleets(rest[0].split("=", 1)[1]); rest = rest[1:]
+        else:
+            pin = parse_fleets(rest[1]); rest = rest[2:]
+    if pin is None:
+        srv = "b"  # default lane for your own work; the router rebalances
+    else:
+        srv = "a" if pin == ["alpha"] else "b"
+    mk = marker_for(pin, srv)
+    if mk:
+        idx = rest.index("--") if "--" in rest else len(rest)
+        rest = rest[:idx] + ["--resource", "fleet/%s=1" % mk] + rest[idx:]
+    lane = SERVERS[srv]["lane"]
+    sd = ['--server-dir', SERVERS[srv]["dir"]] if SERVERS[srv]["dir"] else []
+    script = ('[ -r "$HOOKS" ] && . "$HOOKS" && hq_submit_hooks_argv "$LANE" "$@" && set -- "${HQ_ARGV[@]}"; '
+              'exec "$REAL" ' + " ".join('"%s"' % x for x in sd) + ' "$@"')
+    env = dict(os.environ, HOOKS=HOOKS, LANE=lane, REAL=REAL_HQ)
+    p = subprocess.run(["bash", "-c", script, "hqx", "submit"] + rest, env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    sys.stdout.write(p.stdout)
+    m = re.search(r"job ID: (\d+)", p.stdout)
+    if p.returncode == 0 and m:
+        key = "%s%s" % (srv, m.group(1))
+        if pin is not None:
+            pins = load_pins()
+            pins[key] = pin
+            save_pins(pins)
+        print("hqx id: %s   pin: %s" % (key, fmt_pin(pin)))
+    sys.exit(p.returncode)
+
+
+def get_job(key):
+    s, jid = split_id(key)
+    js = hq_json(s, "job", "info", str(jid))
+    if not js:
+        sys.exit("no job %s" % key)
+    return s, jid, js[0]
+
+
+def cmd_move(args):
+    if len(args) < 3 or args[1] != "--to":
+        sys.exit("usage: hqx move <id> --to <fleet> [--running] [--keep-pin]")
+    key, fleet = args[0], args[2]
+    if fleet not in FLEETS:
+        sys.exit("fleet must be one of " + ",".join(FLEETS))
+    running = "--running" in args
+    s, jid, j = get_job(key)
+    pins = load_pins()
+    old_pin = job_pin(pins, key, j)
+    if "--keep-pin" in args:
+        if old_pin is not None and fleet not in old_pin:
+            sys.exit("%s is pinned to %s; --keep-pin cannot move it to %s" % (key, fmt_pin(old_pin), fleet))
+        new_pin = old_pin
+    else:
+        new_pin = [fleet]
+    dst = FLEET_SERVER[fleet]
+    # Pinned to exactly this fleet: marker forces the fleet on the private server.
+    # --keep-pin with a wider pin: lands on whichever allowed fleet of dst is free.
+    mk = marker_for(new_pin, dst)
+    if j["info"]["task_stats"]["running"] and not running:
+        sys.exit("%s has running tasks; add --running to stop them and resume on %s from their checkpoints" % (key, fleet))
+    if new_pin is not None:
+        pins[key] = new_pin
+        save_pins(pins)
+    new = move_job(s, jid, j, dst, mk, "manual move to %s" % fleet, allow_running=running)
+    if new is not None:
+        print("%s -> %s%d  (pin: %s)" % (key, dst, new, fmt_pin(new_pin)))
+
+
+def cmd_pin(args):
+    if len(args) < 2:
+        sys.exit("usage: hqx pin <id> <fleet[,fleet]|any> [--running]")
+    key, pin = args[0], parse_fleets(args[1])
+    running = "--running" in args
+    s, jid, j = get_job(key)
+    pins = load_pins()
+    if pin is None:
+        pins.pop(key, None)
+    else:
+        pins[key] = pin
+    save_pins(pins)
+    # Does the job need a different server or marker to honour the new pin?
+    want_srv = s if (pin is None or any(f in SERVERS[s]["fleets"] for f in pin)) else FLEET_SERVER[pin[0]]
+    want_mk = marker_for(pin, want_srv)
+    if want_srv == s and want_mk == job_marker(j):
+        print("%s pin: %s (no resubmit needed)" % (key, fmt_pin(pin)))
+        return
+    if j["info"]["task_stats"]["running"] and not running:
+        print("%s pin recorded as %s; its running tasks keep their placement. "
+              "Add --running to restart them under the new pin now." % (key, fmt_pin(pin)))
+        return
+    new = move_job(s, jid, j, want_srv, want_mk, "repin to %s" % fmt_pin(pin), allow_running=running)
+    if new is not None:
+        print("%s -> %s%d  (pin: %s)" % (key, want_srv, new, fmt_pin(pin)))
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    verb, args = sys.argv[1], sys.argv[2:]
+    {"list": cmd_list, "ls": cmd_list, "submit": cmd_submit, "move": cmd_move,
+     "pin": cmd_pin, "router": router_cmd}.get(verb, lambda a: sys.exit("unknown verb %s" % verb))(args)
+
+
+if __name__ == "__main__":
+    main()
