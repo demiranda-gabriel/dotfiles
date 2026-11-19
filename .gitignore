@@ -8,3 +8,7 @@ rclone/rclone.conf
 
 # Bootstrap-generated state if anyone ever stages it accidentally
 .bootstrap.log
+
+# Python bytecode
+__pycache__/
+*.pyc
