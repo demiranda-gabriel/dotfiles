@@ -1,90 +1,43 @@
 #!/usr/bin/env bash
-# lf previewer — text via bat/cat, images + first-page PDF via kitten icat.
+# lf previewer — text via bat/cat, images via kitten icat, pdf first-page render
 # Args: $1=file, $2=width, $3=height, $4=x, $5=y
-#
-# Two things have to be true for an image to appear here.
-#
-# 1. Transfer mode. `stream` is the only mode that works when the terminal is
-#    on another machine (kitty's own docs: "if you use the file or memory
-#    transfer modes and you are connecting over a remote session then image
-#    display will not work"). This stack runs over SSH, so stream is the
-#    default; set ICAT_TRANSFER_MODE=memory on a host where kitty is local.
-#
-# 2. `tee /dev/tty`. lf does not pass the previewer's output through verbatim:
-#    it parses it for colouring and drops APC and DCS sequences, which is
-#    exactly where kitty's image data lives. Inside tmux, icat sends the pixels
-#    as an APC (wrapped in a tmux DCS) and then writes Unicode placeholder
-#    cells that tell kitty where to paint them. lf keeps the placeholders and
-#    the 24-bit foreground colour that names the image, but eats the pixels, so
-#    the terminal is asked to draw an image it was never given.
-#
-#    So the output goes to both sinks. The tty copy carries the pixels straight
-#    to kitty, bypassing lf's filter; the stdout copy becomes the pane's text,
-#    so lf redraws the placeholders itself and the image survives every repaint.
-#    Outside tmux the same call works for the other reason: the tty copy places
-#    the image directly, and kitty keeps images on their own layer, so lf
-#    drawing text over those cells does not erase it.
 
 set -u
 f="$1"; w="$2"; h="$3"; x="$4"; y="$5"
 
 KITTEN="${KITTEN:-$HOME/.local/share/kitty-ssh-kitten/kitty/bin/kitten}"
-TMODE="${ICAT_TRANSFER_MODE:-stream}"
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/lf-preview"
-
-# Pin the image id to 24 bits. Left to itself icat picks a random 32-bit id,
-# and a placeholder cell can only name 24 of them (the foreground colour); the
-# most significant byte would have to travel as an underline colour, which icat
-# does not emit. Anything above 2^24 therefore leaves the pane referring to an
-# id the terminal does not have. lf exports $id, so one image slot per lf
-# instance is enough — only one preview is on screen at a time, and reusing the
-# slot keeps the terminal from accumulating an image per file visited.
-img_id=$(( (${id:-4242} % 16000000) + 1 ))
-
-# Degrade to stdout alone if there is no controlling terminal, rather than
-# failing the whole pipeline.
-TTY=/dev/tty
-[[ -w "$TTY" ]] || TTY=/dev/null
-
-icat() {
-    "$KITTEN" icat --silent --stdin=no --transfer-mode="$TMODE" \
-        --image-id="$img_id" \
-        --place="${w}x${h}@${x}x${y}" -- "$1" </dev/null | tee "$TTY"
-}
-
-# Dispatch on extension first: `file` costs a fork on every cursor move, and
-# the previewer runs on every cursor move.
-case "${f,,}" in
-    *.png|*.jpg|*.jpeg|*.gif|*.webp|*.tif|*.tiff|*.bmp|*.ico|*.avif)
-        icat "$f"
-        exit 1 ;;   # exit 1 = lf will not cache the preview (re-renders on move)
-    *.pdf)
-        # Render once, reuse. Key on path + mtime + size so an edited file
-        # (marp watcher, md-view rebuild) re-renders.
-        mkdir -p "$CACHE"
-        key=$(printf '%s' "$f" | sha1sum | cut -c1-16)
-        stamp=$(stat -c '%Y-%s' -- "$f" 2>/dev/null || echo 0)
-        png="$CACHE/$key-$stamp.jpg"
-        if [[ ! -s "$png" ]]; then
-            rm -f "$CACHE/$key-"*.jpg 2>/dev/null
-            pdftoppm -jpeg -r 100 -singlefile -- "$f" "${png%.jpg}" 2>/dev/null
-        fi
-        [[ -s "$png" ]] && icat "$png"
-        exit 1 ;;
-esac
 
 mime="$(file --mime-type -Lb -- "$f" 2>/dev/null || echo unknown)"
 
+# kitty always sets KITTY_WINDOW_ID; VS Code's xterm.js speaks the iTerm2
+# inline-image protocol instead of kitty's, so hand those terminals to
+# iip-view (which explains the split in full).
+iip=0
+if [ -z "${KITTY_WINDOW_ID:-}" ] && [ "${TERM_PROGRAM:-}" = vscode ]; then
+    iip=1
+fi
+
 case "$mime" in
     image/*)
-        icat "$f"
-        exit 1
+        if [ "$iip" = 1 ]; then
+            iip-view --place="${w}x${h}@${x}x${y}" -- "$f"
+        else
+            "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
+                --place="${w}x${h}@${x}x${y}" -- "$f" </dev/null
+        fi
+        exit 1   # exit code 1 = lf will not cache preview (re-renders on move)
         ;;
     application/pdf)
         tmp="$(mktemp -t lfprev-XXXXXX.jpg)"
         trap 'rm -f "$tmp"' EXIT
-        pdftoppm -jpeg -r 100 -singlefile -- "$f" "${tmp%.jpg}" 2>/dev/null \
-          && icat "$tmp"
+        if pdftoppm -jpeg -r 100 -singlefile -- "$f" "${tmp%.jpg}" 2>/dev/null; then
+            if [ "$iip" = 1 ]; then
+                iip-view --place="${w}x${h}@${x}x${y}" -- "$tmp"
+            else
+                "$KITTEN" icat --silent --stdin=no --transfer-mode=memory \
+                    --place="${w}x${h}@${x}x${y}" -- "$tmp" </dev/null
+            fi
+        fi
         exit 1
         ;;
     text/*|application/json|application/xml|application/javascript)

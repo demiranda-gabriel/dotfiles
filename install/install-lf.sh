@@ -2,13 +2,19 @@
 # Install lf (terminal file manager). Single Go binary.
 set -euo pipefail
 
-VERSION="r41"
+VERSION="r42"
 LOCAL_BIN="$HOME/.local/bin"
 SOFTWARE="$HOME/software/lf"
 
-if command -v lf >/dev/null 2>&1 && [[ -e "$LOCAL_BIN/lf" ]]; then
-    echo "✓ lf already installed: $(command -v lf)"
-    exit 0
+# Version-aware guard: re-running after a VERSION bump upgrades in place.
+# A bare "is it installed?" test would pin the host to whatever it first got.
+if [[ -x "$LOCAL_BIN/lf" ]]; then
+    have="$("$LOCAL_BIN/lf" -version 2>/dev/null)"
+    if [[ "$have" == "$VERSION" ]]; then
+        echo "✓ lf $VERSION already installed: $LOCAL_BIN/lf"
+        exit 0
+    fi
+    echo "→ upgrading lf ${have:-unknown} → $VERSION"
 fi
 
 arch="$(uname -m)"

@@ -1,128 +1,206 @@
--- ~/.config/nvim/init.lua  (tracked in ~/dotfiles/config/nvim, symlinked by bootstrap.sh)
--- Minimal kickstart for nvim 0.12+ (vim.pack)
+-- Neovim config (dotfiles/config/nvim/init.lua), aimed at Python work.
+--
+-- Plugins come from nvim 0.12's built-in manager (vim.pack); the pinned
+-- revisions live in nvim-pack-lock.json beside this file. First start clones
+-- them into ~/.local/share/nvim/site/pack/core/opt. :lua vim.pack.update()
+-- upgrades them.
+--
+-- External tools, installed by install/install-nvim-python.sh:
+--   basedpyright  language server: definition, references, hover, types
+--   ruff          lint + format, also served over LSP
+--   tree-sitter   parser compiler for nvim-treesitter (gcc shim on old glibc)
+--   rg, fzf       fuzzy finder backends for fzf-lua
+--   latex2text    render-markdown's LaTeX-to-unicode converter
 
-vim.g.mapleader = " "
-vim.g.maplocalleader = " "
+-- A dead $XDG_RUNTIME_DIR (logind deletes /run/user/$UID on ALCF login nodes;
+-- see shell/05-xdg-runtime.sh) breaks serverstart(), which fzf-lua needs.
+-- Repair it here too, for nvim started from an older shell or lf session.
+do
+  local rt = vim.env.XDG_RUNTIME_DIR
+  if not rt or not vim.uv.fs_stat(rt) then
+    local fallback = '/tmp/xdg-' .. vim.uv.getuid()
+    vim.fn.mkdir(fallback, 'p', tonumber('700', 8))
+    vim.env.XDG_RUNTIME_DIR = fallback
+  end
+end
 
--- Plugins (nvim 0.12+ native package manager)
-vim.pack.add({
-  { src = "https://github.com/projekt0n/github-nvim-theme", name = "github-nvim-theme" },
-  { src = "https://github.com/MeanderingProgrammer/render-markdown.nvim", name = "render-markdown.nvim" },
-})
+vim.g.mapleader = ' '
+vim.g.maplocalleader = ' '
 
-require("github-theme").setup({})
-vim.cmd.colorscheme("github_dark_dimmed")
-
--- In-buffer markdown rendering. Uses the markdown / markdown_inline treesitter
--- parsers bundled with nvim 0.12; no nvim-treesitter needed.
--- Toggle per buffer with :RenderMarkdown toggle (mapped to <leader>m below).
-require("render-markdown").setup({
-  completions = { lsp = { enabled = true } },
-  -- Optional parsers nvim does not bundle; off so :checkhealth stays clean.
-  html = { enabled = false },
-  -- LaTeX: converted to unicode by pylatexenc. Single-line formulas render
-  -- in place (position = 'center'); multi-line blocks render as virtual
-  -- lines above. Needs the latex treesitter parser, which nvim does not
-  -- bundle. Both the parser and the converter come from
-  -- ~/dotfiles/install/install-nvim.sh: the converter lives in a pinned venv
-  -- (~/.local/share/nvim-latex/venv), symlinked to ~/.local/bin/latex2text so
-  -- no project env can shadow it.
-  latex = { enabled = true },
-  yaml = { enabled = false },
-  -- Nerd Font glyphs are the upstream default. If headings, bullets or
-  -- checkboxes show up as empty boxes, the terminal font lacks them: swap the
-  -- two blocks below for the ASCII fallback.
-  -- heading = { icons = { "# ", "## ", "### ", "#### ", "##### ", "###### " } },
-  -- bullet  = { icons = { "-", "*", "+" } },
-  -- checkbox = { unchecked = { icon = "[ ]" }, checked = { icon = "[x]" } },
-})
-
+-- ---------------------------------------------------------------- options --
 local o = vim.opt
 o.number = true
 o.relativenumber = true
-o.signcolumn = "yes"
+o.signcolumn = 'yes'
+o.cursorline = true
+o.termguicolors = true
+o.mouse = 'a'
 o.expandtab = true
 o.shiftwidth = 4
 o.tabstop = 4
+o.softtabstop = 4
 o.smartindent = true
-o.wrap = false
-o.scrolloff = 8
-o.sidescrolloff = 8
 o.ignorecase = true
 o.smartcase = true
-o.termguicolors = true
 o.undofile = true
-o.updatetime = 250
-o.timeoutlen = 400
-o.splitbelow = true
 o.splitright = true
-o.mouse = "a"
-o.clipboard = "unnamedplus"
+o.splitbelow = true
+o.scrolloff = 8
+o.updatetime = 250
+o.list = true
+o.listchars = { tab = '» ', trail = '·', nbsp = '␣' }
 
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = { "sh", "bash" },
-  callback = function()
-    vim.bo.shiftwidth = 2
-    vim.bo.tabstop = 2
+-- ---------------------------------------------------------------- plugins --
+vim.pack.add({
+  { src = 'https://github.com/nvim-treesitter/nvim-treesitter', version = 'main' },
+  'https://github.com/neovim/nvim-lspconfig',
+  { src = 'https://github.com/saghen/blink.cmp', version = vim.version.range('1.*') },
+  'https://github.com/ibhagwan/fzf-lua',
+  'https://github.com/projekt0n/github-nvim-theme',
+  'https://github.com/MeanderingProgrammer/render-markdown.nvim',
+}, { confirm = false }) -- the list above is the approval; no install prompt
+
+require('github-theme').setup({})
+vim.cmd.colorscheme('github_dark_dimmed')
+
+-- -------------------------------------------------------------- treesitter --
+-- Parsers compile once, asynchronously, on first start (a few seconds each).
+local ts_langs = {
+  'python', 'lua', 'bash', 'json', 'yaml', 'toml', 'markdown',
+  'markdown_inline', 'vim', 'vimdoc', 'query', 'regex', 'rst',
+  'latex', -- needs `tree-sitter generate`; see install/tree-sitter-shim
+}
+require('nvim-treesitter').install(ts_langs)
+
+vim.api.nvim_create_autocmd('FileType', {
+  group = vim.api.nvim_create_augroup('user_treesitter', { clear = true }),
+  callback = function(args)
+    local lang = vim.treesitter.language.get_lang(vim.bo[args.buf].filetype)
+    if not lang or not pcall(vim.treesitter.start, args.buf, lang) then
+      return -- no parser (yet): legacy syntax highlighting stays on
+    end
+    vim.wo.foldmethod = 'expr'
+    vim.wo.foldexpr = 'v:lua.vim.treesitter.foldexpr()'
+    vim.wo.foldlevel = 99
+    vim.bo[args.buf].indentexpr = "v:lua.require'nvim-treesitter'.indentexpr()"
   end,
 })
 
-local map = vim.keymap.set
-map("n", "<leader>w", "<cmd>w<cr>", { desc = "Save" })
-map("n", "<leader>q", "<cmd>q<cr>", { desc = "Quit" })
-map("n", "<leader>e", "<cmd>Explore<cr>", { desc = "File explorer" })
-map("n", "<leader>m", "<cmd>RenderMarkdown toggle<cr>", { desc = "Toggle markdown rendering" })
-map("n", "<esc>", "<cmd>nohlsearch<cr>")
+-- --------------------------------------------------------------------- lsp --
+-- Nearest .venv above the file wins, so a subpackage with its own
+-- pyproject.toml (e.g. software/nequiph/) still resolves imports through the
+-- repository-level uv environment. $VIRTUAL_ENV overrides.
+local function find_python(start)
+  if vim.env.VIRTUAL_ENV then
+    return vim.env.VIRTUAL_ENV .. '/bin/python'
+  end
+  local venv = vim.fs.find('.venv', { upward = true, path = start, type = 'directory' })[1]
+  if venv and vim.uv.fs_stat(venv .. '/bin/python') then
+    return venv .. '/bin/python'
+  end
+end
 
--- Ctrl-j / Ctrl-k move the cursor 10 lines at a time. scrolloff = 8 keeps the
--- cursor off the edge, so the view follows. Swap "10j"/"10k" for "10<C-e>"/"10<C-y>"
--- to scroll the window and leave the cursor where it is.
-map({ "n", "x" }, "<C-j>", "10j", { desc = "Down 10 lines" })
-map({ "n", "x" }, "<C-k>", "10k", { desc = "Up 10 lines" })
-map("n", "<leader>ff", ":find **/", { desc = "Find file" })
-map("n", "<leader>fg", ":vimgrep //j **/*<left><left><left><left><left><left><left>", { desc = "Grep" })
-map("n", "<leader>f", function() vim.lsp.buf.format({ async = false }) end, { desc = "Format buffer" })
-
-vim.lsp.enable({ "pylsp", "ruff", "bashls" })
-
-vim.api.nvim_create_autocmd("LspAttach", {
-  callback = function(ev)
-    local b = { buffer = ev.buf }
-    map("n", "gd", vim.lsp.buf.definition, b)
-    map("n", "gD", vim.lsp.buf.declaration, b)
-    map("n", "gr", vim.lsp.buf.references, b)
-    map("n", "gi", vim.lsp.buf.implementation, b)
-    map("n", "K", vim.lsp.buf.hover, b)
-    map("n", "<leader>rn", vim.lsp.buf.rename, b)
-    map("n", "<leader>ca", vim.lsp.buf.code_action, b)
-    map("n", "[d", function() vim.diagnostic.jump({ count = -1 }) end, b)
-    map("n", "]d", function() vim.diagnostic.jump({ count = 1 }) end, b)
-
-    local client = vim.lsp.get_client_by_id(ev.data.client_id)
-    if client and client:supports_method("textDocument/completion") then
-      vim.lsp.completion.enable(true, client.id, ev.buf, { autotrigger = true })
+vim.lsp.config('basedpyright', {
+  before_init = function(_, config)
+    local py = find_python(config.root_dir or vim.fn.getcwd())
+    if py then
+      -- Mutate in place: the client already holds a reference to this table
+      -- and answers workspace/configuration from it; a new table is ignored.
+      config.settings = config.settings or {}
+      config.settings.python = config.settings.python or {}
+      config.settings.python.pythonPath = py
     end
   end,
+  settings = {
+    basedpyright = {
+      analysis = {
+        typeCheckingMode = 'standard', -- basedpyright's default 'recommended' is very noisy
+        diagnosticMode = 'openFilesOnly',
+        autoImportCompletions = true,
+      },
+    },
+  },
 })
 
-vim.api.nvim_create_autocmd("BufWritePre", {
-  pattern = { "*.py" },
-  callback = function() vim.lsp.buf.format({ async = false, name = "ruff" }) end,
-})
-
-vim.api.nvim_create_autocmd("BufWritePost", {
-  pattern = { "*.sh", "*.bash" },
-  callback = function()
-    local file = vim.fn.expand("%:p")
-    vim.fn.system({ "shfmt", "-i", "2", "-ci", "-w", file })
-    vim.cmd("edit!")
+vim.lsp.config('ruff', {
+  on_attach = function(client)
+    client.server_capabilities.hoverProvider = false -- basedpyright's hover is richer
   end,
 })
 
+vim.lsp.enable({ 'basedpyright', 'ruff' })
+
 vim.diagnostic.config({
-  virtual_text = true,
-  signs = true,
-  underline = true,
-  update_in_insert = false,
+  virtual_text = { spacing = 2, source = 'if_many' },
   severity_sort = true,
+  float = { border = 'rounded', source = true },
+})
+
+-- nvim 0.12 already maps: K hover, grn rename, gra code action, grr references,
+-- gri implementation, grt type definition, gO document symbols, <C-s>
+-- signature help, [d / ]d diagnostics. Added here:
+vim.api.nvim_create_autocmd('LspAttach', {
+  group = vim.api.nvim_create_augroup('user_lsp', { clear = true }),
+  callback = function(args)
+    local map = function(lhs, rhs, desc)
+      vim.keymap.set('n', lhs, rhs, { buffer = args.buf, desc = desc })
+    end
+    map('gd', vim.lsp.buf.definition, 'Go to definition')
+    map('gD', vim.lsp.buf.declaration, 'Go to declaration')
+    map('<leader>e', vim.diagnostic.open_float, 'Line diagnostics')
+    map('<leader>cf', function() vim.lsp.buf.format({ name = 'ruff' }) end, 'Format with ruff')
+    map('<leader>co', function()
+      vim.lsp.buf.code_action({ context = { only = { 'source.organizeImports' } }, apply = true })
+    end, 'Organize imports')
+  end,
+})
+
+-- ------------------------------------------------------------- completion --
+require('blink.cmp').setup({
+  keymap = { preset = 'default' },  -- <C-space> open, <C-y> accept, <C-n>/<C-p> move
+  completion = { documentation = { auto_show = true } },
+  signature = { enabled = true },
+  sources = { default = { 'lsp', 'path', 'buffer' } },
+  -- Pure-Lua matcher: skips the prebuilt Rust library, whose glibc floor
+  -- would break on older clusters (the same reason tree-sitter needs a shim).
+  fuzzy = { implementation = 'lua' },
+})
+
+-- -------------------------------------------------------- markdown view --
+-- In-buffer markdown rendering, ported from the FASRC setup (main, ad5f0da).
+-- Headings, tables, code blocks and checkboxes render in place; the raw text
+-- comes back on the cursor line. Equations: markdown_inline injects `latex`
+-- into every $...$ block, and render-markdown converts that tree to unicode
+-- with latex2text (install-nvim-python.sh). Single-line formulas render in
+-- place, multi-line blocks as virtual lines above. <leader>m toggles.
+require('render-markdown').setup({
+  completions = { lsp = { enabled = true } },
+  html = { enabled = false }, -- optional parsers nvim lacks; keeps :checkhealth clean
+  latex = { enabled = true },
+  yaml = { enabled = false },
+  -- Nerd Font glyphs are the default. If headings, bullets or checkboxes show
+  -- as empty boxes, the terminal font lacks them: use the ASCII fallback.
+  -- heading = { icons = { '# ', '## ', '### ', '#### ', '##### ', '###### ' } },
+  -- bullet  = { icons = { '-', '*', '+' } },
+  -- checkbox = { unchecked = { icon = '[ ]' }, checked = { icon = '[x]' } },
+})
+vim.keymap.set('n', '<leader>m', '<cmd>RenderMarkdown toggle<cr>', { desc = 'Toggle markdown rendering' })
+
+-- ---------------------------------------------------------------- fuzzy ----
+local fzf = require('fzf-lua')
+fzf.setup({})
+vim.keymap.set('n', '<leader>ff', fzf.files, { desc = 'Find files' })
+vim.keymap.set('n', '<leader>fg', fzf.live_grep, { desc = 'Live grep' })
+vim.keymap.set('n', '<leader>fw', fzf.grep_cword, { desc = 'Grep word under cursor' })
+vim.keymap.set('n', '<leader>fb', fzf.buffers, { desc = 'Buffers' })
+vim.keymap.set('n', '<leader>fs', fzf.lsp_document_symbols, { desc = 'Document symbols' })
+vim.keymap.set('n', '<leader>fS', fzf.lsp_live_workspace_symbols, { desc = 'Workspace symbols' })
+vim.keymap.set('n', '<leader>fr', fzf.lsp_references, { desc = 'References' })
+vim.keymap.set('n', '<leader>fd', fzf.diagnostics_document, { desc = 'Diagnostics' })
+vim.keymap.set('n', '<leader>fh', fzf.helptags, { desc = 'Help tags' })
+
+-- ------------------------------------------------------------------ misc ---
+vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
+vim.api.nvim_create_autocmd('TextYankPost', {
+  callback = function() vim.hl.on_yank() end,
 })

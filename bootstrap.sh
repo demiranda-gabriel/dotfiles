@@ -23,8 +23,8 @@ for arg in "$@"; do
         -h|--help)
             cat <<EOF
 Usage: bootstrap.sh [--viewers]
-  --viewers   Also fetch the tool stack (lf, tmux, nvim + markdown rendering,
-              tectonic, pandoc, the PDF
+  --viewers   Also fetch the tool stack (lf, tmux, nvim + Python/markdown
+              tooling, typst, tectonic, pandoc, the PDF
               viewers (doc-view venv + termpdf), gh,
               and the VS Code CLI for login-node tunnels) into ~/.local/bin
               (10s of MB downloaded — only run on a host where you want them)
@@ -177,7 +177,7 @@ if [[ -d /n/netscratch ]]; then
     fi
 fi
 
-# 3d. Optional install stack (lf, tmux, nvim, tectonic, pandoc, pdf viewers)
+# 3d. Optional install stack (lf, tmux, nvim + Python/markdown tooling, typst, tectonic, pandoc, pdf viewers)
 if (( INSTALL_VIEWERS )); then
     echo
     echo "=== Installing tool stack ==="
@@ -191,7 +191,7 @@ fi
 # 4. Toolchain probe
 echo
 echo "=== Toolchain ==="
-for tool in rclone pigz tar tmux lf nvim latex2text tectonic pandoc doc-view termpdf pdftoppm code gh; do
+for tool in rclone pigz tar tmux lf nvim tree-sitter rg basedpyright ruff latex2text typst tectonic pandoc doc-view termpdf pdftoppm code gh; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo "✓ $tool: $(command -v "$tool")"
     else
