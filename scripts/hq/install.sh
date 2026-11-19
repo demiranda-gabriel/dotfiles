@@ -130,6 +130,7 @@ mkdir -p "$HQDIR/shim"
 
 link_script "$DIR/hq-server-up" hq-server-up
 link_script "$DIR/hq-fleet"     hq-fleet
+link_script "$DIR/hq-gpus"      hq-gpus
 
 # Build the login-node get_nprocs shim
 cp -f "$DIR/shim/nproc8.c" "$HQDIR/shim/nproc8.c"
@@ -185,5 +186,5 @@ cat <<EOF
          -A $HQ_ACCOUNT -q $HQ_BRIDGE_QUEUE -l filesystems=$HQ_FILESYSTEMS -l place=scatter
   6. Start the standing fleet:
        HQ_SERVER_HOST=\$(hostname -s) HQ_FLEET_LABEL=$HQ_SYSTEM hq-fleet up
-       hq-fleet status
+       hq-fleet status ; hq-gpus
 EOF

@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""hq-gpus (PBS) — what every GPU in the HyperQueue fleet is doing right now.
+
+PBS/ALCF counterpart of slurm/hq-gpus. One PBS job usually spans several nodes
+and starts one HQ worker per node, so the output has two tables:
+
+  * ALLOCATIONS — one row per PBS job that has (or will have) HQ workers:
+    queue, nodes, workers attached, GPUs busy/total, walltime left.
+  * WORKERS     — one row per attached worker: node, GPUs busy/total, and
+    which HQ job(s) hold them.
+
+Topology: the HQ server runs on the login node, so `hq` is called directly and
+`qstat -f -F json` is read locally. GPU resources are whatever the workers
+advertise under `gpus/*` (`gpus/nvidia` on Polaris, `gpus/intel` on Aurora via
+HQ_WORKER_RESOURCES in fleet.env).
+
+Runs on the system python3 (3.6 on ALCF login nodes) — keep it 3.6-clean
+(no capture_output/text=, no datetime.fromisoformat, no `from __future__
+import annotations`).
+
+Usage:
+  hq-gpus                 one snapshot
+  hq-gpus -w [SECONDS]    refresh every SECONDS (default 15) until Ctrl-C
+  hq-gpus --json          the joined model, for scripting
+  hq-gpus --color {auto,always,never}   busy GPUs yellow, idle green (default auto)
+
+Env:
+  HQ_GPUS_JOBPREFIX   PBS job-name prefix counted as HQ allocations when no
+                      worker is attached yet (default "hq-": hq-capacity,
+                      hq-bridge, hq-<exp>-workers, autoalloc jobs).
+"""
+import argparse
+import calendar
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+UNIT = 10000  # HQ stores resource amounts as fixed point: 1 unit == 10000
+JOBPREFIX = os.environ.get("HQ_GPUS_JOBPREFIX", "hq-")
+
+
+def run(cmd, timeout=60):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True, timeout=timeout)
+
+
+def hq_json(*args):
+    p = run(["hq", "--output-mode=json"] + list(args))
+    if p.returncode != 0:
+        raise RuntimeError("hq {}: {}".format(" ".join(args), (p.stderr or p.stdout).strip()))
+    return json.loads(p.stdout or "null")
+
+
+# --- time helpers ------------------------------------------------------------
+_ISO = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)")
+
+
+def iso_epoch(iso):
+    """Epoch seconds of an HQ UTC timestamp (nanosecond fraction dropped)."""
+    m = _ISO.match(iso or "")
+    return calendar.timegm(tuple(int(g) for g in m.groups())) if m else None
+
+
+def fmt_dur(s):
+    if s is None:
+        return "?"
+    s = max(int(s), 0)
+    if s < 60:
+        return "{}s".format(s)
+    if s < 3600:
+        return "{}m".format(s // 60)
+    if s < 86400:
+        return "{}h{:02d}m".format(s // 3600, (s % 3600) // 60)
+    return "{}d{:02d}h".format(s // 86400, (s % 86400) // 3600)
+
+
+def age(iso):
+    t = iso_epoch(iso)
+    return fmt_dur(time.time() - t) if t is not None else ""
+
+
+def hms(s):
+    """PBS walltime 'HH:MM:SS' (hours may exceed 24) -> seconds."""
+    try:
+        parts = [int(x) for x in (s or "").split(":")]
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    sec = 0
+    for p in parts:
+        sec = sec * 60 + p
+    return sec
+
+
+def left_str(s):
+    if s is None:
+        return "?"
+    s = max(int(s), 0)
+    return "{}:{:02d}:{:02d}".format(s // 3600, (s % 3600) // 60, s % 60)
+
+
+# --- PBS ---------------------------------------------------------------------
+def qstat_jobs():
+    """This user's PBS jobs, keyed by full job id."""
+    # `qstat -f -u` silently drops -f on PBS Pro, so list ids with qselect first
+    ids = run(["qselect", "-u", os.environ.get("USER", "")]).stdout.split()
+    if not ids:
+        return {}
+    p = run(["qstat", "-f", "-F", "json"] + ids)
+    try:
+        jobs = json.loads(p.stdout).get("Jobs", {}) or {}
+    except ValueError:
+        return {}
+    out = {}
+    for jid, j in jobs.items():
+        rl = j.get("Resource_List", {})
+        wall = hms(rl.get("walltime"))
+        used = hms(j.get("resources_used", {}).get("walltime"))
+        state = j.get("job_state", "?")
+        left = (wall - used) if (state == "R" and wall is not None and used is not None) else wall
+        out[jid] = dict(jobid=jid, short=jid.split(".")[0], name=j.get("Job_Name", "?"),
+                        queue=j.get("queue", "?"), state=state,
+                        nodes=int(rl.get("nodect", 0) or 0), left=left)
+    return out
+
+
+# --- HQ resources ------------------------------------------------------------
+def gpu_resource_names(res_list):
+    return [r.get("name") for r in res_list if r.get("name", "").startswith("gpus/")]
+
+
+def res_amount(res_list, name):
+    """Units a worker provides for resource `name` (0 if absent)."""
+    for r in res_list:
+        if r.get("name") != name:
+            continue
+        k = r.get("kind")
+        if k == "range":
+            return r.get("end", -1) - r.get("start", 0) + 1
+        if k == "list":
+            return len(r.get("values", []))
+        if k == "sum":
+            return r.get("size", 0) // UNIT
+        if k == "groups":
+            return sum(len(g) for g in r.get("groups", []))
+    return 0
+
+
+def req_gpus(entry):
+    """{gpu resource name: amount per task} from a job's first submit spec.
+    None for an `All` request (the task takes the whole worker's supply)."""
+    out = {}
+    for variant in entry.get("submits", [{}])[0].get("array", {}).get("resources", [])[:1]:
+        for r in variant.get("resources", []):
+            name = r.get("resource", "")
+            if not name.startswith("gpus/"):
+                continue
+            req = r.get("request")
+            amt = None
+            if isinstance(req, dict):
+                for v in req.values():
+                    if isinstance(v, (int, float)):
+                        amt = int(v) // UNIT
+            out[name] = amt
+    return out
+
+
+# --- model -------------------------------------------------------------------
+def build():
+    try:
+        srv = hq_json("server", "info")
+    except RuntimeError as exc:
+        raise RuntimeError("{}\nStart the server:  hq-server-up".format(exc))
+    workers = hq_json("worker", "list") or []
+    jobs = hq_json("job", "list") or []          # open/unfinished jobs only
+    ids = ",".join(str(j["id"]) for j in jobs)
+    infos = hq_json("job", "info", ids) if ids else []
+    pbs = qstat_jobs()
+
+    jobname = {j["id"]: j["name"] for j in jobs}
+    jobreq = {e["info"]["id"]: req_gpus(e) for e in infos}
+    waiting = sum(j.get("task_stats", {}).get("waiting", 0) for j in jobs)
+
+    running = {}  # worker id -> [task]
+    for e in infos:
+        jid = e["info"]["id"]
+        for t in e.get("tasks", []):
+            if t.get("state") == "running" and t.get("worker") is not None:
+                running.setdefault(t["worker"], []).append(
+                    dict(job=jid, name=jobname.get(jid, "?"), task=t.get("id", 0),
+                         since=t.get("started_at", "")))
+
+    rows = []
+    for w in workers:
+        if w.get("ended"):
+            continue
+        cfg = w.get("configuration", {})
+        res = cfg.get("resources", {}).get("resources", [])
+        gnames = gpu_resource_names(res)
+        gpus = sum(res_amount(res, n) for n in gnames)
+        tasks = running.get(w["id"], [])
+        used = 0
+        for t in tasks:
+            req = jobreq.get(t["job"], {})
+            for n in gnames:
+                if n in req:
+                    used += res_amount(res, n) if req[n] is None else req[n]
+        alloc = str((w.get("allocation") or {}).get("id") or cfg.get("group") or "")
+        rows.append(dict(worker=w["id"], alloc=alloc, alloc_short=alloc.split(".")[0] or "-",
+                         node=cfg.get("hostname", "").split(".")[0], gpu_res=gnames,
+                         gpus=gpus, used=min(used, gpus), up=age(w.get("started", "")),
+                         tasks=tasks))
+    rows.sort(key=lambda r: (r["alloc"], r["worker"]))
+
+    # allocations: every PBS job with attached workers, plus own hq-* jobs
+    allocs = {}
+    for jid, j in pbs.items():
+        if j["name"].startswith(JOBPREFIX):
+            allocs[jid] = dict(j, workers=0, gpus=0, used=0)
+    for r in rows:
+        a = allocs.get(r["alloc"])
+        if a is None:
+            j = pbs.get(r["alloc"], dict(jobid=r["alloc"], short=r["alloc_short"], name="?",
+                                         queue="?", state="?", nodes=0, left=None))
+            a = allocs[r["alloc"]] = dict(j, workers=0, gpus=0, used=0)
+        a["workers"] += 1
+        a["gpus"] += r["gpus"]
+        a["used"] += r["used"]
+    alloc_list = sorted(allocs.values(), key=lambda a: (a["state"] != "R", a["short"]))
+
+    return dict(server=dict(host=srv.get("client_host", "?"), up=age(srv.get("start_date", "")),
+                            version=srv.get("version", "")),
+                allocations=alloc_list, workers=rows, waiting_tasks=waiting)
+
+
+# --- rendering ---------------------------------------------------------------
+# Busy GPUs yellow, idle GPUs green. Plain ANSI 33/32 (not 256/truecolor), so it
+# renders under tmux's screen-256color and anything older. Off when stdout is not
+# a tty, when NO_COLOR is set, or with --color never.
+COLOR = False
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def paint(code, text):
+    return "\033[{}m{}\033[0m".format(code, text) if (COLOR and text) else text
+
+
+def busy(text):
+    return paint("33", text)
+
+
+def idle(text):
+    return paint("32", text)
+
+
+def vlen(text):
+    return len(_ANSI.sub("", text))
+
+
+def gpu_cells(used, total):
+    """One block per GPU: yellow = busy, green = idle (■/□ without colour)."""
+    if COLOR:
+        return busy("■" * used) + idle("■" * (total - used))
+    return "■" * used + "□" * (total - used)
+
+
+def gpu_count(used, total):
+    return "{}/{}".format(busy(str(used)) if used else str(used), total)
+
+
+def table(hdr, body):
+    t = [hdr] + body
+    w = [max(vlen(row[i]) for row in t) for i in range(len(hdr))]
+    out = []
+    for i, row in enumerate(t):
+        out.append("  " + "  ".join(c + " " * (w[j] - vlen(c)) for j, c in enumerate(row)).rstrip())
+        if i == 0:
+            out.append("  " + "  ".join("-" * w[j] for j in range(len(hdr))))
+    return out
+
+
+def task_status(tasks, up):
+    if not tasks:
+        return idle("idle (up {})".format(up))
+    by = {}
+    for t in tasks:
+        by.setdefault((t["job"], t["name"]), []).append(t)
+    parts = []
+    for (jid, name), ts in sorted(by.items()):
+        oldest = min((iso_epoch(t["since"]) or time.time()) for t in ts)
+        ids = sorted(t["task"] for t in ts)
+        tid = ".{}".format(ids[0]) if len(ids) == 1 else " ×{}".format(len(ids))
+        parts.append("{} (#{}{}, {})".format(name, jid, tid, fmt_dur(time.time() - oldest)))
+    return busy(", ".join(parts))
+
+
+def render(m):
+    s = m["server"]
+    out = ["HQ fleet — server {} (up {}, {})".format(s["host"], s["up"], s["version"]), ""]
+
+    al = m["allocations"]
+    if al:
+        out.append("  ALLOCATIONS")
+        body = []
+        for a in al:
+            gpu = "{} busy / {} idle".format(busy(str(a["used"])), idle(str(a["gpus"] - a["used"]))) \
+                if a["workers"] else "-"
+            body.append((a["short"], a["name"], a["queue"], a["state"], str(a["nodes"]),
+                         str(a["workers"]), gpu, left_str(a["left"])))
+        out += table(("PBS JOB", "NAME", "QUEUE", "S", "NODES", "WORKERS", "GPU", "LEFT"), body)
+        out.append("")
+
+    rows = m["workers"]
+    if not rows:
+        out.append("  no workers attached")
+    else:
+        out.append("  WORKERS")
+        body = [(str(r["worker"]), r["alloc_short"], r["node"],
+                 gpu_cells(r["used"], r["gpus"]), gpu_count(r["used"], r["gpus"]),
+                 task_status(r["tasks"], r["up"]))
+                for r in rows]
+        out += table(("WORKER", "PBS JOB", "NODE", "GPUS", "", "STATUS"), body)
+
+    tot = sum(r["gpus"] for r in rows)
+    nbusy = sum(r["used"] for r in rows)
+    out.append("")
+    out.append("  {} worker(s) · {} GPU(s) · {} busy / {} idle".format(
+        len(rows), tot, busy(str(nbusy)), idle(str(tot - nbusy))))
+    queued = [a for a in al if a["state"] in ("Q", "H", "W")]
+    if queued:
+        out.append("  queued allocations: {} ({})".format(
+            len(queued), ", ".join("{} {}n {}".format(a["name"], a["nodes"], a["queue"]) for a in queued)))
+    if m["waiting_tasks"]:
+        out.append("  waiting tasks: {}  (no attached worker satisfies them yet)".format(m["waiting_tasks"]))
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="What every GPU in the HyperQueue fleet is doing (PBS).")
+    ap.add_argument("-w", "--watch", nargs="?", const=15, type=int, metavar="SECONDS",
+                    help="refresh every SECONDS (default 15) until Ctrl-C")
+    ap.add_argument("--json", action="store_true", help="emit the joined model as JSON")
+    ap.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                    help="busy GPUs yellow, idle green (auto: only on a tty, honours NO_COLOR)")
+    a = ap.parse_args()
+    global COLOR
+    COLOR = a.color == "always" or (a.color == "auto" and sys.stdout.isatty()
+                                    and "NO_COLOR" not in os.environ
+                                    and os.environ.get("TERM", "dumb") != "dumb")
+
+    while True:
+        try:
+            model = build()
+            text = json.dumps(model, indent=2) if a.json else render(model)
+        except Exception as exc:  # noqa: BLE001 - surface, don't trace
+            if not a.watch:
+                print("hq-gpus: {}".format(exc), file=sys.stderr)
+                return 1
+            text = "hq-gpus: {}".format(exc)
+        if a.watch:
+            print("\033[2J\033[H" + text + "\n\n  refreshed {} — every {}s, Ctrl-C to stop".format(
+                time.strftime("%H:%M:%S"), a.watch), flush=True)
+            try:
+                time.sleep(a.watch)
+            except KeyboardInterrupt:
+                print()
+                return 0
+        else:
+            print(text)
+            return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

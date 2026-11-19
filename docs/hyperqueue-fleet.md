@@ -216,7 +216,18 @@ hq submit --array 1-100 -- ./run.sh                      # 100 tasks, packed ont
 hq job list / hq job info <id> / hq job cat <id> stdout
 hq worker list                                           # what's attached
 hq-fleet status                                          # fleet at a glance
+hq-gpus [-w [SEC]] [--json]                              # what every GPU is doing
 ```
+
+`hq-gpus` (PBS version, `scripts/hq/hq-gpus`) has two tables. **ALLOCATIONS**
+shows one row per PBS job that holds workers (plus any own `hq-*` job still
+queued): queue, state, nodes, workers attached, GPUs busy/total, walltime left.
+**WORKERS** shows one row per node's worker and which HQ job holds its GPUs. It
+counts any `gpus/*` resource, so it reads `gpus/nvidia` on Polaris and
+`gpus/intel` on Aurora. It runs on the bare system `python3` (3.6), calls `hq`
+directly (the server is local), and reads `qselect` + `qstat -f -F json`. A
+snapshot takes ~0.1 s. `HQ_GPUS_JOBPREFIX` (default `hq-`) sets which queued
+PBS jobs count as fleet allocations before any worker attaches.
 
 (On Polaris, a shell wrapper in `shell/41-polaris.sh` routes `hq submit` task
 logs into `<git-root>/runs/_hq_logs/`; that's a convenience, not part of the
@@ -443,11 +454,13 @@ hq-fleet up -p gpu,seas_gpu -g 2 -c 24 -m 192G -t 1-00:00:00 \
 | **PBS / ALCF** | | |
 | `scripts/hq/hq-server-up` | `~/.local/bin/` | start the server, cgroup-pinned + shimmed |
 | `scripts/hq/hq-fleet` | `~/.local/bin/` | the 24/7 orchestrator (tick/run/up/down/status) |
+| `scripts/hq/hq-gpus` | `~/.local/bin/` | per-allocation / per-worker GPU usage view |
 | `scripts/hq/shim/nproc8.c` | `~/.hq/shim/` (compiled to `.so`) | fakes `get_nprocs()=8` |
 | `scripts/hq/*.pbs.tmpl` | `~/.hq/*.pbs` (rendered) | capacity + bridge worker allocations |
 | **SLURM / FASRC** | | |
 | `scripts/hq/slurm/hq-server-up` | `~/.local/bin/` | ensure server in a compute-node CPU alloc |
 | `scripts/hq/slurm/hq-fleet` | `~/.local/bin/` | on-demand allocator (up/status/down) |
+| `scripts/hq/slurm/hq-gpus` | `~/.local/bin/` | per-lane GPU usage view (ssh-bridged) |
 | `scripts/hq/slurm/{server,worker}.sbatch.tmpl` | `~/.hq/*.sbatch` (rendered) | server + worker allocations |
 | `shell/42-fasrc-hq.sh` | sourced by `.bashrc` | the `hq` ssh-bridge wrapper |
 | **shared** | | |
