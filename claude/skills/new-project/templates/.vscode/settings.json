@@ -1,0 +1,30 @@
+{
+    // Keep search / IntelliSense / the file watcher out of the bulk tiers.
+    // `**/runs` because each experiment carries a runs symlink into scratch.
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.egg-info": true,
+        "**/.pytest_cache": true
+    },
+    "search.exclude": {
+        "runs": true,
+        "**/runs": true,
+        "models": true,
+        "data": true,
+        ".venv": true,
+        "**/wandb": true,
+        "**/*.ckpt": true,
+        "**/*.extxyz": true
+    },
+    "files.watcherExclude": {
+        "**/runs/**": true,
+        "**/models/**": true,
+        "**/data/**": true,
+        "**/.venv/**": true,
+        "**/wandb/**": true,
+        "**/.git/objects/**": true
+    },
+    "python.analysis.exclude": ["runs", "**/runs", "data", "models", ".venv"],
+    "search.followSymlinks": false,
+    "workbench.editorAssociations": { "*.md": "default" }
+}

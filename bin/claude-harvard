@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# claude-harvard — run Claude Code under a second account/login.
+#
+# Uses CLAUDE_CONFIG_DIR to point Claude Code at a separate profile dir
+# (default ~/.claude-harvard). Login state (.credentials.json, .claude.json),
+# history, sessions, projects/ (transcripts + auto-memory) and account-synced
+# skills/plugins stay per-profile. The base config is symlinked from the main
+# profile (~/.claude) so edits there apply to both:
+#   CLAUDE.md, settings.json, keybindings.json, agents/, commands/,
+#   output-styles/, hooks/, mathify/, and every skill in ~/.claude/skills/
+#   (except the account-synced `synced/` dir).
+#
+# Links are (re)created on every launch, so new skills show up automatically.
+# First run: `claude-harvard` then `/login` with the Harvard account.
+#
+#   claude-harvard [claude args...]
+#   CLAUDE_HARVARD_DIR=/other/dir claude-harvard     # override profile dir
+
+set -euo pipefail
+
+BASE="$HOME/.claude"
+PROFILE="${CLAUDE_HARVARD_DIR:-$HOME/.claude-harvard}"
+
+SHARED=(CLAUDE.md settings.json keybindings.json agents commands output-styles hooks mathify)
+
+mkdir -p "$PROFILE/skills"
+chmod 700 "$PROFILE"
+
+link() {  # link <src> <dst>: symlink unless dst already exists as a real file
+    local src="$1" dst="$2"
+    [[ -e "$src" || -L "$src" ]] || return 0
+    if [[ -L "$dst" ]]; then
+        [[ "$(readlink "$dst")" == "$src" ]] && return 0
+        ln -sfn "$src" "$dst"
+    elif [[ -e "$dst" ]]; then
+        echo "claude-harvard: $dst is a real file, not linked to $src — leaving it" >&2
+    else
+        ln -s "$src" "$dst"
+    fi
+}
+
+for name in "${SHARED[@]}"; do
+    link "$BASE/$name" "$PROFILE/$name"
+done
+
+for src in "$BASE"/skills/*; do
+    name="$(basename "$src")"
+    [[ "$name" == synced ]] && continue
+    link "$src" "$PROFILE/skills/$name"
+done
+
+# Drop links to skills that were removed from the base profile.
+for dst in "$PROFILE"/skills/*; do
+    [[ -L "$dst" && ! -e "$dst" ]] && rm -f "$dst"
+done
+
+export CLAUDE_CONFIG_DIR="$PROFILE"
+exec claude "$@"

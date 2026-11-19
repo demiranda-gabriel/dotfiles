@@ -113,6 +113,17 @@ These are *not* fetched by the repo — install them yourself:
 - **`tmux` ≥ 3.2** — for `display-popup` (`M-j`) and `display-menu`
   (`prefix + S`). The bundled `install-tmux.sh` ships 3.5a.
 
+## Second Claude Code profile (`claude-harvard`)
+
+`bin/claude-harvard` runs Claude Code with `CLAUDE_CONFIG_DIR=~/.claude-harvard`,
+i.e. a separate login (run `/login` once with the Harvard account). On each
+launch it symlinks the base config from `~/.claude` — `CLAUDE.md`,
+`settings.json`, `keybindings.json`, `agents/`, `commands/`, `output-styles/`,
+`hooks/`, `mathify/` and every skill except the account-synced `skills/synced/`
+— so both profiles share one config. Credentials, `.claude.json`, history,
+sessions and `projects/` (transcripts + auto-memory) stay per-profile.
+Override the profile dir with `CLAUDE_HARVARD_DIR`.
+
 ## Backup workflow
 
 All bulk data lives under

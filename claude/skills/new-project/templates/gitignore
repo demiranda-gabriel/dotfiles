@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Envs / tooling
+.venv
+.DS_Store
+
+# Editor / agent local state
+.claude/
+.vscode/*
+!.vscode/settings.json
+
+# --- Storage tiers (see DATA_MANAGEMENT.md) ---------------------------------
+# Bulk data — gdrive-tracked. `/data/*` not `/data`, so subdirs can be
+# re-included later (git cannot descend into an excluded directory).
+/data/*
+!/data/README.md
+# Models — curated .nequip.zip packages, gdrive-tracked.
+/models/*
+!/models/README.md
+# Literature PDFs — gdrive-tracked (111 MB at creation; too heavy for git).
+/papers/*
+!/papers/README.md
+# Training outputs — local-only, regenerable from experiments/.
+/runs
+# Per-experiment convenience symlink <exp>/runs -> ../../runs/<N>-<exp>
+# (recreate with scripts/link_experiment_runs.sh).
+experiments/**/runs
+
+# Training artefacts that must never reach git
+/wandb
+*/outputs
+*.ckpt
+*.pt
+*.pt2
+*.pth
+*.safetensors
+nequip_fx_dump_*/
+
+# Logs
+*.log
+*.out
+*.err
+slurm-*.out
+/job-*/
+core.*
+
+# Caches / blobs
+*.cache
+*.pkl
+*.npz
+*.npy
+*.tar
+*.tar.gz
+*.zip
+tmp/
+
+# Literature PDFs pulled for a plan cycle (local reading copies)
+/plans/**/papers/

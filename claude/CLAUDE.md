@@ -42,17 +42,21 @@ able to act on it without scrolling back through the conversation.
 - **Default to display blocks.** Every equation goes on its own full line
   as `$$ … $$`, in LaTeX, with blank lines around it. Split multi-part
   statements into separate blocks rather than chaining them.
-- **Inline math is unicode, never LaTeX.** Inline `$…$` does not render in
-  my chat — it shows as raw source. To reference a variable or small term
-  mid-sentence, write unicode text: ρ(z), Δφ, ε₀, r_max = 7 Å, E_lr, ∇E,
-  →. Use `_` for subscripts that have no unicode form. Same rule inside
-  markdown table cells; if a cell needs a real equation, pull it out into
-  a display block below the table.
-- **Base LaTeX2e inside display blocks.** I copy them straight into my own
-  `.tex`, compiled without extra packages: `\mathrm` not `\text`, `\frac`
-  not `\tfrac`/`\dfrac`, no `\;` `\,` `\!` spacing macros, no `\boxed`,
-  and no literal unicode inside the math (`\times`, `\neq`, `\mathrm{A}`).
-  The unicode rule above is for prose only.
+- **Inline math may be LaTeX.** Inline `$…$` renders in the Happier app
+  (verified 2026-11-14), and the `mathify` hook converts it to unicode in
+  a plain terminal. Use it to reference a variable or small term
+  mid-sentence: `$\rho(z)$`, `$\Delta\varphi$`, `$\varepsilon_0$`,
+  `$r_\mathrm{max} = 7$` Å, `$\nabla E$`. Keep inline math to one row:
+  anything with a fraction, sum or integral goes in a display block.
+  Plain unicode (ρ, Δφ, ε₀, →) is still fine for a lone symbol. Inside
+  markdown table cells keep to unicode (inline LaTeX is untested there);
+  if a cell needs a real equation, pull it out into a display block below
+  the table.
+- **Base LaTeX2e inside all math, inline and display.** I copy it straight
+  into my own `.tex`, compiled without extra packages: `\mathrm` not
+  `\text`, `\frac` not `\tfrac`/`\dfrac`, no `\;` `\,` `\!` spacing macros,
+  no `\boxed`, and no literal unicode inside the math (`\times`, `\neq`,
+  `\mathrm{A}`). Unicode symbols are for prose only.
 
 ## Subagents and parallel tasks
 
@@ -204,8 +208,13 @@ shared/overflow lane and check `hq job list` for teammates' work before large
 batches.
 Because bravo workers can have <24 h left and may be preempted, and charlie
 workers live 6 h, write long payloads re-entrant (auto-resume from
-`last.ckpt`, checkpoint at least every epoch) and avoid `--time-request`
-longer than a worker's remaining walltime (task WAITS forever, silently). A
+`last.ckpt`, checkpoint at least every epoch) and submit them with NO
+`--time-request` (Gabriel's rule, 2026-10-17): a re-entrant task should start
+on any free GPU, be stopped at the worker's walltime and resume on the next
+worker — a request only keeps it WAITING beside idle GPUs (10 tasks sat next to
+147 free charlie GPUs for the last 30 min of an allocation), and one longer
+than every worker's remaining walltime waits forever, silently. Reserve
+`--time-request` for payloads that genuinely cannot resume. A
 worker hitting its time limit SIGINTs its tasks and kills them ~1 s later;
 they return to WAITING with no crash-limit charge and resume on the next
 worker (verified 2026-09-30). Put `%{INSTANCE_ID}` in task log paths or each
@@ -214,8 +223,8 @@ leg truncates the previous leg's log. Full mechanics:
 Since 2026-10-05 plain `hq submit` / `hqb submit` are unchanged and still the
 normal way to submit: the `hqx` router moves your WAITING jobs to free GPU
 slots on the other server automatically. Use `hqx submit --fleet <f>` only to
-pin a job to a fleet. Give long jobs a `--time-request`, or the router may
-place them on a worker about to hit its walltime.
+pin a job to a fleet. The router may place a job on a worker about to hit its
+walltime — intended: the task resumes on the next worker.
 
 ### Submitting work
 
@@ -248,7 +257,7 @@ included).
 | `hq-fleet` | orchestrator, tmux session `hq-fleet`; subcommands `status/up/down/tick`, `DRY_RUN=1` to preview; log `~/.hq/fleet.log` |
 | Primary allocation | alpha: 4-node/168h `capacity` jobs `hq-capacity` (`~/.hq/capacity-workers.pbs`); `HQ_CAP_JOBS` in fleet.env sets how many are kept in flight (2 since 2026-10-03 = one running + one queued back-to-back, both project slots; was 1 from 2026-08, which left 13 h-3.7 d queue gaps after every allocation end). Changing it needs `hq-fleet down` + `hq-fleet up` on login-01 |
 | Bravo lane | `bravo-fleet {up N\|tick\|run\|status\|down}` (`~/.hq/bravo/worker.pbs`): many 1-node `preemptable` jobs named `bravo-1n`, staggered 24-72 h walltimes; ticker = tmux `bravo-fleet` on login-01 (added 2026-08-15) |
-| Charlie lane | `charlie-fleet {tick\|run\|status\|waits\|size [N [--wall W] [--now]]\|up N\|pause\|resume\|down\|down-queued}` (`~/.hq/charlie/worker.pbs`): 25-node × 6 h `prod`→`medium` jobs named `charlie-25n`, ALWAYS-ON CHAIN since 2026-10-12: every allocation runs full walltime (idle watchdog removed); successor submitted when the last allocation has ≤ lead + 5 min left, lead = `CHARLIE_WAIT_Q`=1.0 quantile (= max; 0.8 until 2026-10-15) of the last `CHARLIE_WAIT_N`=10 observed waits (`~/.hq/charlie/waits.tsv`) in [30, 360] min; a successor that starts early `hq worker stop`s the predecessor's workers once nothing waits and it can absorb them (tasks resume from last.ckpt). PBS `-a`/`-h`/`depend` can't time starts (no eligible_time accrual → wait starts at release). `down` also pauses. Ticker = tmux `charlie-fleet` on login-01, restart it after editing fleet.env. Size is runtime-adjustable since 2026-10-14: `charlie-fleet size N` writes `~/.hq/charlie/size`, read on every submit (no restart); 10-24 nodes -> small/3 h, 25-99 -> medium/6 h, 100-496 -> large/24 h; `--now` replaces the queued successor. Not autoalloc: `prod` rejects <10 nodes and autoalloc sizes to demand |
+| Charlie lane | `charlie-fleet {tick\|run\|status\|waits\|size [N [--wall W] [--now]]\|up N\|pause\|resume\|down\|down-queued}` (`~/.hq/charlie/worker.pbs`): 25-node × 6 h `prod`→`medium` jobs named `charlie-25n`, ALWAYS-ON CHAIN since 2026-10-12: every allocation runs full walltime (idle watchdog removed); successor submitted when the last allocation has ≤ lead + 5 min left, lead = `CHARLIE_WAIT_Q`=1.0 quantile (= max; 0.8 until 2026-10-15) of the last `CHARLIE_WAIT_N`=10 observed waits (`~/.hq/charlie/waits.tsv`) in [30, 360] min; since 2026-10-16 a SECOND successor is queued when waits exceed a walltime (`cover` = left + queued walltime <= lead; `CHARLIE_MAX_QUEUED`=2, `CHARLIE_LEAD_CAP`=720). Handover is decided at run time by `charlie-handover` (not frozen in the PBS script): predecessor = allocation that ENDS before ours (not lower PBS id); its workers are `hq worker stop`ped when nothing waits and we can absorb them (tasks resume from last.ckpt), and any predecessor worker idle for two 60 s polls is stopped even while tasks wait, so an emptied allocation ends instead of idling. PBS `-a`/`-h`/`depend` can't time starts (no eligible_time accrual → wait starts at release). `down` also pauses. Ticker = tmux `charlie-fleet` on login-01, restart it after editing fleet.env. Size is runtime-adjustable since 2026-10-14: `charlie-fleet size N` writes `~/.hq/charlie/size`, read on every submit (no restart); 10-24 nodes -> small/3 h, 25-99 -> medium/6 h, 100-496 -> large/24 h; `--now` replaces the queued successor. Not autoalloc: `prod` rejects <10 nodes and autoalloc sizes to demand |
 | One queue: `hqx` | (2026-10-05) `hqx list` = both servers as one queue (ids `a<id>` shared / `b<id>` private); `hqx submit [--fleet alpha\|bravo\|charlie[,…]\|any]`, `hqx move <id> --to <fleet> [--running]`, `hqx pin <id> <fleets>\|any`. Router = tmux `hq-router` on login-01 (`hqx router status\|up\|down`): every 60 s moves YOUR waiting jobs (cancel + resubmit from the server's JSON) to free GPU slots on the other server, never teammates' jobs, never to create demand. Pinning = worker marker resources `fleet/<name>` added at `worker start` by the wrapper `~/.local/bin/hq` -> `scripts/hq/hq-fleet-wrap`; REAL binary is `~/.local/libexec/hq/hq` (must stay named `hq`: hq-server-up uses `pgrep -x hq`). State in `~/.hq-router/` |
 | Bravo server (PRIVATE) | since 2026-08-20 bravo workers attach to a second server: tmux `hq-bravo`, started ONLY via `hq-bravo-server-up`, server-dir `~/.hq-bravo-server`, journal/log under `~/.hq-bravo/`, pinned ports 36152/44986. Client = `hqb`. Keys in `~/.hq-bravo/access/` are demiranda-only — NEVER copy them into `hq-shared/` |
 | Bridge allocation | **DISABLED since 2026-07-27** (`HQ_NO_BRIDGE=1` in fleet.env; capacity-only policy for the group-shared fleet). The `preemptable` `hq-bridge` machinery (`~/.hq/preempt-bridge.pbs`) still exists — re-enable by removing the knob |
