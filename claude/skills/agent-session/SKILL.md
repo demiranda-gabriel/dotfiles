@@ -72,6 +72,15 @@ codex app-server daemon version                  # -> "status":"running"
 If no daemon is running there, `codex app-server daemon start` instead.
 `daemon restart` does NOT fix an orphaned daemon (it cannot reach it to stop it).
 
+**Second source of stray daemons: the Codex desktop app over SSH** (seen
+2026-11-19). When the desktop app connects to a remote host by SSH it boots its
+own `codex -c features.code_mode_host=true app-server --listen unix://` (parent
+pid 1, `CODEX_REMOTE_PAYLOAD` in its environment) on whichever login node the
+SSH lands on. If that is not the codex node, kill it, then check the link on
+the codex node (`codex app-server daemon version`) and recreate it if needed.
+The lasting fix is to point the desktop app's SSH host at the codex node
+(polaris-login-04), not at a round-robin alias.
+
 ## Usage
 
 ```bash
