@@ -29,8 +29,11 @@ if [[ -d /lus/eagle ]]; then
   # It also arms the zombie watchdog (tmux `vscode-watch`, 2026-10-15), which
   # restarts a tunnel that is up but has lost its relay connection.
   #
-  # login-04 only (moved off login-01 2026-10-06: login-01 hit its 256-pid
-  # cap and wedged, and it already hosts the hq servers + fleet tickers). A
+  # login-01 only (2026-11-17: moved back from login-04, which hit its 256-pid
+  # cap once all codex sessions were pinned there -- see bin/agent-session).
+  # History: moved OFF login-01 on 2026-10-06 because login-01 hit the cap and
+  # wedged, and it also hosts the hq servers + fleet tickers -- so watch
+  # `cat /sys/fs/cgroup/users/$USER/pids.current` on login-01. A
   # tunnel registers ONE machine per CLI data dir, and
   # vscode-login-tunnel.sh gives each node its own dir (see its header) — so
   # re-upping on every node would litter the VS Code machine list with a
@@ -42,8 +45,8 @@ if [[ -d /lus/eagle ]]; then
   # The token check keeps a credential-less node from parking a device-code
   # prompt in a detached pane forever (the script's first-run login path).
   if [[ $- == *i* ]] \
-      && [[ "$(hostname -s)" == polaris-login-04 ]] \
-      && [[ -f "$HOME/.vscode/cli-polaris-login-04/token.json" ]] \
+      && [[ "$(hostname -s)" == polaris-login-01 ]] \
+      && [[ -f "$HOME/.vscode/cli-polaris-login-01/token.json" ]] \
       && command -v vscode-tunnel >/dev/null 2>&1; then
     vscode-tunnel up >/dev/null 2>&1
   fi
